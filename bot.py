@@ -29,17 +29,24 @@ if MNEMONIC:
             print(f"Created wallet: {name}")
         print("Bot LTC #0:", wallet.key_for_path("m/44'/2'/0'/0/0").address)
     except Exception as e:
-        print(f"Wallet failed: {e}")
+        print(f"Wallet error: {e}")
 
 def get_addr(idx):
     return wallet.key_for_path(f"m/44'/2'/0'/0/{idx}").address if wallet else "NO_WALLET"
 
-# DB
+# Database - FIXED AUTOINCREMENT
 conn = sqlite3.connect('trades.db')
 c = conn.cursor()
-c.execute('CREATE TABLE IF NOT EXISTS keys (key TEXT PRIMARY KEY, used INT DEFAULT 0)')
-c.execute('CREATE TABLE IF NOT EXISTS activated_users (user_id TEXT PRIMARY KEY)')
-c.execute('CREATE TABLE IF NOT EXISTS trades (id INT PRIMARY KEY AUTOINCREMENT, buyer_id TEXT, currency TEXT, deposit_addr TEXT, channel_id TEXT, status TEXT DEFAULT "waiting_role")')
+c.execute('''CREATE TABLE IF NOT EXISTS keys (key TEXT PRIMARY KEY, used INTEGER DEFAULT 0)''')
+c.execute('''CREATE TABLE IF NOT EXISTS activated_users (user_id TEXT PRIMARY KEY)''')
+c.execute('''CREATE TABLE IF NOT EXISTS trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    buyer_id TEXT,
+    currency TEXT,
+    deposit_addr TEXT,
+    channel_id TEXT,
+    status TEXT DEFAULT "waiting_role"
+)''')
 conn.commit()
 
 # Bot
@@ -60,7 +67,7 @@ class TradeModal(Modal, title="Trade Setup"):
         self.currency = currency
 
     async def on_submit(self, i: discord.Interaction):
-        await i.response.defer(ephemeral=True)
+        await i.response.defer(ephemeral=True)  # Prevents "interaction failed"
 
         other_input = self.other.value.strip()
         u = None
@@ -85,8 +92,10 @@ class TradeModal(Modal, title="Trade Setup"):
         idx = int(time.time() * 1000) % 1000000
         addr = get_addr(idx)
 
-        c.execute("INSERT INTO trades (buyer_id, currency, deposit_addr, channel_id, status) VALUES (?,?,?,?,?)",
-                  (str(i.user.id), self.currency, addr, "pending", 'waiting_role'))
+        c.execute(
+            "INSERT INTO trades (buyer_id, currency, deposit_addr, channel_id, status) VALUES (?,?,?,?,?)",
+            (str(i.user.id), self.currency, addr, "pending", 'waiting_role')
+        )
         trade_id = c.lastrowid
         conn.commit()
 
@@ -111,16 +120,16 @@ class TradeModal(Modal, title="Trade Setup"):
             f"{u.mention} pick role:", view=view
         )
 
-        await i.followup.send(f"Ticket: {ch.mention}", ephemeral=True)
+        await i.followup.send(f"Ticket created: {ch.mention}", ephemeral=True)
 
-# Role buttons
+# Role view
 class RoleView(View):
     def __init__(self, tid, starter, other):
         super().__init__(timeout=None)
         self.tid = tid
         self.other = other
 
-    @discord.ui.button(label="Sender", style=discord.ButtonStyle.green)
+    @discord.ui.button(label="Sender", style=discord.ButtonStyle.green, custom_id="sender_btn")
     async def sender(self, i: discord.Interaction, _):
         if i.user.id != self.other:
             return await i.response.send_message("Not for you.", ephemeral=True)
@@ -129,7 +138,7 @@ class RoleView(View):
         await i.response.send_message(f"{i.user.mention} is Sender", ephemeral=False)
         self.stop()
 
-    @discord.ui.button(label="Receiver", style=discord.ButtonStyle.blurple)
+    @discord.ui.button(label="Receiver", style=discord.ButtonStyle.blurple, custom_id="receiver_btn")
     async def receiver(self, i: discord.Interaction, _):
         if i.user.id != self.other:
             return await i.response.send_message("Not for you.", ephemeral=True)
@@ -153,7 +162,7 @@ class PanelView(View):
             SelectOption(label="USDC [SOL]", value="USDC_SOL", emoji="💵"),
             SelectOption(label="USDT [BEP-20]", value="USDT_BEP20", emoji="💵"),
         ]
-        sel = Select(placeholder="Make a selection", options=opts)
+        sel = Select(placeholder="Make a selection", options=opts, custom_id="crypto_sel")
 
         @sel.callback
         async def cb(i: discord.Interaction):
@@ -193,10 +202,10 @@ async def tp(i: discord.Interaction):
 
 @client.event
 async def on_ready():
-    print(f'Logged: {client.user}')
+    print(f'Logged in: {client.user}')
     try:
         synced = await tree.sync()
-        print(f"Synced {len(synced)} cmds")
+        print(f"Synced {len(synced)} commands")
         for s in synced:
             print(f" - /{s.name}")
     except Exception as e:
