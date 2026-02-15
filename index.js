@@ -26,7 +26,7 @@ function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
-// Wallet
+// Wallet - fixed bip32 access
 let root;
 const mnemonic = process.env.BOT_MNEMONIC;
 if (mnemonic) {
@@ -125,7 +125,7 @@ client.on(Events.InteractionCreate, async interaction => {
       if (interaction.user.id === OWNER_ID) return interaction.reply({ content: "Owner doesn't need key.", ephemeral: true });
 
       db.get('SELECT used FROM keys WHERE key = ?', key, (err, row) => {
-        if (err || !row || row.used) return interaction.reply({ content: 'Invalid/used.', ephemeral: true });
+        if (err || !row || row.used) return interaction.reply({ content: 'Invalid or used.', ephemeral: true });
         db.run('UPDATE keys SET used = 1 WHERE key = ?', key);
         db.run('INSERT OR IGNORE INTO activated_users (user_id) VALUES (?)', interaction.user.id);
         interaction.reply({ content: 'Activated!', ephemeral: true });
