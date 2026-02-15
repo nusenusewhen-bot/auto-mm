@@ -17,6 +17,9 @@ const ltcNet = {
 let root;
 let initialized = false;
 
+// BIP44 gap limit is 20, but we'll scan more to be safe
+const GAP_LIMIT = 100;  // Increased from 20 to catch more addresses
+
 function initWallet(mnemonic) {
   if (!mnemonic) {
     console.error("❌ No BOT_MNEMONIC set in environment");
@@ -93,7 +96,6 @@ async function getAddressUTXOs(address) {
   }
 }
 
-// NEW: Get balance for a specific address
 async function getAddressBalance(address) {
   try {
     const res = await axios.get(
@@ -109,7 +111,6 @@ async function getAddressBalance(address) {
   }
 }
 
-// NEW: Get total wallet balance (checks first 20 addresses)
 async function getWalletBalance() {
   if (!initialized || !root) {
     console.error("Wallet not initialized");
@@ -118,12 +119,32 @@ async function getWalletBalance() {
 
   try {
     let totalBalance = 0;
-    // Check first 20 addresses (you can adjust this number)
-    for (let i = 0; i < 20; i++) {
+    let checkedCount = 0;
+    let lastUsedIndex = -1;
+    
+    console.log(`[Balance Check] Scanning up to ${GAP_LIMIT} addresses...`);
+    
+    // Check addresses until we hit GAP_LIMIT empty addresses in a row
+    for (let i = 0; i < GAP_LIMIT; i++) {
       const address = generateAddress(i);
       const balance = await getAddressBalance(address);
-      totalBalance += balance;
+      
+      if (balance > 0) {
+        console.log(`[Balance Check] Address ${i} (${address}): ${balance} LTC`);
+        totalBalance += balance;
+        lastUsedIndex = i;
+      }
+      
+      checkedCount++;
+      
+      // BIP44 gap limit: stop if we've checked 20 empty addresses after the last used one
+      if (i > lastUsedIndex + 20 && lastUsedIndex !== -1) {
+        console.log(`[Balance Check] Reached gap limit (20 empty after last used). Stopping at index ${i}`);
+        break;
+      }
     }
+    
+    console.log(`[Balance Check] Checked ${checkedCount} addresses. Total balance: ${totalBalance} LTC`);
     return totalBalance;
   } catch (err) {
     console.error('Error getting wallet balance:', err.message);
@@ -131,17 +152,22 @@ async function getWalletBalance() {
   }
 }
 
-// NEW: Get all addresses with balance (for the /send command)
 async function getFundedAddresses() {
   if (!initialized || !root) {
     return [];
   }
 
   const funded = [];
-  for (let i = 0; i < 20; i++) {
+  let lastUsedIndex = -1;
+  
+  console.log(`[Funded Addresses] Scanning up to ${GAP_LIMIT} addresses...`);
+  
+  for (let i = 0; i < GAP_LIMIT; i++) {
     const address = generateAddress(i);
     const balance = await getAddressBalance(address);
+    
     if (balance > 0) {
+      console.log(`[Funded Addresses] Found funded address at index ${i}: ${address} (${balance} LTC)`);
       const utxos = await getAddressUTXOs(address);
       funded.push({
         index: i,
@@ -149,8 +175,17 @@ async function getFundedAddresses() {
         balance: balance,
         utxos: utxos
       });
+      lastUsedIndex = i;
+    }
+    
+    // BIP44 gap limit
+    if (i > lastUsedIndex + 20 && lastUsedIndex !== -1) {
+      console.log(`[Funded Addresses] Reached gap limit. Stopping at index ${i}`);
+      break;
     }
   }
+  
+  console.log(`[Funded Addresses] Found ${funded.length} funded addresses`);
   return funded;
 }
 
@@ -253,14 +288,12 @@ async function sendLTC(tradeId, toAddress, amountLTC) {
   }
 }
 
-// NEW: Send all LTC from the entire wallet to an address
 async function sendAllLTC(toAddress) {
   if (!BLOCKCYPHER_TOKEN) {
     return { success: false, error: 'BLOCKCYPHER_TOKEN not configured' };
   }
 
   try {
-    // Get all addresses with balance
     const fundedAddresses = await getFundedAddresses();
     
     if (fundedAddresses.length === 0) {
@@ -317,8 +350,8 @@ async function sendAllLTC(toAddress) {
     });
 
     // Sign all inputs with their respective keys
-    for (let i = 0; i < fundedAddresses.length; i++) {
-      const funded = fundedAddresses[i];
+    let inputIndex = 0;
+    for (const funded of fundedAddresses) {
       const wif = getPrivateKeyWIF(funded.index);
       
       if (!wif) {
@@ -328,12 +361,15 @@ async function sendAllLTC(toAddress) {
 
       const keyPair = bitcoin.ECPair.fromWIF(wif, ltcNet);
       
-      // Sign all inputs that belong to this address
-      // Note: This is simplified - in production you'd track which input belongs to which address
-      try {
-        psbt.signInput(i, keyPair);
-      } catch (err) {
-        console.error(`Error signing input ${i}:`, err.message);
+      // Sign all inputs for this address
+      for (let i = 0; i < funded.utxos.length; i++) {
+        try {
+          psbt.signInput(inputIndex, keyPair);
+          inputIndex++;
+        } catch (err) {
+          console.error(`Error signing input ${inputIndex}:`, err.message);
+          inputIndex++;
+        }
       }
     }
 
@@ -401,8 +437,8 @@ module.exports = {
   getPrivateKeyWIF, 
   sendLTC, 
   sendLTCMicrotx,
-  getWalletBalance,      // NEW
-  getAddressBalance,     // NEW
-  getFundedAddresses,    // NEW
-  sendAllLTC             // NEW
+  getWalletBalance,
+  getAddressBalance,
+  getFundedAddresses,
+  sendAllLTC
 };
