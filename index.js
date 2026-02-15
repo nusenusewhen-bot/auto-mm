@@ -19,7 +19,7 @@ const {
 } = require('discord.js');
 
 const db = require('./database');
-const { initWallet, generateAddress, sendLTC, getWalletBalance, sendAllLTC } = require('./wallet');
+const { initWallet, generateAddress, sendLTC, getWalletBalance, sendAllLTC, isInitialized } = require('./wallet');
 const { checkPayment, getLtcPriceUSD } = require('./blockchain');
 const { REST } = require('@discordjs/rest');
 const QRCode = require('qrcode');
@@ -44,7 +44,12 @@ if (!DISCORD_TOKEN || !OWNER_ID || !process.env.BOT_MNEMONIC) {
   process.exit(1);
 }
 
-initWallet(process.env.BOT_MNEMONIC);
+// Initialize wallet
+const walletInitialized = initWallet(process.env.BOT_MNEMONIC);
+if (!walletInitialized) {
+  console.error('Failed to initialize wallet. Check your BOT_MNEMONIC in .env');
+  process.exit(1);
+}
 
 // Active payment monitors (tradeId -> intervalId)
 const activeMonitors = new Map();
@@ -210,6 +215,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const { commandName } = interaction;
 
       if (commandName === 'send') {
+        // Check wallet initialization first
+        if (!isInitialized()) {
+          return interaction.reply({ 
+            content: '❌ Wallet not initialized. Check console for errors.', 
+            flags: 64 
+          });
+        }
+
         const hasPermission = await hasOwnerPermissions(interaction.user.id, interaction.member);
         
         if (!hasPermission) {
