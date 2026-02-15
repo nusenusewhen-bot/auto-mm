@@ -3,12 +3,12 @@ const bitcoin = require('bitcoinjs-lib');
 const tinysecp = require('tiny-secp256k1');
 const { BIP32Factory } = require('bip32');
 
-// Proper bip32 init for bitcoinjs v6+
+// Initialize bip32 with tiny-secp256k1
 const bip32 = BIP32Factory(tinysecp);
 
 let root = null;
 
-// Litecoin network params
+// Litecoin network parameters
 const ltcNet = {
   messagePrefix: '\x19Litecoin Signed Message:\n',
   bech32: 'ltc',
@@ -21,6 +21,11 @@ const ltcNet = {
   wif: 0xb0
 };
 
+/**
+ * Initialize wallet from mnemonic
+ * @param {string} mnemonic - 12-word mnemonic from env
+ * @returns {BIP32} root node or null
+ */
 function initWallet(mnemonic) {
   if (!mnemonic) {
     console.log('No BOT_MNEMONIC set - wallet disabled');
@@ -45,16 +50,21 @@ function initWallet(mnemonic) {
   }
 }
 
+/**
+ * Derive a deposit address at the given index
+ * @param {number} index
+ * @returns {string} Litecoin address or error string
+ */
 function getDepositAddress(index) {
   if (!root) return 'WALLET_NOT_LOADED';
 
   try {
-    // BIP84 style path for native segwit Litecoin
+    // BIP84 derivation path for native SegWit LTC (ltc1...)
     const path = `m/84'/2'/0'/0/${index}`;
     const child = root.derivePath(path);
 
     const { address } = bitcoin.payments.p2wpkh({
-      pubkey: child.publicKey,
+      pubkey: Buffer.from(child.publicKey),
       network: ltcNet
     });
 
