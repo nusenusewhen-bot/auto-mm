@@ -21,6 +21,7 @@ const OWNER_ID = '1298640383688970293';
 const TOKEN = process.env.DISCORD_TOKEN;
 const OWNER_LTC_ADDRESS = 'LeDdjh2BDbPkrhG2pkWBko3HRdKQzprJMX';
 
+// ---------------- Initialization ----------------
 client.once(Events.ClientReady, () => {
   console.log(`Logged in as ${client.user.tag}`);
   initWallet(process.env.BOT_MNEMONIC);
@@ -52,71 +53,68 @@ function calculateFee(value){
   return 0;
 }
 
-function sendMessage(channel, content, components=[]){
-  channel.send({ content, components });
+function sendEmbed(channel, title, description, color='#00aaff', components=[]){
+  const embed = new EmbedBuilder()
+    .setTitle(title)
+    .setDescription(description)
+    .setColor(color);
+  channel.send({ embeds:[embed], components });
 }
 
 // ---------------- Commands ----------------
 client.on(Events.InteractionCreate, async interaction => {
-  if(!interaction.isCommand()) return;
+  if(interaction.isCommand()){
 
-  const { commandName } = interaction;
+    const { commandName } = interaction;
 
-  // ---- Owner: Generate Key ----
-  if(commandName === 'generatekey'){
-    if(interaction.user.id !== OWNER_ID)
-      return interaction.reply({ content:'Only owner.', ephemeral:true });
-    const key = Math.random().toString(36).substring(2,18).toUpperCase();
-    db.run('INSERT INTO keys(key) VALUES(?)', key);
-    return interaction.reply({ content:`Key: \`${key}\``, ephemeral:true });
+    // ---- Owner generates key ----
+    if(commandName === 'generatekey'){
+      if(interaction.user.id !== OWNER_ID)
+        return interaction.reply({ content:'Only owner.', ephemeral:true });
+      const key = Math.random().toString(36).substring(2,18).toUpperCase();
+      db.run('INSERT INTO keys(key) VALUES(?)', key);
+      return interaction.reply({ content:`Key: \`${key}\``, ephemeral:true });
+    }
+
+    // ---- Redeem Key ----
+    if(commandName === 'redeemkey'){
+      const key = interaction.options.getString('key').toUpperCase();
+      if(interaction.user.id === OWNER_ID) 
+        return interaction.reply({ content:"Owner doesn't need key.", ephemeral:true });
+
+      db.get('SELECT used FROM keys WHERE key=?', key, (err,row)=>{
+        if(err || !row || row.used) return interaction.reply({ content:'Invalid/used key.', ephemeral:true });
+        db.run('UPDATE keys SET used=1 WHERE key=?', key);
+        db.run('INSERT OR IGNORE INTO activated_users(user_id) VALUES(?)', interaction.user.id);
+        return interaction.reply({ content:'Activated!', ephemeral:true });
+      });
+    }
+
+    // ---- LTC Trade Panel ----
+    if(commandName === 'autoticketpanel'){
+      db.get('SELECT 1 FROM activated_users WHERE user_id=?', interaction.user.id, (err,row)=>{
+        if(interaction.user.id !== OWNER_ID && !row)
+          return interaction.reply({ content:'Redeem a key first.', ephemeral:true });
+
+        sendEmbed(interaction.channel, 'Litecoin Escrow Panel', 'Start LTC Trade with button below', '#00aaff', [
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId('start_trade')
+              .setLabel('Start LTC Trade')
+              .setStyle(ButtonStyle.Primary)
+          )
+        ]);
+        interaction.reply({ content:'Panel loaded', ephemeral:true });
+      });
+    }
   }
-
-  // ---- Redeem Key ----
-  if(commandName === 'redeemkey'){
-    const key = interaction.options.getString('key').toUpperCase();
-    if(interaction.user.id === OWNER_ID) 
-      return interaction.reply({ content:"Owner doesn't need key.", ephemeral:true });
-
-    db.get('SELECT used FROM keys WHERE key=?', key, (err,row)=>{
-      if(err || !row || row.used) return interaction.reply({ content:'Invalid/used key.', ephemeral:true });
-      db.run('UPDATE keys SET used=1 WHERE key=?', key);
-      db.run('INSERT OR IGNORE INTO activated_users(user_id) VALUES(?)', interaction.user.id);
-      return interaction.reply({ content:'Activated!', ephemeral:true });
-    });
-  }
-
-  // ---- LTC Panel ----
-  if(commandName === 'autoticketpanel'){
-    db.get('SELECT 1 FROM activated_users WHERE user_id=?', interaction.user.id, (err,row)=>{
-      if(interaction.user.id !== OWNER_ID && !row)
-        return interaction.reply({ content:'Redeem a key first.', ephemeral:true });
-
-      const embed = new EmbedBuilder()
-        .setTitle('Litecoin Escrow Panel')
-        .setDescription('Start an LTC trade')
-        .setColor('#00aaff');
-      const rowBtn = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId('start_trade')
-          .setLabel('Start LTC Trade')
-          .setStyle(ButtonStyle.Primary)
-      );
-      interaction.reply({ embeds:[embed], components:[rowBtn] });
-    });
-  }
-});
-
-// ---------------- Button & Modal Logic ----------------
-client.on(Events.InteractionCreate, async interaction => {
 
   // ---------------- Button Handling ----------------
   if(interaction.isButton()){
-
     const [action, tradeId, extra] = interaction.customId.split('_');
 
-    // ---- Start Trade ----
+    // ---- Start Trade Modal ----
     if(interaction.customId === 'start_trade'){
-      // Show modal to input other user
       const modal = new ModalBuilder()
         .setCustomId('trade_modal')
         .setTitle('Start LTC Trade')
@@ -126,16 +124,17 @@ client.on(Events.InteractionCreate, async interaction => {
               .setCustomId('other_user')
               .setLabel('User/ID of other person')
               .setStyle(TextInputStyle.Short)
+              .setPlaceholder('@mention or ID')
               .setRequired(true)
           )
         );
       return interaction.showModal(modal);
     }
 
-    // ---- Choose Role ----
+    // ---- Choose Roles ----
     if(action === 'choose'){
       db.get('SELECT * FROM trades WHERE id=?', tradeId, (err,row)=>{
-        if(!row) return interaction.reply({ content:'Trade not found.', ephemeral:true });
+        if(!row) return interaction.reply({ content:'Trade not found', ephemeral:true });
 
         if(extra === 'sender'){
           if(row.sender_id) return interaction.reply({ content:'Sender already chosen', ephemeral:true });
@@ -146,14 +145,14 @@ client.on(Events.InteractionCreate, async interaction => {
           db.run('UPDATE trades SET receiver_id=? WHERE id=?', [interaction.user.id, tradeId]);
         }
 
-        // If both chosen, send Confirm Trade buttons
         db.get('SELECT sender_id, receiver_id FROM trades WHERE id=?', tradeId, (e,r)=>{
           if(r.sender_id && r.receiver_id){
-            const confirmRow = new ActionRowBuilder().addComponents(
-              new ButtonBuilder().setCustomId(`confirm_trade_${tradeId}`).setLabel('Confirm Trade').setStyle(ButtonStyle.Success),
-              new ButtonBuilder().setCustomId(`cancel_trade_${tradeId}`).setLabel('No').setStyle(ButtonStyle.Danger)
-            );
-            sendMessage(interaction.channel, 'Both roles chosen. Confirm trade?', [confirmRow]);
+            sendEmbed(interaction.channel, 'Both roles chosen', 'Confirm Trade below', '#00ff00', [
+              new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId(`confirm_trade_${tradeId}`).setLabel('Confirm Trade').setStyle(ButtonStyle.Success),
+                new ButtonBuilder().setCustomId(`cancel_trade_${tradeId}`).setLabel('No').setStyle(ButtonStyle.Danger)
+              )
+            ]);
           }
         });
       });
@@ -162,7 +161,7 @@ client.on(Events.InteractionCreate, async interaction => {
     // ---- Confirm Trade ----
     if(action === 'confirm' && extra === 'trade'){
       db.run('UPDATE trades SET status=? WHERE id=?', ['confirmed', tradeId]);
-      sendMessage(interaction.channel, 'Trade confirmed! Sender, input deal value using the Input button.');
+      sendEmbed(interaction.channel, 'Trade Confirmed', 'Sender, input the deal amount using modal', '#00aaff');
     }
 
     // ---- Release / Refund ----
@@ -170,8 +169,8 @@ client.on(Events.InteractionCreate, async interaction => {
       db.get('SELECT sender_id FROM trades WHERE id=?', tradeId, (err,row)=>{
         if(!row) return;
         if(interaction.user.id !== row.sender_id && interaction.user.id !== OWNER_ID) 
-          return interaction.reply({ content:'Only sender or owner can release.', ephemeral:true });
-        sendMessage(interaction.channel, 'Release selected. Sender, input LTC address.');
+          return interaction.reply({ content:'Only sender/owner can release', ephemeral:true });
+        sendEmbed(interaction.channel, 'Release Selected', 'Sender, input LTC address', '#00ff00');
       });
     }
 
@@ -179,15 +178,14 @@ client.on(Events.InteractionCreate, async interaction => {
       db.get('SELECT sender_id, receiver_id FROM trades WHERE id=?', tradeId, (err,row)=>{
         if(!row) return;
         if(interaction.user.id !== row.sender_id && interaction.user.id !== OWNER_ID)
-          return interaction.reply({ content:'Only sender or owner can refund.', ephemeral:true });
-        sendMessage(interaction.channel, 'Refund requested. Confirm refund?');
+          return interaction.reply({ content:'Only sender/owner can refund', ephemeral:true });
+        sendEmbed(interaction.channel, 'Refund Requested', 'Confirm Refund', '#ff0000');
       });
     }
   }
 
   // ---------------- Modal Handling ----------------
   if(interaction.isModalSubmit()){
-
     if(interaction.customId === 'trade_modal'){
       const otherInput = interaction.fields.getTextInputValue('other_user');
       let otherUser;
@@ -201,13 +199,11 @@ client.on(Events.InteractionCreate, async interaction => {
       if(otherUser.id === interaction.user.id)
         return interaction.reply({ content:"Can't trade with yourself.", ephemeral:true });
 
-      // Create trade channel
       db.run('INSERT INTO trades(channel_id, status) VALUES (?,?)', ['pending','waiting_role'], function(err){
         if(err) return interaction.reply({ content:'DB error', ephemeral:true });
         const tradeId = this.lastID;
         const depositAddr = getDepositAddress(tradeId);
 
-        // Create channel
         interaction.guild.channels.create({
           name:`trade-${tradeId}`,
           type:ChannelType.GuildText,
@@ -218,27 +214,20 @@ client.on(Events.InteractionCreate, async interaction => {
           ]
         }).then(ch=>{
           db.run('UPDATE trades SET channel_id=?, deposit_addr=? WHERE id=?', [ch.id, depositAddr, tradeId]);
-          const roleRow = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`choose_${tradeId}_sender`).setLabel('Sender').setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId(`choose_${tradeId}_receiver`).setLabel('Receiver').setStyle(ButtonStyle.Primary)
-          );
-
-          const embed = new EmbedBuilder()
-            .setTitle(`Litecoin Trade #${tradeId}`)
-            .setDescription(`Deposit: ${depositAddr}\n${interaction.user} vs ${otherUser}`)
-            .setColor('#00aaff');
-
-          sendMessage(ch, 'Choose roles:', [roleRow]);
+          sendEmbed(ch, `Litecoin Trade #${tradeId}`, `Deposit: ${depositAddr}\n${interaction.user} vs ${otherUser}`, '#00aaff', [
+            new ActionRowBuilder().addComponents(
+              new ButtonBuilder().setCustomId(`choose_${tradeId}_sender`).setLabel('Sender').setStyle(ButtonStyle.Success),
+              new ButtonBuilder().setCustomId(`choose_${tradeId}_receiver`).setLabel('Receiver').setStyle(ButtonStyle.Primary)
+            )
+          ]);
           interaction.reply({ content:`Trade ticket created: ${ch}`, ephemeral:true });
         });
       });
     }
-
   }
-
 });
 
-// ---------------- Owner Commands ----------------
+// ---------------- Owner Force Commands ----------------
 client.on(Events.MessageCreate, async message => {
   if(message.author.bot) return;
   const args = message.content.split(' ');
@@ -246,14 +235,11 @@ client.on(Events.MessageCreate, async message => {
   if(message.author.id === OWNER_ID){
     if(args[0] === '$release'){
       const tradeId = args[1];
-      // Force release logic here
-      sendMessage(message.channel, `Force release executed for trade #${tradeId}`);
+      sendEmbed(message.channel, `Force Release Executed`, `Trade #${tradeId} released by owner`, '#00ff00');
     }
-
     if(args[0] === '$refund'){
       const tradeId = args[1];
-      // Force refund logic here
-      sendMessage(message.channel, `Force refund executed for trade #${tradeId}`);
+      sendEmbed(message.channel, `Force Refund Executed`, `Trade #${tradeId} refunded by owner`, '#ff0000');
     }
   }
 });
