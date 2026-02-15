@@ -111,6 +111,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
   // ---------------- Button Handling ----------------
   if(interaction.isButton()){
+    await interaction.deferUpdate(); // Acknowledge to prevent "interaction failed"
     const [action, tradeId, extra] = interaction.customId.split('_');
 
     // Start Trade Modal
@@ -148,14 +149,14 @@ client.on(Events.InteractionCreate, async interaction => {
     // Choose roles
     if(action === 'choose'){
       db.get('SELECT * FROM trades WHERE id=?', tradeId, (err,row)=>{
-        if(!row) return interaction.reply({ content:'Trade not found', ephemeral:true });
+        if(!row) return;
 
         if(extra === 'sender'){
-          if(row.sender_id) return interaction.reply({ content:'Sender already chosen', ephemeral:true });
+          if(row.sender_id) return;
           db.run('UPDATE trades SET sender_id=? WHERE id=?', [interaction.user.id, tradeId]);
         }
         if(extra === 'receiver'){
-          if(row.receiver_id) return interaction.reply({ content:'Receiver already chosen', ephemeral:true });
+          if(row.receiver_id) return;
           db.run('UPDATE trades SET receiver_id=? WHERE id=?', [interaction.user.id, tradeId]);
         }
 
@@ -182,8 +183,7 @@ client.on(Events.InteractionCreate, async interaction => {
     if(action === 'release'){
       db.get('SELECT sender_id FROM trades WHERE id=?', tradeId, (err,row)=>{
         if(!row) return;
-        if(interaction.user.id !== row.sender_id && interaction.user.id !== OWNER_ID) 
-          return interaction.reply({ content:'Only sender/owner can release', ephemeral:true });
+        if(interaction.user.id !== row.sender_id && interaction.user.id !== OWNER_ID) return;
         sendEmbed(interaction.channel, 'Release Selected', 'Sender, input LTC address using modal', '#00ff00');
       });
     }
@@ -191,8 +191,7 @@ client.on(Events.InteractionCreate, async interaction => {
     if(action === 'refund'){
       db.get('SELECT sender_id, receiver_id FROM trades WHERE id=?', tradeId, (err,row)=>{
         if(!row) return;
-        if(interaction.user.id !== row.sender_id && interaction.user.id !== OWNER_ID)
-          return interaction.reply({ content:'Only sender/owner can refund', ephemeral:true });
+        if(interaction.user.id !== row.sender_id && interaction.user.id !== OWNER_ID) return;
         sendEmbed(interaction.channel, 'Refund Requested', 'Confirm Refund', '#ff0000');
       });
     }
