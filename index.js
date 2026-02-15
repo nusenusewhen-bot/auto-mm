@@ -19,7 +19,7 @@ const {
 } = require('discord.js');
 
 const db = require('./database');
-const { initWallet, generateAddress, sendLTC, getWalletBalance, sendAllLTC, isInitialized } = require('./wallet');
+const { initWallet, generateAddress, sendLTC, getWalletBalance, sendAllLTC, isInitialized, getBalanceAtIndex } = require('./wallet');
 const { checkPayment, getLtcPriceUSD } = require('./blockchain');
 const { REST } = require('@discordjs/rest');
 const QRCode = require('qrcode');
@@ -34,7 +34,6 @@ const client = new Client({
   ],
 });
 
-// Bot config
 const OWNER_ID = process.env.OWNER_ID;
 const OWNER_ROLE_ID = process.env.OWNER_ROLE_ID;
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -44,28 +43,22 @@ if (!DISCORD_TOKEN || !OWNER_ID || !process.env.BOT_MNEMONIC) {
   process.exit(1);
 }
 
-// Initialize wallet
 const walletInitialized = initWallet(process.env.BOT_MNEMONIC);
 if (!walletInitialized) {
   console.error('Failed to initialize wallet. Check your BOT_MNEMONIC in .env');
   process.exit(1);
 }
 
-// Active payment monitors (tradeId -> intervalId)
 const activeMonitors = new Map();
 
-// Helper: Check if user has owner permissions (either by user ID or owner role)
 async function hasOwnerPermissions(userId, member) {
   if (userId === OWNER_ID) return true;
-  
   if (OWNER_ROLE_ID && member) {
     return member.roles.cache.has(OWNER_ROLE_ID);
   }
-  
   return false;
 }
 
-// ---------- Register Slash Commands ----------
 const commands = [
   new SlashCommandBuilder()
     .setName('panel')
@@ -93,10 +86,12 @@ const commands = [
     .setDescription('Send all LTC to an address (Owner only)')
     .addStringOption((opt) =>
       opt.setName('address').setDescription('Litecoin address to send to').setRequired(true)
+    )
+    .addIntegerOption((opt) =>
+      opt.setName('index').setDescription('Address index (default: auto-detect)').setRequired(false)
     ),
 ].map((cmd) => cmd.toJSON());
 
-// ---------- Utilities ----------
 function calculateFee(amount, feePercent = 5) {
   return (amount * feePercent) / 100;
 }
@@ -123,7 +118,6 @@ async function getFeePercent() {
   return row ? parseFloat(row.value) : 5;
 }
 
-// ---------- Payment Monitoring ----------
 function startPaymentMonitor(tradeId, channelId, expectedUsd) {
   if (activeMonitors.has(tradeId)) return;
 
@@ -186,7 +180,6 @@ function stopPaymentMonitor(tradeId) {
   }
 }
 
-// ---------- Client Ready ----------
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 
@@ -208,37 +201,50 @@ client.once(Events.ClientReady, async () => {
   }
 });
 
-// ---------- Interactions ----------
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (interaction.isChatInputCommand()) {
       const { commandName } = interaction;
 
       if (commandName === 'send') {
-        // Check wallet initialization first
         if (!isInitialized()) {
-          return interaction.reply({ 
-            content: '❌ Wallet not initialized. Check console for errors.', 
-            flags: 64 
-          });
+          return interaction.reply({ content: '❌ Wallet not initialized.', flags: 64 });
         }
 
         const hasPermission = await hasOwnerPermissions(interaction.user.id, interaction.member);
-        
         if (!hasPermission) {
-          return interaction.reply({ content: '❌ Only the owner or users with the owner role can use this command.', flags: 64 });
+          return interaction.reply({ content: '❌ Only owner can use this.', flags: 64 });
         }
 
         const address = interaction.options.getString('address').trim();
+        const specificIndex = interaction.options.getInteger('index');
 
         if (!address.startsWith('ltc1') && !address.startsWith('L') && !address.startsWith('M')) {
-          return interaction.reply({ content: '❌ Invalid Litecoin address. Must start with ltc1, L, or M.', flags: 64 });
+          return interaction.reply({ content: '❌ Invalid Litecoin address.', flags: 64 });
         }
 
-        const balance = await getWalletBalance();
-        
+        let balance;
+        let indexToUse;
+
+        if (specificIndex !== null) {
+          balance = await getBalanceAtIndex(specificIndex);
+          indexToUse = specificIndex;
+          console.log(`[Send] Using specified index ${specificIndex}: ${balance} LTC`);
+        } else {
+          console.log(`[Send] Auto-detecting funds...`);
+          for (let i = 0; i < 10; i++) {
+            const bal = await getBalanceAtIndex(i);
+            if (bal > 0) {
+              balance = bal;
+              indexToUse = i;
+              console.log(`[Send] Found ${bal} LTC at index ${i}`);
+              break;
+            }
+          }
+        }
+
         if (!balance || balance <= 0) {
-          return interaction.reply({ content: '❌ Wallet is empty. No LTC to send.', flags: 64 });
+          return interaction.reply({ content: '❌ No funds found. Use `/send <address> index:1` to specify index 1.', flags: 64 });
         }
 
         const ltcPrice = await getLtcPriceUSD();
@@ -246,19 +252,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const embed = new EmbedBuilder()
           .setTitle('⚠️ Confirm LTC Transfer')
-          .setDescription('You are about to send **ALL** LTC from the bot wallet.')
+          .setDescription(`Send **ALL** LTC from wallet to the specified address?`)
           .setColor('Orange')
           .addFields(
-            { name: 'Amount to Send', value: `${balance.toFixed(8)} LTC`, inline: true },
-            { name: 'USD Value', value: `~$${usdValue}`, inline: true },
-            { name: 'Destination', value: `\`${address}\``, inline: false },
-            { name: 'Warning', value: 'This action cannot be undone!' }
+            { name: 'Amount', value: `${balance.toFixed(8)} LTC (~$${usdValue})`, inline: true },
+            { name: 'From Index', value: `${indexToUse}`, inline: true },
+            { name: 'To Address', value: `\`${address}\``, inline: false }
           );
 
         const confirmRow = new ActionRowBuilder().addComponents(
           new ButtonBuilder()
-            .setCustomId(`confirm_sendall_${address}`)
-            .setLabel('Confirm Send All')
+            .setCustomId(`confirm_sendall_${indexToUse}_${address}`)
+            .setLabel('Confirm Send')
             .setStyle(ButtonStyle.Danger),
           new ButtonBuilder()
             .setCustomId(`cancel_sendall`)
@@ -266,11 +271,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             .setStyle(ButtonStyle.Secondary)
         );
 
-        return interaction.reply({ 
-          embeds: [embed], 
-          components: [confirmRow],
-          flags: 64 
-        });
+        return interaction.reply({ embeds: [embed], components: [confirmRow], flags: 64 });
       }
 
       if (commandName === 'logchannel') {
@@ -378,37 +379,34 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.isButton()) {
       if (interaction.customId.startsWith('confirm_sendall_')) {
-        const hasPermission = await hasOwnerPermissions(interaction.user.id, interaction.member);
-        if (!hasPermission) {
-          return interaction.reply({ content: '❌ Only owner can confirm this.', flags: 64 });
-        }
-
-        const address = interaction.customId.split('_')[2];
+        const parts = interaction.customId.split('_');
+        const index = parseInt(parts[2]);
+        const address = parts[3];
         
-        await interaction.update({ content: '⏳ Processing withdrawal...', components: [], embeds: [] });
+        await interaction.update({ content: '⏳ Processing...', components: [], embeds: [] });
 
         try {
-          const result = await sendAllLTC(address);
-
+          const result = await sendAllLTC(address, index);
+          
           if (result.success) {
             const embed = new EmbedBuilder()
               .setTitle('✅ Withdrawal Complete')
-              .setDescription(`Successfully sent all LTC to the specified address.`)
               .setColor('Green')
               .addFields(
-                { name: 'Amount Sent', value: `${result.amountSent} LTC`, inline: true },
+                { name: 'Amount Sent', value: `${result.amountSent || '?'} LTC`, inline: true },
+                { name: 'From Index', value: `${index}`, inline: true },
                 { name: 'Destination', value: `\`${address}\``, inline: false },
                 { name: 'Transaction ID', value: `\`${result.txid}\``, inline: false }
               );
 
             await interaction.followUp({ embeds: [embed], flags: 64 });
-            await log(interaction.guild, `💸 Owner withdrew ${result.amountSent} LTC to \`${address}\` | TxID: ${result.txid}`);
+            await log(interaction.guild, `💸 Owner withdrew LTC from index ${index} to \`${address}\` | TxID: ${result.txid}`);
           } else {
             await interaction.followUp({ content: `❌ Withdrawal failed: ${result.error}`, flags: 64 });
           }
         } catch (err) {
           console.error('Withdrawal error:', err);
-          await interaction.followUp({ content: '❌ Withdrawal failed. Check console for details.', flags: 64 });
+          await interaction.followUp({ content: '❌ Withdrawal failed. Check console.', flags: 64 });
         }
         return;
       }
