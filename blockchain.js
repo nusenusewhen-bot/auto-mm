@@ -28,6 +28,7 @@ async function getLtcPriceUSD() {
   }
 }
 
+// Check if LTC deposit has reached the expected USD amount
 async function checkPayment(address, expectedUsd) {
   if (!BLOCKCYPHER_TOKEN) {
     console.error('BLOCKCYPHER_TOKEN not configured');
@@ -46,23 +47,35 @@ async function checkPayment(address, expectedUsd) {
       { timeout: 10000 }
     );
 
-    const receivedLtc = res.data.total_received / 1e8;
-    const receivedUsd = receivedLtc * price;
+    const confirmedLtc = res.data.total_received / 1e8;
+    const confirmedUsd = confirmedLtc * price;
     const unconfirmedLtc = res.data.unconfirmed_received / 1e8;
     const unconfirmedUsd = unconfirmedLtc * price;
+    const totalUsd = confirmedUsd + unconfirmedUsd;
 
     console.log(
-      `[Payment Check] ${address}: $${receivedUsd.toFixed(2)} confirmed / $${expectedUsd} ` +
-      `($${unconfirmedUsd.toFixed(2)} unconfirmed) - ${receivedLtc.toFixed(8)} LTC @ $${price}`
+      `[Payment Check] ${address}: $${confirmedUsd.toFixed(2)} confirmed + $${unconfirmedUsd.toFixed(2)} unconfirmed = $${totalUsd.toFixed(2)} / $${expectedUsd} expected`
     );
 
-    const tolerance = expectedUsd * 0.005;
-    return receivedUsd >= (expectedUsd - tolerance) && res.data.unconfirmed_n_tx === 0;
+    // Allow small tolerance (1%) for price fluctuations
+    const tolerance = expectedUsd * 0.01;
+    const requiredAmount = expectedUsd - tolerance;
+
+    // Check if total (confirmed + unconfirmed) meets requirement
+    if (totalUsd >= requiredAmount) {
+      if (res.data.unconfirmed_n_tx > 0) {
+        console.log(`[Payment Check] Payment detected with ${res.data.unconfirmed_n_tx} unconfirmed tx(s)`);
+      }
+      return true;
+    }
+
+    return false;
 
   } catch (err) {
     if (err.response?.status === 429) {
       console.error('BlockCypher rate limit hit');
     } else if (err.response?.status === 404) {
+      console.log(`[Payment Check] ${address}: No transactions yet`);
       return false;
     } else {
       console.error('Error checking payment:', err.message);
