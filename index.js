@@ -1,12 +1,6 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, Events, PermissionsBitField, ChannelType, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 const sqlite3 = require('sqlite3').verbose();
-const bip39 = require('bip39');
-const bitcoin = require('bitcoinjs-lib');
-const tinysecp = require('tiny-secp256k1');
-const { BIP32Factory } = require('bitcoinjs-lib/lib/bip32'); // correct import path
-
-const bip32 = BIP32Factory(tinysecp);
 
 const db = new sqlite3.Database('./trades.db');
 const client = new Client({
@@ -33,11 +27,17 @@ function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
-// Wallet – FIXED with BIP32Factory
+// Wallet – FIXED
 let root;
 const mnemonic = process.env.BOT_MNEMONIC;
 if (mnemonic) {
   try {
+    const bip39 = require('bip39');
+    const bitcoin = require('bitcoinjs-lib');
+    const tinysecp = require('tiny-secp256k1');
+
+    const bip32 = bitcoin.bip32;
+
     const seed = bip39.mnemonicToSeedSync(mnemonic);
 
     const ltcNet = {
