@@ -20,13 +20,13 @@ if (!TOKEN) {
   process.exit(1);
 }
 
-// Logging helper
+// Logging
 function log(msg) {
   const ts = new Date().toISOString();
   console.log(`[${ts}] ${msg}`);
 }
 
-// Litecoin wallet
+// Wallet (fixed)
 let root;
 const mnemonic = process.env.BOT_MNEMONIC;
 if (mnemonic) {
@@ -69,7 +69,7 @@ function getDepositAddress(index) {
   return address;
 }
 
-// DB setup
+// DB
 db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS keys (key TEXT PRIMARY KEY, used INTEGER DEFAULT 0)`);
   db.run(`CREATE TABLE IF NOT EXISTS activated_users (user_id TEXT PRIMARY KEY)`);
@@ -94,9 +94,11 @@ const panelRow = new ActionRowBuilder().addComponents(
     )
 );
 
-// Commands & interactions
+// Commands
 client.on(Events.InteractionCreate, async interaction => {
   if (interaction.isCommand()) {
+    log(`Command: /${interaction.commandName} by ${interaction.user.tag}`);
+
     const { commandName } = interaction;
 
     if (commandName === 'generatekey') {
@@ -111,26 +113,29 @@ client.on(Events.InteractionCreate, async interaction => {
       if (interaction.user.id === OWNER_ID) return interaction.reply({ content: "Owner doesn't need key.", ephemeral: true });
 
       db.get('SELECT used FROM keys WHERE key = ?', key, (err, row) => {
-        if (err || !row || row.used) return interaction.reply({ content: 'Invalid/used.', ephemeral: true });
+        if (err || !row || row.used) return interaction.reply({ content: 'Invalid or used.', ephemeral: true });
         db.run('UPDATE keys SET used = 1 WHERE key = ?', key);
         db.run('INSERT OR IGNORE INTO activated_users (user_id) VALUES (?)', interaction.user.id);
-        interaction.reply({ content: 'Activated!', ephemeral: true });
+        interaction.reply({ content: 'Activated! Use /autoticketpanel', ephemeral: true });
       });
     }
 
     if (commandName === 'autoticketpanel') {
-      if (interaction.user.id !== OWNER_ID) {
-        db.get('SELECT 1 FROM activated_users WHERE user_id = ?', interaction.user.id, (err, row) => {
-          if (!row) return interaction.reply({ content: 'Redeem a key first.', ephemeral: true });
-          interaction.reply({ embeds: [embed()], components: [panelRow] });
-        });
-      } else {
-        interaction.reply({ embeds: [embed()], components: [panelRow] });
-      }
+      db.get('SELECT 1 FROM activated_users WHERE user_id = ?', interaction.user.id, (err, row) => {
+        if (interaction.user.id !== OWNER_ID && !row) return interaction.reply({ content: 'Redeem a key first.', ephemeral: true });
+
+        const embed = new EmbedBuilder()
+          .setTitle('Crypto Currency')
+          .setDescription('**Fees:**\n• Deals over 250$: **2$**\n• Deals under 250$: **1$**\n• Deals under 50$: **0.7$**\n• Deals under 10$: **0.3$**\n• Deals under 5$: **FREE**')
+          .setColor('#0099ff');
+
+        interaction.reply({ embeds: [embed], components: [panelRow] });
+      });
     }
   }
 
   if (interaction.isStringSelectMenu() && interaction.customId === 'crypto_select') {
+    log(`Select: ${interaction.values[0]} by ${interaction.user.tag}`);
     const currency = interaction.values[0];
     const modal = new ModalBuilder()
       .setCustomId(`trade_modal_${currency}`)
@@ -164,6 +169,9 @@ client.on(Events.InteractionCreate, async interaction => {
   }
 
   if (interaction.isModalSubmit() && interaction.customId.startsWith('trade_modal_')) {
+    log(`Modal submit by ${interaction.user.tag}`);
+    await interaction.deferReply({ ephemeral: true });
+
     const currency = interaction.customId.split('_')[2];
     const otherInput = interaction.fields.getTextInputValue('other_user');
     const youGive = interaction.fields.getTextInputValue('you_give');
@@ -174,10 +182,11 @@ client.on(Events.InteractionCreate, async interaction => {
       const id = otherInput.replace(/[<@!>]/g, '');
       otherUser = await client.users.fetch(id);
     } catch (err) {
-      return interaction.reply({ content: 'Invalid user ID/mention.', ephemeral: true });
+      log(`User fetch failed: ${err}`);
+      return interaction.editReply({ content: 'Invalid user ID/mention.', ephemeral: true });
     }
 
-    if (otherUser.id === interaction.user.id) return interaction.reply({ content: "Can't trade with yourself.", ephemeral: true });
+    if (otherUser.id === interaction.user.id) return interaction.editReply({ content: "Can't trade with yourself.", ephemeral: true });
 
     const idx = Date.now() % 1000000;
     const addr = getDepositAddress(idx);
@@ -186,7 +195,10 @@ client.on(Events.InteractionCreate, async interaction => {
       'INSERT INTO trades (buyer_id, currency, deposit_addr, channel_id, status) VALUES (?, ?, ?, ?, ?)',
       [interaction.user.id, currency, addr, 'pending', 'waiting_role'],
       function(err) {
-        if (err) return interaction.reply({ content: 'DB error.', ephemeral: true });
+        if (err) {
+          log(`DB insert error: ${err}`);
+          return interaction.editReply({ content: 'DB error.', ephemeral: true });
+        }
         const tradeId = this.lastID;
 
         const overwrites = [
@@ -220,10 +232,11 @@ client.on(Events.InteractionCreate, async interaction => {
 
           ch.send({ content: `${otherUser}, pick your role:`, embeds: [embed], components: [row] });
 
-          interaction.reply({ content: `Ticket created: ${ch}`, ephemeral: true });
+          interaction.editReply({ content: `Ticket created: ${ch}`, ephemeral: true });
+          log(`Ticket created: ${ch.id}`);
         }).catch(err => {
-          console.error('Channel error:', err);
-          interaction.reply({ content: 'Failed to create channel (bot needs Manage Channels permission).', ephemeral: true });
+          log(`Channel create error: ${err}`);
+          interaction.editReply({ content: 'Failed to create channel (bot needs Manage Channels permission).', ephemeral: true });
         });
       }
     );
@@ -241,13 +254,14 @@ client.on(Events.InteractionCreate, async interaction => {
 
         db.run('UPDATE trades SET status = ? WHERE id = ?', [isSender ? 'sender' : 'receiver', tradeId]);
         interaction.update({ content: `${interaction.user} chose **${isSender ? 'Sender' : 'Receiver'}**`, components: [] });
+        log(`Role set: ${isSender ? 'Sender' : 'Receiver'} for trade ${tradeId}`);
       });
     }
   }
 });
 
-client.once('ready', () => {
-  console.log(`Logged in as ${client.user.tag}`);
+client.once(Events.ClientReady, () => {
+  log(`Logged in as ${client.user.tag}`);
 });
 
 client.login(TOKEN);
