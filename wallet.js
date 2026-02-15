@@ -16,23 +16,23 @@ const ltcNet = {
 
 let root;
 let initialized = false;
-let walletMnemonic = null;
+const balanceCache = new Map();
 
-const GAP_LIMIT = 100;
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 function initWallet(mnemonic) {
   console.log("[Wallet] Initializing wallet...");
 
   if (!mnemonic) {
     console.error("❌ [Wallet] No BOT_MNEMONIC set in environment");
-    console.error("[Wallet] Make sure your .env file has: BOT_MNEMONIC=your twelve word phrase here");
     return false;
   }
 
   const cleanMnemonic = mnemonic.trim().toLowerCase().replace(/\s+/g, ' ');
 
   console.log(`[Wallet] Mnemonic length: ${cleanMnemonic.split(' ').length} words`);
-  console.log(`[Wallet] First 4 words: ${cleanMnemonic.split(' ').slice(0, 4).join(' ')}...`);
 
   try {
     if (!bip39.validateMnemonic(cleanMnemonic)) {
@@ -43,11 +43,10 @@ function initWallet(mnemonic) {
     const seed = bip39.mnemonicToSeedSync(cleanMnemonic);
     root = hdkey.fromMasterSeed(seed);
     initialized = true;
-    walletMnemonic = cleanMnemonic;
     
-    const firstAddress = generateAddress(0);
-    console.log(`✅ [Wallet] Litecoin HD wallet initialized successfully`);
-    console.log(`✅ [Wallet] First address (index 0): ${firstAddress}`);
+    console.log(`✅ [Wallet] Wallet initialized`);
+    console.log(`✅ [Wallet] Address [0]: ${generateAddress(0)}`);
+    console.log(`✅ [Wallet] Address [1]: ${generateAddress(1)}`);
 
     return true;
   } catch (err) {
@@ -61,279 +60,163 @@ function isInitialized() {
 }
 
 function generateAddress(index) {
-  if (!initialized || !root) {
-    console.error("[Wallet] ERROR: Wallet not initialized when generating address");
-    return "WALLET_NOT_INITIALIZED";
-  }
-
+  if (!initialized || !root) return "WALLET_NOT_INITIALIZED";
   try {
     const child = root.derive(`m/44'/2'/0'/0/${index}`);
-    const { address } = bitcoin.payments.p2wpkh({
-      pubkey: child.publicKey,
-      network: ltcNet
-    });
+    const { address } = bitcoin.payments.p2wpkh({ pubkey: child.publicKey, network: ltcNet });
     return address;
   } catch (err) {
-    console.error(`[Wallet] Failed to generate address for index ${index}:`, err);
     return "ADDRESS_GENERATION_FAILED";
   }
 }
 
 function getPrivateKeyWIF(index) {
-  if (!initialized || !root) {
-    console.error("[Wallet] ERROR: Wallet not initialized when getting private key");
-    return null;
-  }
-
+  if (!initialized || !root) return null;
   try {
     const child = root.derive(`m/44'/2'/0'/0/${index}`);
-    const wif = bitcoin.ECPair.fromPrivateKey(child.privateKey, { network: ltcNet }).toWIF();
-    return wif;
+    return bitcoin.ECPair.fromPrivateKey(child.privateKey, { network: ltcNet }).toWIF();
   } catch (err) {
-    console.error(`[Wallet] Failed to get private key for index ${index}:`, err);
     return null;
-  }
-}
-
-async function getAddressUTXOs(address) {
-  if (!BLOCKCYPHER_TOKEN) {
-    console.error("[Wallet] ERROR: BLOCKCYPHER_TOKEN not set");
-    return [];
-  }
-
-  try {
-    const res = await axios.get(
-      `https://api.blockcypher.com/v1/ltc/main/addrs/${address}?unspentOnly=true&token=${BLOCKCYPHER_TOKEN}`,
-      { timeout: 15000 }
-    );
-
-    if (!res.data.txrefs) return [];
-
-    return res.data.txrefs.map(utxo => ({
-      txid: utxo.tx_hash,
-      vout: utxo.tx_output_n,
-      value: utxo.value,
-      confirmations: utxo.confirmations
-    }));
-  } catch (err) {
-    if (err.response?.status === 429) {
-      console.error(`[Wallet] Rate limit hit for address ${address}`);
-    } else if (err.response?.status === 404) {
-      return [];
-    } else {
-      console.error(`[Wallet] Error fetching UTXOs for ${address}:`, err.message);
-    }
-    return [];
   }
 }
 
 async function getAddressBalance(address) {
-  if (!BLOCKCYPHER_TOKEN) {
-    console.error("[Wallet] ERROR: BLOCKCYPHER_TOKEN not set");
-    return 0;
-  }
+  if (!BLOCKCYPHER_TOKEN) return 0;
+  if (balanceCache.has(address)) return balanceCache.get(address);
 
   try {
+    // Wait 1 second between requests to avoid rate limits
+    await delay(1000);
+    
     const res = await axios.get(
       `https://api.blockcypher.com/v1/ltc/main/addrs/${address}/balance?token=${BLOCKCYPHER_TOKEN}`,
-      { timeout: 10000 }
+      { timeout: 15000 }
     );
     
-    return (res.data.balance || 0) / 1e8;
+    const balance = (res.data.balance || 0) / 1e8;
+    balanceCache.set(address, balance);
+    return balance;
   } catch (err) {
     if (err.response?.status === 429) {
-      console.error(`[Wallet] Rate limit hit for address ${address}`);
-    } else if (err.response?.status === 404) {
-      return 0;
-    } else {
-      console.error(`[Wallet] Error fetching balance for ${address}:`, err.message);
+      console.error(`[Wallet] Rate limit hit! Waiting 10 seconds...`);
+      await delay(10000);
+      // Try once more
+      try {
+        const res = await axios.get(
+          `https://api.blockcypher.com/v1/ltc/main/addrs/${address}/balance?token=${BLOCKCYPHER_TOKEN}`,
+          { timeout: 15000 }
+        );
+        const balance = (res.data.balance || 0) / 1e8;
+        balanceCache.set(address, balance);
+        return balance;
+      } catch {
+        return 0;
+      }
     }
     return 0;
   }
 }
 
-async function getWalletBalance() {
-  if (!isInitialized()) {
-    console.error("❌ [Wallet] Cannot get balance: Wallet not initialized");
-    console.error("[Wallet] Make sure BOT_MNEMONIC is set correctly in .env");
-    return 0;
-  }
-
+async function getAddressUTXOs(address) {
+  if (!BLOCKCYPHER_TOKEN) return [];
   try {
-    let totalBalance = 0;
-    let checkedCount = 0;
-    let lastUsedIndex = -1;
-    let consecutiveEmpty = 0;
-    
-    console.log(`[Wallet] Starting balance scan (max ${GAP_LIMIT} addresses)...`);
-    
-    for (let i = 0; i < GAP_LIMIT; i++) {
-      const address = generateAddress(i);
-      
-      if (address === "WALLET_NOT_INITIALIZED" || address === "ADDRESS_GENERATION_FAILED") {
-        console.error(`[Wallet] Failed to generate address at index ${i}`);
-        continue;
-      }
-      
-      const balance = await getAddressBalance(address);
-      
-      if (balance > 0) {
-        console.log(`[Wallet] ✅ Address ${i}: ${balance} LTC (${address})`);
-        totalBalance += balance;
-        lastUsedIndex = i;
-        consecutiveEmpty = 0;
-      } else {
-        consecutiveEmpty++;
-      }
-      
-      checkedCount++;
-      
-      if (consecutiveEmpty >= 20 && lastUsedIndex !== -1) {
-        console.log(`[Wallet] Reached gap limit (20 empty addresses). Stopping scan at index ${i}`);
-        break;
-      }
-    }
-    
-    console.log(`[Wallet] Scan complete. Checked ${checkedCount} addresses.`);
-    console.log(`[Wallet] Total balance found: ${totalBalance} LTC`);
-    
-    if (totalBalance === 0) {
-      console.log("[Wallet] ⚠️ No balance found in any address!");
-      console.log("[Wallet] Make sure you have LTC in addresses derived from this mnemonic");
-      console.log(`[Wallet] First few addresses to check:`);
-      for (let i = 0; i < 5; i++) {
-        console.log(`[Wallet]   Index ${i}: ${generateAddress(i)}`);
-      }
-    }
-    
-    return totalBalance;
+    await delay(1000);
+    const res = await axios.get(
+      `https://api.blockcypher.com/v1/ltc/main/addrs/${address}?unspentOnly=true&token=${BLOCKCYPHER_TOKEN}`,
+      { timeout: 15000 }
+    );
+    if (!res.data.txrefs) return [];
+    return res.data.txrefs.map(utxo => ({
+      txid: utxo.tx_hash,
+      vout: utxo.tx_output_n,
+      value: utxo.value
+    }));
   } catch (err) {
-    console.error('[Wallet] Error getting wallet balance:', err.message);
-    return 0;
-  }
-}
-
-async function getFundedAddresses() {
-  if (!isInitialized()) {
-    console.error("❌ [Wallet] Cannot get funded addresses: Wallet not initialized");
     return [];
   }
-
-  const funded = [];
-  let lastUsedIndex = -1;
-  let consecutiveEmpty = 0;
-  
-  console.log(`[Wallet] Scanning for funded addresses...`);
-  
-  for (let i = 0; i < GAP_LIMIT; i++) {
-    const address = generateAddress(i);
-    const balance = await getAddressBalance(address);
-    
-    if (balance > 0) {
-      console.log(`[Wallet] Found funded address at index ${i}: ${address} (${balance} LTC)`);
-      const utxos = await getAddressUTXOs(address);
-      funded.push({
-        index: i,
-        address: address,
-        balance: balance,
-        utxos: utxos
-      });
-      lastUsedIndex = i;
-      consecutiveEmpty = 0;
-    } else {
-      consecutiveEmpty++;
-    }
-    
-    if (consecutiveEmpty >= 20 && lastUsedIndex !== -1) {
-      break;
-    }
-  }
-  
-  console.log(`[Wallet] Found ${funded.length} funded addresses with total balance: ${funded.reduce((sum, f) => sum + f.balance, 0)} LTC`);
-  return funded;
 }
 
-async function sendLTC(tradeId, toAddress, amountLTC) {
-  if (!isInitialized()) {
-    return { success: false, error: 'Wallet not initialized' };
+async function getWalletBalance(specificIndex = null) {
+  if (!isInitialized()) return 0;
+
+  // If specific index provided, use that
+  if (specificIndex !== null) {
+    const address = generateAddress(specificIndex);
+    const balance = await getAddressBalance(address);
+    console.log(`[Wallet] Index ${specificIndex}: ${balance} LTC`);
+    return balance;
   }
 
-  if (!BLOCKCYPHER_TOKEN) {
-    return { success: false, error: 'BLOCKCYPHER_TOKEN not configured' };
+  // Otherwise scan first 20 addresses
+  let total = 0;
+  for (let i = 0; i < 20; i++) {
+    const balance = await getBalanceAtIndex(i);
+    if (balance > 0) {
+      console.log(`[Wallet] Found ${balance} LTC at index ${i}`);
+      total += balance;
+    }
   }
+  return total;
+}
+
+async function getBalanceAtIndex(index) {
+  if (!isInitialized()) return 0;
+  const address = generateAddress(index);
+  return await getAddressBalance(address);
+}
+
+async function sendFromIndex(index, toAddress, amountLTC) {
+  if (!isInitialized()) return { success: false, error: 'Wallet not initialized' };
+  if (!BLOCKCYPHER_TOKEN) return { success: false, error: 'BLOCKCYPHER_TOKEN not configured' };
 
   try {
-    const fromAddress = generateAddress(tradeId);
-    const wif = getPrivateKeyWIF(tradeId);
+    const fromAddress = generateAddress(index);
+    const wif = getPrivateKeyWIF(index);
+    if (!wif) return { success: false, error: 'Could not derive private key' };
 
-    if (!wif) {
-      return { success: false, error: 'Could not derive private key' };
-    }
-
+    console.log(`[Wallet] Sending from index ${index} (${fromAddress})`);
+    
     const utxos = await getAddressUTXOs(fromAddress);
-    if (utxos.length === 0) {
-      return { success: false, error: 'No UTXOs found (insufficient balance)' };
-    }
+    if (utxos.length === 0) return { success: false, error: 'No UTXOs found' };
 
     const amountSatoshi = Math.floor(parseFloat(amountLTC) * 1e8);
     const fee = 10000;
     const totalInput = utxos.reduce((sum, u) => sum + u.value, 0);
 
     if (totalInput < amountSatoshi + fee) {
-      return { success: false, error: `Insufficient balance. Have: ${totalInput / 1e8}, Need: ${(amountSatoshi + fee) / 1e8}` };
+      return { success: false, error: `Insufficient balance. Have: ${totalInput / 1e8}` };
     }
 
     const psbt = new bitcoin.Psbt({ network: ltcNet });
-
     let inputSum = 0;
+
     for (const utxo of utxos) {
       if (inputSum >= amountSatoshi + fee) break;
-
       try {
+        await delay(1000);
         const txRes = await axios.get(
           `https://api.blockcypher.com/v1/ltc/main/txs/${utxo.txid}?token=${BLOCKCYPHER_TOKEN}`,
           { timeout: 10000 }
         );
-
-        const tx = txRes.data;
-        const output = tx.outputs[utxo.vout];
-
+        const output = txRes.data.outputs[utxo.vout];
         psbt.addInput({
           hash: utxo.txid,
           index: utxo.vout,
-          witnessUtxo: {
-            script: Buffer.from(output.script, 'hex'),
-            value: utxo.value
-          }
+          witnessUtxo: { script: Buffer.from(output.script, 'hex'), value: utxo.value }
         });
-
         inputSum += utxo.value;
       } catch (err) {
-        console.error('[Wallet] Error fetching TX:', err.message);
         continue;
       }
     }
 
-    psbt.addOutput({
-      address: toAddress,
-      value: amountSatoshi
-    });
-
+    psbt.addOutput({ address: toAddress, value: amountSatoshi });
     const change = inputSum - amountSatoshi - fee;
-    if (change > 546) {
-      psbt.addOutput({
-        address: fromAddress,
-        value: change
-      });
-    }
+    if (change > 546) psbt.addOutput({ address: fromAddress, value: change });
 
     const keyPair = bitcoin.ECPair.fromWIF(wif, ltcNet);
     for (let i = 0; i < psbt.inputCount; i++) {
-      try {
-        psbt.signInput(i, keyPair);
-      } catch (err) {
-        console.error(`[Wallet] Error signing input ${i}:`, err.message);
-      }
+      try { psbt.signInput(i, keyPair); } catch (e) {}
     }
 
     psbt.finalizeAllInputs();
@@ -341,179 +224,52 @@ async function sendLTC(tradeId, toAddress, amountLTC) {
 
     const broadcastRes = await axios.post(
       `https://api.blockcypher.com/v1/ltc/main/txs/push?token=${BLOCKCYPHER_TOKEN}`,
-      { tx: txHex },
-      { timeout: 15000 }
+      { tx: txHex }, { timeout: 15000 }
     );
 
-    return {
-      success: true,
-      txid: broadcastRes.data.tx.hash
-    };
-
+    return { success: true, txid: broadcastRes.data.tx.hash };
   } catch (err) {
-    console.error('[Wallet] Send LTC error:', err);
     return { success: false, error: err.response?.data?.error || err.message };
   }
 }
 
-async function sendAllLTC(toAddress) {
-  if (!isInitialized()) {
-    return { success: false, error: 'Wallet not initialized' };
-  }
-
-  if (!BLOCKCYPHER_TOKEN) {
-    return { success: false, error: 'BLOCKCYPHER_TOKEN not configured' };
-  }
-
-  try {
-    console.log(`[Wallet] Starting sendAllLTC to ${toAddress}`);
-    const fundedAddresses = await getFundedAddresses();
-    
-    if (fundedAddresses.length === 0) {
-      return { success: false, error: 'No funded addresses found' };
-    }
-
-    const psbt = new bitcoin.Psbt({ network: ltcNet });
-    let totalInput = 0;
-    const fee = 10000;
-
-    for (const funded of fundedAddresses) {
-      for (const utxo of funded.utxos) {
-        try {
-          const txRes = await axios.get(
-            `https://api.blockcypher.com/v1/ltc/main/txs/${utxo.txid}?token=${BLOCKCYPHER_TOKEN}`,
-            { timeout: 10000 }
-          );
-
-          const tx = txRes.data;
-          const output = tx.outputs[utxo.vout];
-
-          psbt.addInput({
-            hash: utxo.txid,
-            index: utxo.vout,
-            witnessUtxo: {
-              script: Buffer.from(output.script, 'hex'),
-              value: utxo.value
-            }
-          });
-
-          totalInput += utxo.value;
-        } catch (err) {
-          console.error(`[Wallet] Error fetching TX for UTXO ${utxo.txid}:`, err.message);
-          continue;
-        }
-      }
-    }
-
-    if (psbt.inputCount === 0) {
-      return { success: false, error: 'Could not add any inputs' };
-    }
-
-    const amountToSend = totalInput - fee;
-    if (amountToSend <= 0) {
-      return { success: false, error: 'Insufficient balance to cover fees' };
-    }
-
-    psbt.addOutput({
-      address: toAddress,
-      value: amountToSend
-    });
-
-    let inputIndex = 0;
-    for (const funded of fundedAddresses) {
-      const wif = getPrivateKeyWIF(funded.index);
-      
-      if (!wif) {
-        console.error(`[Wallet] Could not get WIF for index ${funded.index}`);
-        continue;
-      }
-
-      const keyPair = bitcoin.ECPair.fromWIF(wif, ltcNet);
-      
-      for (let i = 0; i < funded.utxos.length; i++) {
-        try {
-          psbt.signInput(inputIndex, keyPair);
-          inputIndex++;
-        } catch (err) {
-          console.error(`[Wallet] Error signing input ${inputIndex}:`, err.message);
-          inputIndex++;
-        }
-      }
-    }
-
-    psbt.finalizeAllInputs();
-    const txHex = psbt.extractTransaction().toHex();
-
-    const broadcastRes = await axios.post(
-      `https://api.blockcypher.com/v1/ltc/main/txs/push?token=${BLOCKCYPHER_TOKEN}`,
-      { tx: txHex },
-      { timeout: 15000 }
-    );
-
-    console.log(`[Wallet] Successfully sent ${(amountToSend / 1e8).toFixed(8)} LTC`);
-    
-    return {
-      success: true,
-      txid: broadcastRes.data.tx.hash,
-      amountSent: (amountToSend / 1e8).toFixed(8)
-    };
-
-  } catch (err) {
-    console.error('[Wallet] Send All LTC error:', err);
-    return { success: false, error: err.response?.data?.error || err.message };
-  }
+async function sendLTC(tradeId, toAddress, amountLTC) {
+  return sendFromIndex(tradeId, toAddress, amountLTC);
 }
 
-async function sendLTCMicrotx(tradeId, toAddress, amountLTC) {
-  if (!isInitialized()) {
-    return { success: false, error: 'Wallet not initialized' };
-  }
-
-  if (!BLOCKCYPHER_TOKEN) {
-    return { success: false, error: 'BLOCKCYPHER_TOKEN not configured' };
-  }
-
-  try {
-    const fromAddress = generateAddress(tradeId);
-    const wif = getPrivateKeyWIF(tradeId);
-
-    if (!wif) {
-      return { success: false, error: 'Could not derive private key' };
+async function sendAllLTC(toAddress, specificIndex = null) {
+  if (!isInitialized()) return { success: false, error: 'Wallet not initialized' };
+  
+  let indexToUse = specificIndex;
+  
+  // If no index specified, try to find one with balance
+  if (indexToUse === null) {
+    console.log(`[Wallet] Searching for funds in first 10 addresses...`);
+    for (let i = 0; i < 10; i++) {
+      const balance = await getBalanceAtIndex(i);
+      if (balance > 0) {
+        indexToUse = i;
+        console.log(`[Wallet] Found funds at index ${i}: ${balance} LTC`);
+        break;
+      }
     }
-
-    const amountSatoshi = Math.floor(parseFloat(amountLTC) * 1e8);
-
-    const res = await axios.post(
-      `https://api.blockcypher.com/v1/ltc/main/txs/micro?token=${BLOCKCYPHER_TOKEN}`,
-      {
-        from_address: fromAddress,
-        to_address: toAddress,
-        value_satoshis: amountSatoshi,
-        private_key: wif
-      },
-      { timeout: 30000 }
-    );
-
-    return {
-      success: true,
-      txid: res.data.tx.hash
-    };
-
-  } catch (err) {
-    console.error('[Wallet] Microtx error:', err.response?.data || err.message);
-    return { success: false, error: err.response?.data?.error || err.message };
   }
+  
+  if (indexToUse === null) {
+    return { success: false, error: 'No funded addresses found' };
+  }
+  
+  const balance = await getBalanceAtIndex(indexToUse);
+  if (balance <= 0) return { success: false, error: 'No balance at specified index' };
+  
+  // Subtract fee (0.0001 LTC)
+  const amountToSend = Math.max(0, balance - 0.0001);
+  console.log(`[Wallet] Sending ${amountToSend} LTC from index ${indexToUse}`);
+  
+  return await sendFromIndex(indexToUse, toAddress, amountToSend.toFixed(8));
 }
 
 module.exports = { 
-  initWallet, 
-  isInitialized,
-  generateAddress, 
-  getPrivateKeyWIF, 
-  sendLTC, 
-  sendLTCMicrotx,
-  getWalletBalance,
-  getAddressBalance,
-  getFundedAddresses,
-  sendAllLTC
+  initWallet, isInitialized, generateAddress, getPrivateKeyWIF, 
+  sendLTC, sendFromIndex, getWalletBalance, getBalanceAtIndex, sendAllLTC 
 };
