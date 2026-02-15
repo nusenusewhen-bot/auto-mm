@@ -1,13 +1,13 @@
 import discord
 from discord import app_commands, SelectOption
-from discord.ui import View, Select, Modal, TextInput, Button
+from discord.ui import View, Select, Modal, TextInput
 import os
 import sqlite3
 import asyncio
 from dotenv import load_dotenv
 import time
-import traceback
 from datetime import datetime
+from bitcoinlib.wallets import Wallet, wallet_exists, WalletError
 
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
@@ -19,9 +19,8 @@ if not TOKEN:
 
 OWNER_ID = 1298640383688970293
 
-# Logging helper
 def log(msg):
-    ts = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"[{ts}] {msg}")
 
 # Wallet
@@ -29,7 +28,6 @@ wallet = None
 if MNEMONIC:
     name = "AutoMMBotWallet"
     try:
-        from bitcoinlib.wallets import Wallet, wallet_exists, WalletError
         if wallet_exists(name):
             wallet = Wallet(name)
             log(f"Opened wallet: {name}")
@@ -44,7 +42,7 @@ def get_addr(idx):
     try:
         return wallet.key_for_path(f"m/44'/2'/0'/0/{idx}").address if wallet else "NO_WALLET"
     except Exception as e:
-        log(f"Addr gen error: {e}")
+        log(f"Addr error: {e}")
         return "ADDR_ERROR"
 
 # Database
@@ -70,7 +68,7 @@ class TradeModal(Modal, title="Trade Setup"):
         self.currency = currency
 
     async def on_submit(self, i: discord.Interaction):
-        log(f"Modal submit started | User: {i.user} | Currency: {self.currency}")
+        log(f"Modal submit | User: {i.user} | Currency: {self.currency}")
         await i.response.defer(ephemeral=True)
 
         try:
@@ -84,12 +82,12 @@ class TradeModal(Modal, title="Trade Setup"):
 
             if not u:
                 await i.followup.send("Invalid user.", ephemeral=True)
-                log("Modal failed: invalid user")
+                log("Modal: invalid user")
                 return
 
             if u.id == i.user.id:
                 await i.followup.send("Can't trade with self.", ephemeral=True)
-                log("Modal failed: self-trade")
+                log("Modal: self-trade attempt")
                 return
 
             idx = int(time.time() * 1000) % 1000000
@@ -123,12 +121,12 @@ class TradeModal(Modal, title="Trade Setup"):
                 f"{u.mention} pick role:", view=view
             )
 
-            await i.followup.send(f"Ticket created: {ch.mention}", ephemeral=True)
-            log(f"Modal success | Trade #{trade_id} | Channel: {ch.id}")
+            await i.followup.send(f"Ticket: {ch.mention}", ephemeral=True)
+            log(f"Modal success | Trade #{trade_id} | Channel {ch.id}")
 
         except Exception as e:
-            log(f"Modal CRASH: {e}\n{traceback.format_exc()}")
-            await i.followup.send("Something broke. Check logs.", ephemeral=True)
+            log(f"Modal CRASH: {str(e)}\n{traceback.format_exc()}")
+            await i.followup.send("Failed to create ticket. Check logs.", ephemeral=True)
 
 class RoleView(View):
     def __init__(self, tid, starter, other):
@@ -138,30 +136,22 @@ class RoleView(View):
 
     @discord.ui.button(label="Sender", style=discord.ButtonStyle.green, custom_id="sender_btn")
     async def sender(self, i: discord.Interaction, _):
-        log(f"Button 'Sender' clicked | User: {i.user} | Trade: {self.tid}")
+        log(f"Sender button clicked | User: {i.user} | Trade: {self.tid}")
         if i.user.id != self.other:
             return await i.response.send_message("Not for you.", ephemeral=True)
-        try:
-            c.execute("UPDATE trades SET status='sender' WHERE id=?", (self.tid,))
-            conn.commit()
-            await i.response.send_message(f"{i.user.mention} is Sender", ephemeral=False)
-            log(f"Sender role set for trade {self.tid}")
-        except Exception as e:
-            log(f"Sender button crash: {e}")
+        c.execute("UPDATE trades SET status='sender' WHERE id=?", (self.tid,))
+        conn.commit()
+        await i.response.send_message(f"{i.user.mention} is Sender", ephemeral=False)
         self.stop()
 
     @discord.ui.button(label="Receiver", style=discord.ButtonStyle.blurple, custom_id="receiver_btn")
     async def receiver(self, i: discord.Interaction, _):
-        log(f"Button 'Receiver' clicked | User: {i.user} | Trade: {self.tid}")
+        log(f"Receiver button clicked | User: {i.user} | Trade: {self.tid}")
         if i.user.id != self.other:
             return await i.response.send_message("Not for you.", ephemeral=True)
-        try:
-            c.execute("UPDATE trades SET status='receiver' WHERE id=?", (self.tid,))
-            conn.commit()
-            await i.response.send_message(f"{i.user.mention} is Receiver", ephemeral=False)
-            log(f"Receiver role set for trade {self.tid}")
-        except Exception as e:
-            log(f"Receiver button crash: {e}")
+        c.execute("UPDATE trades SET status='receiver' WHERE id=?", (self.tid,))
+        conn.commit()
+        await i.response.send_message(f"{i.user.mention} is Receiver", ephemeral=False)
         self.stop()
 
 class PanelView(View):
@@ -182,7 +172,7 @@ class PanelView(View):
 
         @sel.callback
         async def cb(i: discord.Interaction):
-            log(f"Select callback | User: {i.user} | Selected: {i.data['values'][0]}")
+            log(f"Select callback | User: {i.user} | Currency: {i.data['values'][0]}")
             await i.response.send_modal(TradeModal(i.data['values'][0]))
 
         self.add_item(sel)
@@ -225,23 +215,24 @@ async def tp(i: discord.Interaction):
 
 @client.event
 async def on_ready():
-    print(f'Logged in: {client.user}')
+    log(f'Logged in: {client.user} (ID: {client.user.id})')
+
     try:
         synced = await tree.sync()
-        print(f"Synced {len(synced)} global commands")
+        log(f"Global sync: {len(synced)} commands")
         for s in synced:
-            print(f" - /{s.name}")
+            log(f" - /{s.name}")
     except Exception as e:
-        print(f"Global sync failed: {e}")
+        log(f"Global sync failed: {e}")
 
-    YOUR_GUILD_ID = 123456789012345678  # REPLACE WITH YOUR SERVER ID
+    YOUR_GUILD_ID = 1298640383688970293  # REPLACE WITH YOUR ACTUAL SERVER ID
     guild = client.get_guild(YOUR_GUILD_ID)
     if guild:
         try:
             await tree.sync(guild=guild)
-            print(f"Guild sync done: {guild.name}")
+            log(f"Guild sync done: {guild.name}")
         except Exception as e:
-            print(f"Guild sync failed: {e}")
+            log(f"Guild sync failed: {e}")
 
     client.add_view(PanelView())
 
