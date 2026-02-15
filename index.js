@@ -1,266 +1,186 @@
 require('dotenv').config();
-const { 
-  Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, 
-  ButtonBuilder, ButtonStyle, Events, PermissionsBitField, ChannelType,
-  ModalBuilder, TextInputBuilder, TextInputStyle 
+const {
+  Client,
+  GatewayIntentBits,
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  ChannelType,
+  PermissionsBitField,
+  Events
 } = require('discord.js');
-const sqlite3 = require('sqlite3').verbose();
-const { initWallet, getDepositAddress } = require('./wallet');
 
-const db = new sqlite3.Database('./trades.db');
+const db = require('./database');
+const { initWallet, generateAddress } = require('./wallet');
+const { checkPayment } = require('./blockchain');
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers
+    GatewayIntentBits.MessageContent
   ]
 });
 
-const OWNER_ID = '1298640383688970293';
-const TOKEN = process.env.DISCORD_TOKEN;
-const OWNER_LTC_ADDRESS = 'LeDdjh2BDbPkrhG2pkWBko3HRdKQzprJMX';
+initWallet(process.env.BOT_MNEMONIC);
 
-// ---------------- Initialize Wallet ----------------
-client.once(Events.ClientReady, () => {
-  console.log(`Logged in as ${client.user.tag}`);
-  initWallet(process.env.BOT_MNEMONIC);
-});
-
-// ---------------- Database Setup ----------------
-db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS keys (key TEXT PRIMARY KEY, used INTEGER DEFAULT 0)`);
-  db.run(`CREATE TABLE IF NOT EXISTS activated_users (user_id TEXT PRIMARY KEY)`);
-  db.run(`CREATE TABLE IF NOT EXISTS trades (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    channel_id TEXT,
-    sender_id TEXT,
-    receiver_id TEXT,
-    you_give TEXT,
-    they_give TEXT,
-    amount REAL,
-    fee REAL,
-    deposit_addr TEXT,
-    status TEXT DEFAULT 'waiting_role'
-  )`);
-});
-
-// ---------------- Helper Functions ----------------
-function calculateFee(value){
-  if(value <= 5) return 0;
-  if(value <= 10) return 0.3;
-  if(value <= 50) return 0.7;
-  if(value <= 100) return 1;
-  if(value > 250) return 2;
+function calculateFee(amount) {
+  if (amount <= 5) return 0;
+  if (amount <= 10) return 0.3;
+  if (amount <= 50) return 0.7;
+  if (amount <= 100) return 1;
+  if (amount > 250) return 2;
   return 0;
 }
 
-function sendEmbed(channel, title, description, color='#00aaff', components=[]){
-  const embed = new EmbedBuilder()
-    .setTitle(title)
-    .setDescription(description)
-    .setColor(color);
-  return channel.send({ embeds:[embed], components });
+function log(guild, message) {
+  const row = db.prepare(`SELECT value FROM config WHERE key='logChannel'`).get();
+  if (!row) return;
+  const channel = guild.channels.cache.get(row.value);
+  if (channel) channel.send(message);
 }
 
-// ---------------- Commands ----------------
+client.once(Events.ClientReady, () => {
+  console.log(`Logged in as ${client.user.tag}`);
+});
+
 client.on(Events.InteractionCreate, async interaction => {
-  if(interaction.isCommand()){
-    const { commandName } = interaction;
 
-    // Owner generates key
-    if(commandName === 'generatekey'){
-      if(interaction.user.id !== OWNER_ID)
-        return interaction.reply({ content:'Only owner.', ephemeral:true });
-      const key = Math.random().toString(36).substring(2,18).toUpperCase();
-      db.run('INSERT INTO keys(key) VALUES(?)', key);
-      return interaction.reply({ content:`Key: \`${key}\``, ephemeral:true });
+  if (interaction.isChatInputCommand()) {
+
+    if (interaction.commandName === 'logchannel') {
+      const id = interaction.options.getString('channelid');
+      db.prepare(`INSERT OR REPLACE INTO config(key,value) VALUES('logChannel',?)`).run(id);
+      return interaction.reply({ content: `Log channel set.`, flags: 64 });
     }
 
-    // Redeem key
-    if(commandName === 'redeemkey'){
-      const key = interaction.options.getString('key').toUpperCase();
-      if(interaction.user.id === OWNER_ID) 
-        return interaction.reply({ content:"Owner doesn't need key.", ephemeral:true });
-      db.get('SELECT used FROM keys WHERE key=?', key, (err,row)=>{
-        if(err || !row || row.used) return interaction.reply({ content:'Invalid/used key.', ephemeral:true });
-        db.run('UPDATE keys SET used=1 WHERE key=?', key);
-        db.run('INSERT OR IGNORE INTO activated_users(user_id) VALUES(?)', interaction.user.id);
-        return interaction.reply({ content:'Activated!', ephemeral:true });
-      });
-    }
+    if (interaction.commandName === 'autoticketpanel') {
+      const embed = new EmbedBuilder()
+        .setTitle("Litecoin Auto MM")
+        .setDescription("Click below to start a trade.")
+        .setColor("Green");
 
-    // LTC Panel
-    if(commandName === 'autoticketpanel'){
-      db.get('SELECT 1 FROM activated_users WHERE user_id=?', interaction.user.id, (err,row)=>{
-        if(interaction.user.id !== OWNER_ID && !row)
-          return interaction.reply({ content:'Redeem a key first.', ephemeral:true });
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId("start_trade")
+          .setLabel("Start Trade")
+          .setStyle(ButtonStyle.Primary)
+      );
 
-        sendEmbed(interaction.channel, 'Litecoin Escrow Panel', 'Start LTC Trade with button below', '#00aaff', [
-          new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-              .setCustomId('start_trade')
-              .setLabel('Start LTC Trade')
-              .setStyle(ButtonStyle.Primary)
-          )
-        ]);
-        interaction.reply({ content:'Panel loaded', ephemeral:true });
-      });
+      return interaction.reply({ embeds: [embed], components: [row] });
     }
   }
 
-  // ---------------- Button Handling ----------------
-  if(interaction.isButton()){
-    await interaction.deferUpdate(); // Prevent "interaction failed"
-    const [action, tradeId, extra] = interaction.customId.split('_');
+  if (interaction.isButton()) {
 
-    // Start Trade Modal
-    if(interaction.customId === 'start_trade'){
+    if (interaction.customId === "start_trade") {
       const modal = new ModalBuilder()
-        .setCustomId('trade_modal')
-        .setTitle('Start LTC Trade')
-        .addComponents(
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder()
-              .setCustomId('other_user')
-              .setLabel('User/ID of other person')
-              .setStyle(TextInputStyle.Short)
-              .setPlaceholder('@mention or ID')
-              .setRequired(true)
-          ),
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder()
-              .setCustomId('you_give')
-              .setLabel('What are YOU giving')
-              .setStyle(TextInputStyle.Paragraph)
-              .setRequired(true)
-          ),
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder()
-              .setCustomId('they_give')
-              .setLabel('What are THEY giving')
-              .setStyle(TextInputStyle.Paragraph)
-              .setRequired(true)
-          )
-        );
+        .setCustomId("trade_modal")
+        .setTitle("Start Trade");
+
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId("otherUser")
+            .setLabel("Other User ID")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId("amount")
+            .setLabel("Trade Amount (LTC)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+        )
+      );
+
       return interaction.showModal(modal);
     }
-
-    // Choose roles
-    if(action === 'choose'){
-      db.get('SELECT * FROM trades WHERE id=?', tradeId, (err,row)=>{
-        if(!row) return;
-
-        if(extra === 'sender'){
-          if(row.sender_id) return;
-          db.run('UPDATE trades SET sender_id=? WHERE id=?', [interaction.user.id, tradeId]);
-        }
-        if(extra === 'receiver'){
-          if(row.receiver_id) return;
-          db.run('UPDATE trades SET receiver_id=? WHERE id=?', [interaction.user.id, tradeId]);
-        }
-
-        db.get('SELECT sender_id, receiver_id FROM trades WHERE id=?', tradeId, (e,r)=>{
-          if(r.sender_id && r.receiver_id){
-            sendEmbed(interaction.channel, 'Both roles chosen', 'Confirm Trade below', '#00ff00', [
-              new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId(`confirm_trade_${tradeId}`).setLabel('Confirm Trade').setStyle(ButtonStyle.Success),
-                new ButtonBuilder().setCustomId(`cancel_trade_${tradeId}`).setLabel('No').setStyle(ButtonStyle.Danger)
-              )
-            ]);
-          }
-        });
-      });
-    }
-
-    // Confirm trade
-    if(action === 'confirm' && extra === 'trade'){
-      db.run('UPDATE trades SET status=? WHERE id=?', ['confirmed', tradeId]);
-      sendEmbed(interaction.channel, 'Trade Confirmed', 'Sender, input the deal value using modal', '#00aaff');
-    }
-
-    // Release / Refund
-    if(action === 'release'){
-      db.get('SELECT sender_id FROM trades WHERE id=?', tradeId, (err,row)=>{
-        if(!row) return;
-        if(interaction.user.id !== row.sender_id && interaction.user.id !== OWNER_ID) return;
-        sendEmbed(interaction.channel, 'Release Selected', 'Sender, input LTC address using modal', '#00ff00');
-      });
-    }
-
-    if(action === 'refund'){
-      db.get('SELECT sender_id, receiver_id FROM trades WHERE id=?', tradeId, (err,row)=>{
-        if(!row) return;
-        if(interaction.user.id !== row.sender_id && interaction.user.id !== OWNER_ID) return;
-        sendEmbed(interaction.channel, 'Refund Requested', 'Confirm Refund', '#ff0000');
-      });
-    }
   }
 
-  // ---------------- Modal Handling ----------------
-  if(interaction.isModalSubmit()){
-    if(interaction.customId === 'trade_modal'){
-      const otherInput = interaction.fields.getTextInputValue('other_user');
-      const youGive = interaction.fields.getTextInputValue('you_give');
-      const theyGive = interaction.fields.getTextInputValue('they_give');
+  if (interaction.isModalSubmit()) {
 
-      let otherUser;
-      try {
-        const id = otherInput.replace(/[<@!>]/g,'');
-        otherUser = await client.users.fetch(id);
-      } catch(err){
-        return interaction.reply({ content:'Invalid user.', ephemeral:true });
+    if (interaction.customId === "trade_modal") {
+
+      const otherUserId = interaction.fields.getTextInputValue("otherUser");
+      const amount = parseFloat(interaction.fields.getTextInputValue("amount"));
+
+      if (isNaN(amount)) {
+        return interaction.reply({ content: "Invalid amount.", flags: 64 });
       }
 
-      if(otherUser.id === interaction.user.id)
-        return interaction.reply({ content:"Can't trade with yourself.", ephemeral:true });
+      const fee = calculateFee(amount);
+      const total = amount + fee;
 
-      // Create trade ticket
-      db.run('INSERT INTO trades(channel_id,status,you_give,they_give) VALUES (?,?,?,?)', ['pending','waiting_role',youGive,theyGive], function(err){
-        if(err) return interaction.reply({ content:'DB error', ephemeral:true });
-        const tradeId = this.lastID;
-        const depositAddr = getDepositAddress(tradeId);
+      const tradeIndex = db.prepare(`SELECT COUNT(*) as count FROM trades`).get().count;
+      const wallet = generateAddress(tradeIndex);
 
-        interaction.guild.channels.create({
-          name:`trade-${tradeId}`,
-          type:ChannelType.GuildText,
-          permissionOverwrites:[
-            { id:interaction.guild.roles.everyone.id, deny:[PermissionsBitField.Flags.ViewChannel]},
-            { id:interaction.user.id, allow:[PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages]},
-            { id:otherUser.id, allow:[PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages]}
-          ]
-        }).then(ch=>{
-          db.run('UPDATE trades SET channel_id=?, deposit_addr=? WHERE id=?', [ch.id, depositAddr, tradeId]);
-          sendEmbed(ch, `Litecoin Trade #${tradeId}`, 
-            `Deposit Address: ${depositAddr}\n**${interaction.user} gives:** ${youGive}\n**${otherUser} gives:** ${theyGive}`, '#00aaff', [
-            new ActionRowBuilder().addComponents(
-              new ButtonBuilder().setCustomId(`choose_${tradeId}_sender`).setLabel('Sender').setStyle(ButtonStyle.Success),
-              new ButtonBuilder().setCustomId(`choose_${tradeId}_receiver`).setLabel('Receiver').setStyle(ButtonStyle.Primary)
-            )
-          ]);
-          interaction.reply({ content:`Trade ticket created: ${ch}`, ephemeral:true });
-        });
+      const channel = await interaction.guild.channels.create({
+        name: `trade-${Date.now()}`,
+        type: ChannelType.GuildText,
+        permissionOverwrites: [
+          { id: interaction.guild.roles.everyone, deny: [PermissionsBitField.Flags.ViewChannel] },
+          { id: interaction.user.id, allow: [PermissionsBitField.Flags.ViewChannel] },
+          { id: otherUserId, allow: [PermissionsBitField.Flags.ViewChannel] }
+        ]
       });
+
+      db.prepare(`
+        INSERT INTO trades(channelId,senderId,receiverId,amount,fee,depositAddress,status)
+        VALUES(?,?,?,?,?,?,?)
+      `).run(
+        channel.id,
+        interaction.user.id,
+        otherUserId,
+        amount,
+        fee,
+        wallet.address,
+        "pending"
+      );
+
+      const embed = new EmbedBuilder()
+        .setTitle("Trade Created")
+        .setDescription(
+          `Deposit Address:\n\`${wallet.address}\`\n\n` +
+          `Amount: ${amount} LTC\n` +
+          `Fee: ${fee} LTC\n` +
+          `Total To Send: ${total} LTC`
+        )
+        .setColor("Blue");
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId("release")
+          .setLabel("Release")
+          .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+          .setCustomId("refund")
+          .setLabel("Refund")
+          .setStyle(ButtonStyle.Danger)
+      );
+
+      await channel.send({ embeds: [embed], components: [row] });
+      await interaction.reply({ content: `Trade channel created: ${channel}`, flags: 64 });
+
+      log(interaction.guild, `Trade created: ${channel.id}`);
+
+      // Auto payment monitor
+      const interval = setInterval(async () => {
+        const paid = await checkPayment(wallet.address, total);
+        if (paid) {
+          clearInterval(interval);
+          db.prepare(`UPDATE trades SET status='paid' WHERE channelId=?`).run(channel.id);
+          channel.send("Payment detected and confirmed.");
+          log(interaction.guild, `Payment confirmed in ${channel.id}`);
+        }
+      }, 30000);
     }
   }
 });
 
-// ---------------- Owner Force Commands ----------------
-client.on(Events.MessageCreate, async message => {
-  if(message.author.bot) return;
-  const args = message.content.split(' ');
-
-  if(message.author.id === OWNER_ID){
-    if(args[0] === '$release'){
-      const tradeId = args[1];
-      sendEmbed(message.channel, `Force Release Executed`, `Trade #${tradeId} released by owner`, '#00ff00');
-    }
-    if(args[0] === '$refund'){
-      const tradeId = args[1];
-      sendEmbed(message.channel, `Force Refund Executed`, `Trade #${tradeId} refunded by owner`, '#ff0000');
-    }
-  }
-});
-
-// ---------------- Login ----------------
-client.login(TOKEN);
+client.login(process.env.DISCORD_TOKEN);
