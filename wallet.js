@@ -16,37 +16,54 @@ const ltcNet = {
 
 let root;
 let initialized = false;
+let walletMnemonic = null;
 
-// BIP44 gap limit is 20, but we'll scan more to be safe
-const GAP_LIMIT = 100;  // Increased from 20 to catch more addresses
+const GAP_LIMIT = 100;
 
 function initWallet(mnemonic) {
+  console.log("[Wallet] Initializing wallet...");
+
   if (!mnemonic) {
-    console.error("❌ No BOT_MNEMONIC set in environment");
+    console.error("❌ [Wallet] No BOT_MNEMONIC set in environment");
+    console.error("[Wallet] Make sure your .env file has: BOT_MNEMONIC=your twelve word phrase here");
     return false;
   }
 
+  const cleanMnemonic = mnemonic.trim().toLowerCase().replace(/\s+/g, ' ');
+
+  console.log(`[Wallet] Mnemonic length: ${cleanMnemonic.split(' ').length} words`);
+  console.log(`[Wallet] First 4 words: ${cleanMnemonic.split(' ').slice(0, 4).join(' ')}...`);
+
   try {
-    if (!bip39.validateMnemonic(mnemonic)) {
-      console.error("❌ Invalid mnemonic provided");
+    if (!bip39.validateMnemonic(cleanMnemonic)) {
+      console.error("❌ [Wallet] Invalid mnemonic provided");
       return false;
     }
 
-    const seed = bip39.mnemonicToSeedSync(mnemonic);
+    const seed = bip39.mnemonicToSeedSync(cleanMnemonic);
     root = hdkey.fromMasterSeed(seed);
     initialized = true;
-    console.log("✅ Litecoin HD wallet initialized");
+    walletMnemonic = cleanMnemonic;
+    
+    const firstAddress = generateAddress(0);
+    console.log(`✅ [Wallet] Litecoin HD wallet initialized successfully`);
+    console.log(`✅ [Wallet] First address (index 0): ${firstAddress}`);
+
     return true;
   } catch (err) {
-    console.error("❌ Failed to initialize wallet:", err.message);
+    console.error("❌ [Wallet] Failed to initialize wallet:", err.message);
     return false;
   }
 }
 
+function isInitialized() {
+  return initialized && root !== null;
+}
+
 function generateAddress(index) {
   if (!initialized || !root) {
-    console.error("Wallet not initialized");
-    return "WALLET_NOT_LOADED";
+    console.error("[Wallet] ERROR: Wallet not initialized when generating address");
+    return "WALLET_NOT_INITIALIZED";
   }
 
   try {
@@ -57,25 +74,33 @@ function generateAddress(index) {
     });
     return address;
   } catch (err) {
-    console.error(`Failed to generate address for index ${index}:`, err);
+    console.error(`[Wallet] Failed to generate address for index ${index}:`, err);
     return "ADDRESS_GENERATION_FAILED";
   }
 }
 
 function getPrivateKeyWIF(index) {
-  if (!initialized || !root) return null;
+  if (!initialized || !root) {
+    console.error("[Wallet] ERROR: Wallet not initialized when getting private key");
+    return null;
+  }
 
   try {
     const child = root.derive(`m/44'/2'/0'/0/${index}`);
     const wif = bitcoin.ECPair.fromPrivateKey(child.privateKey, { network: ltcNet }).toWIF();
     return wif;
   } catch (err) {
-    console.error(`Failed to get private key for index ${index}:`, err);
+    console.error(`[Wallet] Failed to get private key for index ${index}:`, err);
     return null;
   }
 }
 
 async function getAddressUTXOs(address) {
+  if (!BLOCKCYPHER_TOKEN) {
+    console.error("[Wallet] ERROR: BLOCKCYPHER_TOKEN not set");
+    return [];
+  }
+
   try {
     const res = await axios.get(
       `https://api.blockcypher.com/v1/ltc/main/addrs/${address}?unspentOnly=true&token=${BLOCKCYPHER_TOKEN}`,
@@ -91,29 +116,46 @@ async function getAddressUTXOs(address) {
       confirmations: utxo.confirmations
     }));
   } catch (err) {
-    console.error('Error fetching UTXOs:', err.message);
+    if (err.response?.status === 429) {
+      console.error(`[Wallet] Rate limit hit for address ${address}`);
+    } else if (err.response?.status === 404) {
+      return [];
+    } else {
+      console.error(`[Wallet] Error fetching UTXOs for ${address}:`, err.message);
+    }
     return [];
   }
 }
 
 async function getAddressBalance(address) {
+  if (!BLOCKCYPHER_TOKEN) {
+    console.error("[Wallet] ERROR: BLOCKCYPHER_TOKEN not set");
+    return 0;
+  }
+
   try {
     const res = await axios.get(
       `https://api.blockcypher.com/v1/ltc/main/addrs/${address}/balance?token=${BLOCKCYPHER_TOKEN}`,
       { timeout: 10000 }
     );
     
-    // Return confirmed balance (in LTC, not satoshi)
     return (res.data.balance || 0) / 1e8;
   } catch (err) {
-    console.error('Error fetching address balance:', err.message);
+    if (err.response?.status === 429) {
+      console.error(`[Wallet] Rate limit hit for address ${address}`);
+    } else if (err.response?.status === 404) {
+      return 0;
+    } else {
+      console.error(`[Wallet] Error fetching balance for ${address}:`, err.message);
+    }
     return 0;
   }
 }
 
 async function getWalletBalance() {
-  if (!initialized || !root) {
-    console.error("Wallet not initialized");
+  if (!isInitialized()) {
+    console.error("❌ [Wallet] Cannot get balance: Wallet not initialized");
+    console.error("[Wallet] Make sure BOT_MNEMONIC is set correctly in .env");
     return 0;
   }
 
@@ -121,53 +163,74 @@ async function getWalletBalance() {
     let totalBalance = 0;
     let checkedCount = 0;
     let lastUsedIndex = -1;
+    let consecutiveEmpty = 0;
     
-    console.log(`[Balance Check] Scanning up to ${GAP_LIMIT} addresses...`);
+    console.log(`[Wallet] Starting balance scan (max ${GAP_LIMIT} addresses)...`);
     
-    // Check addresses until we hit GAP_LIMIT empty addresses in a row
     for (let i = 0; i < GAP_LIMIT; i++) {
       const address = generateAddress(i);
+      
+      if (address === "WALLET_NOT_INITIALIZED" || address === "ADDRESS_GENERATION_FAILED") {
+        console.error(`[Wallet] Failed to generate address at index ${i}`);
+        continue;
+      }
+      
       const balance = await getAddressBalance(address);
       
       if (balance > 0) {
-        console.log(`[Balance Check] Address ${i} (${address}): ${balance} LTC`);
+        console.log(`[Wallet] ✅ Address ${i}: ${balance} LTC (${address})`);
         totalBalance += balance;
         lastUsedIndex = i;
+        consecutiveEmpty = 0;
+      } else {
+        consecutiveEmpty++;
       }
       
       checkedCount++;
       
-      // BIP44 gap limit: stop if we've checked 20 empty addresses after the last used one
-      if (i > lastUsedIndex + 20 && lastUsedIndex !== -1) {
-        console.log(`[Balance Check] Reached gap limit (20 empty after last used). Stopping at index ${i}`);
+      if (consecutiveEmpty >= 20 && lastUsedIndex !== -1) {
+        console.log(`[Wallet] Reached gap limit (20 empty addresses). Stopping scan at index ${i}`);
         break;
       }
     }
     
-    console.log(`[Balance Check] Checked ${checkedCount} addresses. Total balance: ${totalBalance} LTC`);
+    console.log(`[Wallet] Scan complete. Checked ${checkedCount} addresses.`);
+    console.log(`[Wallet] Total balance found: ${totalBalance} LTC`);
+    
+    if (totalBalance === 0) {
+      console.log("[Wallet] ⚠️ No balance found in any address!");
+      console.log("[Wallet] Make sure you have LTC in addresses derived from this mnemonic");
+      console.log(`[Wallet] First few addresses to check:`);
+      for (let i = 0; i < 5; i++) {
+        console.log(`[Wallet]   Index ${i}: ${generateAddress(i)}`);
+      }
+    }
+    
     return totalBalance;
   } catch (err) {
-    console.error('Error getting wallet balance:', err.message);
+    console.error('[Wallet] Error getting wallet balance:', err.message);
     return 0;
   }
 }
 
 async function getFundedAddresses() {
-  if (!initialized || !root) {
+  if (!isInitialized()) {
+    console.error("❌ [Wallet] Cannot get funded addresses: Wallet not initialized");
     return [];
   }
 
   const funded = [];
   let lastUsedIndex = -1;
+  let consecutiveEmpty = 0;
   
-  console.log(`[Funded Addresses] Scanning up to ${GAP_LIMIT} addresses...`);
+  console.log(`[Wallet] Scanning for funded addresses...`);
   
   for (let i = 0; i < GAP_LIMIT; i++) {
     const address = generateAddress(i);
     const balance = await getAddressBalance(address);
     
     if (balance > 0) {
-      console.log(`[Funded Addresses] Found funded address at index ${i}: ${address} (${balance} LTC)`);
+      console.log(`[Wallet] Found funded address at index ${i}: ${address} (${balance} LTC)`);
       const utxos = await getAddressUTXOs(address);
       funded.push({
         index: i,
@@ -176,20 +239,25 @@ async function getFundedAddresses() {
         utxos: utxos
       });
       lastUsedIndex = i;
+      consecutiveEmpty = 0;
+    } else {
+      consecutiveEmpty++;
     }
     
-    // BIP44 gap limit
-    if (i > lastUsedIndex + 20 && lastUsedIndex !== -1) {
-      console.log(`[Funded Addresses] Reached gap limit. Stopping at index ${i}`);
+    if (consecutiveEmpty >= 20 && lastUsedIndex !== -1) {
       break;
     }
   }
   
-  console.log(`[Funded Addresses] Found ${funded.length} funded addresses`);
+  console.log(`[Wallet] Found ${funded.length} funded addresses with total balance: ${funded.reduce((sum, f) => sum + f.balance, 0)} LTC`);
   return funded;
 }
 
 async function sendLTC(tradeId, toAddress, amountLTC) {
+  if (!isInitialized()) {
+    return { success: false, error: 'Wallet not initialized' };
+  }
+
   if (!BLOCKCYPHER_TOKEN) {
     return { success: false, error: 'BLOCKCYPHER_TOKEN not configured' };
   }
@@ -241,7 +309,7 @@ async function sendLTC(tradeId, toAddress, amountLTC) {
 
         inputSum += utxo.value;
       } catch (err) {
-        console.error('Error fetching TX:', err.message);
+        console.error('[Wallet] Error fetching TX:', err.message);
         continue;
       }
     }
@@ -264,7 +332,7 @@ async function sendLTC(tradeId, toAddress, amountLTC) {
       try {
         psbt.signInput(i, keyPair);
       } catch (err) {
-        console.error(`Error signing input ${i}:`, err.message);
+        console.error(`[Wallet] Error signing input ${i}:`, err.message);
       }
     }
 
@@ -283,17 +351,22 @@ async function sendLTC(tradeId, toAddress, amountLTC) {
     };
 
   } catch (err) {
-    console.error('Send LTC error:', err);
+    console.error('[Wallet] Send LTC error:', err);
     return { success: false, error: err.response?.data?.error || err.message };
   }
 }
 
 async function sendAllLTC(toAddress) {
+  if (!isInitialized()) {
+    return { success: false, error: 'Wallet not initialized' };
+  }
+
   if (!BLOCKCYPHER_TOKEN) {
     return { success: false, error: 'BLOCKCYPHER_TOKEN not configured' };
   }
 
   try {
+    console.log(`[Wallet] Starting sendAllLTC to ${toAddress}`);
     const fundedAddresses = await getFundedAddresses();
     
     if (fundedAddresses.length === 0) {
@@ -302,9 +375,8 @@ async function sendAllLTC(toAddress) {
 
     const psbt = new bitcoin.Psbt({ network: ltcNet });
     let totalInput = 0;
-    const fee = 10000; // Base fee, might need adjustment for multiple inputs
+    const fee = 10000;
 
-    // Add inputs from all funded addresses
     for (const funded of fundedAddresses) {
       for (const utxo of funded.utxos) {
         try {
@@ -327,7 +399,7 @@ async function sendAllLTC(toAddress) {
 
           totalInput += utxo.value;
         } catch (err) {
-          console.error(`Error fetching TX for UTXO ${utxo.txid}:`, err.message);
+          console.error(`[Wallet] Error fetching TX for UTXO ${utxo.txid}:`, err.message);
           continue;
         }
       }
@@ -337,37 +409,33 @@ async function sendAllLTC(toAddress) {
       return { success: false, error: 'Could not add any inputs' };
     }
 
-    // Calculate amount to send (total - fee)
     const amountToSend = totalInput - fee;
     if (amountToSend <= 0) {
       return { success: false, error: 'Insufficient balance to cover fees' };
     }
 
-    // Add output to destination
     psbt.addOutput({
       address: toAddress,
       value: amountToSend
     });
 
-    // Sign all inputs with their respective keys
     let inputIndex = 0;
     for (const funded of fundedAddresses) {
       const wif = getPrivateKeyWIF(funded.index);
       
       if (!wif) {
-        console.error(`Could not get WIF for index ${funded.index}`);
+        console.error(`[Wallet] Could not get WIF for index ${funded.index}`);
         continue;
       }
 
       const keyPair = bitcoin.ECPair.fromWIF(wif, ltcNet);
       
-      // Sign all inputs for this address
       for (let i = 0; i < funded.utxos.length; i++) {
         try {
           psbt.signInput(inputIndex, keyPair);
           inputIndex++;
         } catch (err) {
-          console.error(`Error signing input ${inputIndex}:`, err.message);
+          console.error(`[Wallet] Error signing input ${inputIndex}:`, err.message);
           inputIndex++;
         }
       }
@@ -382,6 +450,8 @@ async function sendAllLTC(toAddress) {
       { timeout: 15000 }
     );
 
+    console.log(`[Wallet] Successfully sent ${(amountToSend / 1e8).toFixed(8)} LTC`);
+    
     return {
       success: true,
       txid: broadcastRes.data.tx.hash,
@@ -389,12 +459,16 @@ async function sendAllLTC(toAddress) {
     };
 
   } catch (err) {
-    console.error('Send All LTC error:', err);
+    console.error('[Wallet] Send All LTC error:', err);
     return { success: false, error: err.response?.data?.error || err.message };
   }
 }
 
 async function sendLTCMicrotx(tradeId, toAddress, amountLTC) {
+  if (!isInitialized()) {
+    return { success: false, error: 'Wallet not initialized' };
+  }
+
   if (!BLOCKCYPHER_TOKEN) {
     return { success: false, error: 'BLOCKCYPHER_TOKEN not configured' };
   }
@@ -426,13 +500,14 @@ async function sendLTCMicrotx(tradeId, toAddress, amountLTC) {
     };
 
   } catch (err) {
-    console.error('Microtx error:', err.response?.data || err.message);
+    console.error('[Wallet] Microtx error:', err.response?.data || err.message);
     return { success: false, error: err.response?.data?.error || err.message };
   }
 }
 
 module.exports = { 
   initWallet, 
+  isInitialized,
   generateAddress, 
   getPrivateKeyWIF, 
   sendLTC, 
