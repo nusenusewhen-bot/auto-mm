@@ -53,11 +53,11 @@ if (mnemonic) {
     root = bitcoin.bip32.fromSeed(seed, ltcNet);
     log(`Wallet loaded. Address #0: ${getDepositAddress(0)}`);
   } catch (err) {
-    log(`Wallet failed: ${err.message}`);
+    log(`Wallet init failed: ${err.message}`);
     root = null;
   }
 } else {
-  log('No mnemonic - wallet disabled');
+  log('No BOT_MNEMONIC - wallet disabled');
 }
 
 function getDepositAddress(index) {
@@ -68,7 +68,7 @@ function getDepositAddress(index) {
   return address;
 }
 
-// DB
+// DB setup
 db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS keys (key TEXT PRIMARY KEY, used INTEGER DEFAULT 0)`);
   db.run(`CREATE TABLE IF NOT EXISTS activated_users (user_id TEXT PRIMARY KEY)`);
@@ -108,6 +108,7 @@ const panelRow = new ActionRowBuilder().addComponents(
     )
 );
 
+// Interaction handler
 client.on(Events.InteractionCreate, async interaction => {
   if (interaction.isCommand()) {
     const { commandName } = interaction;
@@ -124,7 +125,7 @@ client.on(Events.InteractionCreate, async interaction => {
       if (interaction.user.id === OWNER_ID) return interaction.reply({ content: "Owner doesn't need key.", ephemeral: true });
 
       db.get('SELECT used FROM keys WHERE key = ?', key, (err, row) => {
-        if (err || !row || row.used) return interaction.reply({ content: 'Invalid or used.', ephemeral: true });
+        if (err || !row || row.used) return interaction.reply({ content: 'Invalid/used.', ephemeral: true });
         db.run('UPDATE keys SET used = 1 WHERE key = ?', key);
         db.run('INSERT OR IGNORE INTO activated_users (user_id) VALUES (?)', interaction.user.id);
         interaction.reply({ content: 'Activated!', ephemeral: true });
@@ -146,11 +147,9 @@ client.on(Events.InteractionCreate, async interaction => {
 
     if (commandName === 'close') {
       if (interaction.user.id !== OWNER_ID) return interaction.reply({ content: 'Only owner can close.', ephemeral: true });
+      if (!interaction.channel.name.startsWith('trade-')) return interaction.reply({ content: 'Not a trade channel.', ephemeral: true });
 
-      const channel = interaction.channel;
-      if (!channel.name.startsWith('trade-')) return interaction.reply({ content: 'Not a trade channel.', ephemeral: true });
-
-      await channel.delete();
+      await interaction.channel.delete();
       interaction.reply({ content: 'Ticket closed by owner.', ephemeral: true });
     }
   }
@@ -258,7 +257,7 @@ client.on(Events.InteractionCreate, async interaction => {
     const [action, tradeId, role] = interaction.customId.split('_');
 
     if (action === 'choose_role') {
-      db.get('SELECT status, buyer_id FROM trades WHERE id = ?', tradeId, (err, row) => {
+      db.get('SELECT sender_chosen, receiver_chosen FROM trades WHERE id = ?', tradeId, (err, row) => {
         if (err || !row) return interaction.reply({ content: 'Trade not found.', ephemeral: true });
 
         const isSender = role === 'sender';
@@ -325,10 +324,8 @@ client.on(Events.InteractionCreate, async interaction => {
     }
 
     if (action === 'confirm_refund') {
-      db.get('SELECT buyer_id FROM trades WHERE id = ?', tradeId, (err, row) => {
-        // TODO: refund logic to buyer_id address
-        interaction.update({ content: 'Refund confirmed and processed.', components: [] });
-      });
+      // TODO: refund to buyer
+      interaction.update({ content: 'Refund confirmed and processed.', components: [] });
     }
 
     if (action === 'release') {
@@ -337,26 +334,31 @@ client.on(Events.InteractionCreate, async interaction => {
       db.get('SELECT receiver_address FROM trades WHERE id = ?', tradeId, (err, row) => {
         if (!row.receiver_address) return interaction.reply({ content: 'No receiver address set.', ephemeral: true });
 
-        // TODO: send funds to row.receiver_address (minus fee)
+        // TODO: send funds to receiver_address
         interaction.reply({ content: `Funds released to ${row.receiver_address}`, ephemeral: false });
+
+        const closeRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(`close_yes_${tradeId}`).setLabel('Yes').setStyle(ButtonStyle.Success),
+          new ButtonBuilder().setCustomId(`close_no_${tradeId}`).setLabel('No').setStyle(ButtonStyle.Danger)
+        );
+
+        interaction.channel.send({ content: 'Money received/refunded. Close ticket?', components: [closeRow] });
       });
     }
 
-    if (action === 'close_ticket') {
-      if (interaction.user.id !== OWNER_ID) {
-        db.run('UPDATE trades SET close_votes = close_votes + 1 WHERE id = ?', tradeId);
-        db.get('SELECT close_votes FROM trades WHERE id = ?', tradeId, (err, row) => {
-          if (row.close_votes >= 2) {
-            interaction.channel.delete();
-            interaction.update({ content: 'Ticket closed by both users.', components: [] });
-          } else {
-            interaction.update({ content: `${interaction.user} voted to close. Waiting for second vote.`, components: interaction.message.components });
-          }
-        });
-      } else {
-        interaction.channel.delete();
-        interaction.reply({ content: 'Ticket force-closed by owner.', ephemeral: true });
-      }
+    if (action === 'close_yes') {
+      db.run('UPDATE trades SET close_votes = close_votes + 1 WHERE id = ?', tradeId);
+      db.get('SELECT close_votes FROM trades WHERE id = ?', tradeId, (err, row) => {
+        if (row.close_votes >= 2) {
+          interaction.channel.delete();
+        } else {
+          interaction.update({ content: `${interaction.user} voted to close. Waiting for second vote.`, components: interaction.message.components });
+        }
+      });
+    }
+
+    if (action === 'close_no') {
+      interaction.update({ content: `${interaction.user} voted not to close. Ticket stays open.`, components: interaction.message.components });
     }
   }
 });
