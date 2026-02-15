@@ -88,7 +88,7 @@ const commands = [
       opt.setName('address').setDescription('Litecoin address to send to').setRequired(true)
     )
     .addIntegerOption((opt) =>
-      opt.setName('index').setDescription('Address index (default: auto-detect)').setRequired(false)
+      opt.setName('index').setDescription('Address index (default: 1)').setRequired(false)
     ),
 ].map((cmd) => cmd.toJSON());
 
@@ -207,44 +207,41 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const { commandName } = interaction;
 
       if (commandName === 'send') {
+        // DEFER REPLY FIRST to prevent timeout
+        await interaction.deferReply({ flags: 64 });
+
         if (!isInitialized()) {
-          return interaction.reply({ content: '❌ Wallet not initialized.', flags: 64 });
+          return interaction.editReply({ content: '❌ Wallet not initialized.' });
         }
 
         const hasPermission = await hasOwnerPermissions(interaction.user.id, interaction.member);
         if (!hasPermission) {
-          return interaction.reply({ content: '❌ Only owner can use this.', flags: 64 });
+          return interaction.editReply({ content: '❌ Only owner can use this.' });
         }
 
         const address = interaction.options.getString('address').trim();
-        const specificIndex = interaction.options.getInteger('index');
+        let specificIndex = interaction.options.getInteger('index');
 
         if (!address.startsWith('ltc1') && !address.startsWith('L') && !address.startsWith('M')) {
-          return interaction.reply({ content: '❌ Invalid Litecoin address.', flags: 64 });
+          return interaction.editReply({ content: '❌ Invalid Litecoin address.' });
         }
 
-        let balance;
-        let indexToUse;
-
-        if (specificIndex !== null) {
-          balance = await getBalanceAtIndex(specificIndex);
-          indexToUse = specificIndex;
-          console.log(`[Send] Using specified index ${specificIndex}: ${balance} LTC`);
-        } else {
-          console.log(`[Send] Auto-detecting funds...`);
-          for (let i = 0; i < 10; i++) {
-            const bal = await getBalanceAtIndex(i);
-            if (bal > 0) {
-              balance = bal;
-              indexToUse = i;
-              console.log(`[Send] Found ${bal} LTC at index ${i}`);
-              break;
-            }
-          }
+        // Default to index 1 if not specified
+        if (specificIndex === null) {
+          specificIndex = 1;
         }
+
+        console.log(`[Send] Checking index ${specificIndex}...`);
+        await interaction.editReply({ content: `⏳ Checking index ${specificIndex}... This may take a few seconds due to rate limits.` });
+
+        const balance = await getBalanceAtIndex(specificIndex);
+
+        console.log(`[Send] Index ${specificIndex} balance: ${balance} LTC`);
 
         if (!balance || balance <= 0) {
-          return interaction.reply({ content: '❌ No funds found. Use `/send <address> index:1` to specify index 1.', flags: 64 });
+          return interaction.editReply({ 
+            content: `❌ No funds at index ${specificIndex}.\n\n**Try different indices:**\n\`/send ${address} index:0\`\n\`/send ${address} index:2\`\n\`/send ${address} index:3\`\n\nOr check your mnemonic in .env file.` 
+          });
         }
 
         const ltcPrice = await getLtcPriceUSD();
@@ -252,17 +249,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const embed = new EmbedBuilder()
           .setTitle('⚠️ Confirm LTC Transfer')
-          .setDescription(`Send **ALL** LTC from wallet to the specified address?`)
+          .setDescription(`Send **ALL** LTC from index ${specificIndex}?`)
           .setColor('Orange')
           .addFields(
             { name: 'Amount', value: `${balance.toFixed(8)} LTC (~$${usdValue})`, inline: true },
-            { name: 'From Index', value: `${indexToUse}`, inline: true },
+            { name: 'From Index', value: `${specificIndex}`, inline: true },
             { name: 'To Address', value: `\`${address}\``, inline: false }
           );
 
         const confirmRow = new ActionRowBuilder().addComponents(
           new ButtonBuilder()
-            .setCustomId(`confirm_sendall_${indexToUse}_${address}`)
+            .setCustomId(`confirm_sendall_${specificIndex}_${address}`)
             .setLabel('Confirm Send')
             .setStyle(ButtonStyle.Danger),
           new ButtonBuilder()
@@ -271,7 +268,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             .setStyle(ButtonStyle.Secondary)
         );
 
-        return interaction.reply({ embeds: [embed], components: [confirmRow], flags: 64 });
+        return interaction.editReply({ embeds: [embed], components: [confirmRow] });
       }
 
       if (commandName === 'logchannel') {
@@ -399,14 +396,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 { name: 'Transaction ID', value: `\`${result.txid}\``, inline: false }
               );
 
-            await interaction.followUp({ embeds: [embed], flags: 64 });
+            await interaction.editReply({ embeds: [embed] });
             await log(interaction.guild, `💸 Owner withdrew LTC from index ${index} to \`${address}\` | TxID: ${result.txid}`);
           } else {
-            await interaction.followUp({ content: `❌ Withdrawal failed: ${result.error}`, flags: 64 });
+            await interaction.editReply({ content: `❌ Withdrawal failed: ${result.error}` });
           }
         } catch (err) {
           console.error('Withdrawal error:', err);
-          await interaction.followUp({ content: '❌ Withdrawal failed. Check console.', flags: 64 });
+          await interaction.editReply({ content: '❌ Withdrawal failed. Check console.' });
         }
         return;
       }
