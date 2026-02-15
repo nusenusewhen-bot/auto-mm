@@ -19,7 +19,7 @@ const {
 } = require('discord.js');
 
 const db = require('./database');
-const { initWallet, generateAddress, sendLTC } = require('./wallet');
+const { initWallet, generateAddress, sendLTC, getWalletBalance } = require('./wallet');
 const { checkPayment, getLtcPriceUSD } = require('./blockchain');
 const { REST } = require('@discordjs/rest');
 const QRCode = require('qrcode');
@@ -36,6 +36,7 @@ const client = new Client({
 
 // Bot config
 const OWNER_ID = process.env.OWNER_ID;
+const OWNER_ROLE_ID = process.env.OWNER_ROLE_ID; // Add this to your .env
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 
 if (!DISCORD_TOKEN || !OWNER_ID || !process.env.BOT_MNEMONIC) {
@@ -47,6 +48,19 @@ initWallet(process.env.BOT_MNEMONIC);
 
 // Active payment monitors (tradeId -> intervalId)
 const activeMonitors = new Map();
+
+// Helper: Check if user has owner permissions (either by user ID or owner role)
+async function hasOwnerPermissions(userId, member) {
+  // Check if user is the owner by ID
+  if (userId === OWNER_ID) return true;
+  
+  // Check if user has the owner role (if configured)
+  if (OWNER_ROLE_ID && member) {
+    return member.roles.cache.has(OWNER_ROLE_ID);
+  }
+  
+  return false;
+}
 
 // ---------- Register Slash Commands ----------
 const commands = [
@@ -70,6 +84,13 @@ const commands = [
     .setDescription('Manually check payment status (Admin only)')
     .addStringOption((opt) =>
       opt.setName('tradeid').setDescription('Trade ID').setRequired(true)
+    ),
+  // NEW: /send command
+  new SlashCommandBuilder()
+    .setName('send')
+    .setDescription('Send all LTC to an address (Owner only)')
+    .addStringOption((opt) =>
+      opt.setName('address').setDescription('Litecoin address to send to').setRequired(true)
     ),
 ].map((cmd) => cmd.toJSON());
 
@@ -193,6 +214,62 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isChatInputCommand()) {
       const { commandName } = interaction;
 
+      // NEW: /send command handler
+      if (commandName === 'send') {
+        // Check owner permissions (by user ID or owner role)
+        const hasPermission = await hasOwnerPermissions(interaction.user.id, interaction.member);
+        
+        if (!hasPermission) {
+          return interaction.reply({ content: '❌ Only the owner or users with the owner role can use this command.', flags: 64 });
+        }
+
+        const address = interaction.options.getString('address').trim();
+
+        // Validate LTC address
+        if (!address.startsWith('ltc1') && !address.startsWith('L') && !address.startsWith('M')) {
+          return interaction.reply({ content: '❌ Invalid Litecoin address. Must start with ltc1, L, or M.', flags: 64 });
+        }
+
+        // Get wallet balance
+        const balance = await getWalletBalance();
+        
+        if (!balance || balance <= 0) {
+          return interaction.reply({ content: '❌ Wallet is empty. No LTC to send.', flags: 64 });
+        }
+
+        // Create confirmation embed
+        const ltcPrice = await getLtcPriceUSD();
+        const usdValue = (balance * ltcPrice).toFixed(2);
+
+        const embed = new EmbedBuilder()
+          .setTitle('⚠️ Confirm LTC Transfer')
+          .setDescription('You are about to send **ALL** LTC from the bot wallet.')
+          .setColor('Orange')
+          .addFields(
+            { name: 'Amount to Send', value: `${balance} LTC`, inline: true },
+            { name: 'USD Value', value: `~$${usdValue}`, inline: true },
+            { name: 'Destination', value: `\`${address}\``, inline: false },
+            { name: 'Warning', value: 'This action cannot be undone!' }
+          );
+
+        const confirmRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`confirm_sendall_${address}`)
+            .setLabel('Confirm Send All')
+            .setStyle(ButtonStyle.Danger),
+          new ButtonBuilder()
+            .setCustomId(`cancel_sendall`)
+            .setLabel('Cancel')
+            .setStyle(ButtonStyle.Secondary)
+        );
+
+        return interaction.reply({ 
+          embeds: [embed], 
+          components: [confirmRow],
+          flags: 64 
+        });
+      }
+
       if (commandName === 'logchannel') {
         if (interaction.user.id !== OWNER_ID) {
           return interaction.reply({ content: '❌ Only owner can use this.', flags: 64 });
@@ -299,6 +376,51 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     // ----- Button Interactions -----
     if (interaction.isButton()) {
+      // NEW: Handle /send confirmations
+      if (interaction.customId.startsWith('confirm_sendall_')) {
+        const hasPermission = await hasOwnerPermissions(interaction.user.id, interaction.member);
+        if (!hasPermission) {
+          return interaction.reply({ content: '❌ Only owner can confirm this.', flags: 64 });
+        }
+
+        const address = interaction.customId.split('_')[2];
+        
+        await interaction.update({ content: '⏳ Processing withdrawal...', components: [], embeds: [] });
+
+        try {
+          const balance = await getWalletBalance();
+          const result = await sendLTC('withdrawal', address, balance);
+
+          if (result.success) {
+            const embed = new EmbedBuilder()
+              .setTitle('✅ Withdrawal Complete')
+              .setDescription(`Successfully sent all LTC to the specified address.`)
+              .setColor('Green')
+              .addFields(
+                { name: 'Amount Sent', value: `${balance} LTC`, inline: true },
+                { name: 'Destination', value: `\`${address}\``, inline: false },
+                { name: 'Transaction ID', value: `\`${result.txid}\``, inline: false }
+              );
+
+            await interaction.followUp({ embeds: [embed], flags: 64 });
+            
+            // Log the withdrawal
+            await log(interaction.guild, `💸 Owner withdrew ${balance} LTC to \`${address}\` | TxID: ${result.txid}`);
+          } else {
+            await interaction.followUp({ content: `❌ Withdrawal failed: ${result.error}`, flags: 64 });
+          }
+        } catch (err) {
+          console.error('Withdrawal error:', err);
+          await interaction.followUp({ content: '❌ Withdrawal failed. Check console for details.', flags: 64 });
+        }
+        return;
+      }
+
+      if (interaction.customId === 'cancel_sendall') {
+        await interaction.update({ content: '❌ Withdrawal cancelled.', components: [], embeds: [] });
+        return;
+      }
+
       // Role selection - Sending
       if (interaction.customId.startsWith('role_sending_')) {
         const tradeId = interaction.customId.split('_')[2];
