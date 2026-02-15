@@ -23,43 +23,42 @@ const ltcNet = {
 
 /**
  * Initialize wallet from mnemonic
- * @param {string} mnemonic - 12-word mnemonic from env
- * @returns {BIP32} root node or null
+ * @param {string} mnemonic - 12/24-word mnemonic
+ * @returns {BIP32|null} root node
  */
-function initWallet(mnemonic) {
-  if (!mnemonic) {
+function initWallet(mnemonic){
+  if(!mnemonic){
     console.log('No BOT_MNEMONIC set - wallet disabled');
     return null;
   }
 
-  try {
-    if (!bip39.validateMnemonic(mnemonic)) {
-      throw new Error('Invalid mnemonic format');
+  try{
+    if(!bip39.validateMnemonic(mnemonic)){
+      throw new Error('Invalid mnemonic');
     }
 
     const seed = bip39.mnemonicToSeedSync(mnemonic);
     root = bip32.fromSeed(seed, ltcNet);
 
-    const testAddr = getDepositAddress(0);
-    console.log(`Litecoin wallet loaded. Address #0: ${testAddr}`);
-
+    // test address
+    const addr = getDepositAddress(0);
+    console.log(`Litecoin wallet loaded. Address #0: ${addr}`);
     return root;
-  } catch (err) {
+  } catch(err){
     console.error(`Wallet init failed: ${err.message}`);
     return null;
   }
 }
 
 /**
- * Derive a deposit address at the given index
+ * Derive deposit address for a given index
  * @param {number} index
- * @returns {string} Litecoin address or error string
+ * @returns {string} LTC address
  */
-function getDepositAddress(index) {
-  if (!root) return 'WALLET_NOT_LOADED';
-
-  try {
-    // BIP84 derivation path for native SegWit LTC (ltc1...)
+function getDepositAddress(index){
+  if(!root) return 'WALLET_NOT_LOADED';
+  try{
+    // BIP84 native SegWit for Litecoin (ltc1...)
     const path = `m/84'/2'/0'/0/${index}`;
     const child = root.derivePath(path);
 
@@ -69,7 +68,7 @@ function getDepositAddress(index) {
     });
 
     return address;
-  } catch (err) {
+  } catch(err){
     console.error(`Address derivation failed: ${err.message}`);
     return 'ADDRESS_ERROR';
   }
