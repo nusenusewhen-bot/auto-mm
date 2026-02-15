@@ -1,7 +1,7 @@
 import discord
 from discord.ui import View, Select, Modal, TextInput
 import time
-from bot import get_addr, conn, c  # Import shared functions/DB from bot.py
+from bot import get_addr, conn, c, client  # Import shared from bot.py (safe now)
 
 class TradeModal(Modal, title="Trade Setup"):
     other = TextInput(label="User/ID of the other person", placeholder="@mention or ID", required=True)
@@ -20,12 +20,12 @@ class TradeModal(Modal, title="Trade Setup"):
         if other_input.startswith('<@') and other_input.endswith('>'):
             try:
                 uid = int(other_input[2:-1].replace('!', ''))
-                u = await i.client.fetch_user(uid)
+                u = await client.fetch_user(uid)
             except:
                 pass
         else:
             try:
-                u = await i.client.fetch_user(int(other_input))
+                u = await client.fetch_user(int(other_input))
             except:
                 pass
 
@@ -66,7 +66,7 @@ class TradeModal(Modal, title="Trade Setup"):
             f"{u.mention} pick role:", view=view
         )
 
-        await i.followup.send(f"Ticket: {ch.mention}", ephemeral=True)
+        await i.followup.send(f"Ticket created: {ch.mention}", ephemeral=True)
 
 class RoleView(View):
     def __init__(self, tid, starter, other):
