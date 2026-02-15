@@ -111,7 +111,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
   // ---------------- Button Handling ----------------
   if(interaction.isButton()){
-    await interaction.deferUpdate(); // Acknowledge to prevent "interaction failed"
+    await interaction.deferUpdate(); // Prevent "interaction failed"
     const [action, tradeId, extra] = interaction.customId.split('_');
 
     // Start Trade Modal
