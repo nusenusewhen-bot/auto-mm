@@ -1,19 +1,27 @@
 {
-  "name": "auto-ltc-mm",
-  "version": "1.0.0",
-  "description": "Automatic Litecoin Middleman Bot",
+  "name": "ltc-middleman-bot",
+  "version": "2.0.0",
+  "description": "Litecoin Middleman Discord Bot with QR codes and payment monitoring",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "nodemon index.js"
   },
   "dependencies": {
     "axios": "^1.6.0",
     "better-sqlite3": "^9.4.0",
     "bip39": "^3.1.0",
+    "bitcoinjs-lib": "^6.1.6",
     "discord.js": "^14.14.1",
     "dotenv": "^16.3.1",
     "hdkey": "^2.1.0",
-    "bitcoinjs-lib": "^6.1.6"
+    "qrcode": "^1.5.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
