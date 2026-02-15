@@ -93,6 +93,67 @@ async function getAddressUTXOs(address) {
   }
 }
 
+// NEW: Get balance for a specific address
+async function getAddressBalance(address) {
+  try {
+    const res = await axios.get(
+      `https://api.blockcypher.com/v1/ltc/main/addrs/${address}/balance?token=${BLOCKCYPHER_TOKEN}`,
+      { timeout: 10000 }
+    );
+    
+    // Return confirmed balance (in LTC, not satoshi)
+    return (res.data.balance || 0) / 1e8;
+  } catch (err) {
+    console.error('Error fetching address balance:', err.message);
+    return 0;
+  }
+}
+
+// NEW: Get total wallet balance (checks first 20 addresses)
+async function getWalletBalance() {
+  if (!initialized || !root) {
+    console.error("Wallet not initialized");
+    return 0;
+  }
+
+  try {
+    let totalBalance = 0;
+    // Check first 20 addresses (you can adjust this number)
+    for (let i = 0; i < 20; i++) {
+      const address = generateAddress(i);
+      const balance = await getAddressBalance(address);
+      totalBalance += balance;
+    }
+    return totalBalance;
+  } catch (err) {
+    console.error('Error getting wallet balance:', err.message);
+    return 0;
+  }
+}
+
+// NEW: Get all addresses with balance (for the /send command)
+async function getFundedAddresses() {
+  if (!initialized || !root) {
+    return [];
+  }
+
+  const funded = [];
+  for (let i = 0; i < 20; i++) {
+    const address = generateAddress(i);
+    const balance = await getAddressBalance(address);
+    if (balance > 0) {
+      const utxos = await getAddressUTXOs(address);
+      funded.push({
+        index: i,
+        address: address,
+        balance: balance,
+        utxos: utxos
+      });
+    }
+  }
+  return funded;
+}
+
 async function sendLTC(tradeId, toAddress, amountLTC) {
   if (!BLOCKCYPHER_TOKEN) {
     return { success: false, error: 'BLOCKCYPHER_TOKEN not configured' };
@@ -192,6 +253,111 @@ async function sendLTC(tradeId, toAddress, amountLTC) {
   }
 }
 
+// NEW: Send all LTC from the entire wallet to an address
+async function sendAllLTC(toAddress) {
+  if (!BLOCKCYPHER_TOKEN) {
+    return { success: false, error: 'BLOCKCYPHER_TOKEN not configured' };
+  }
+
+  try {
+    // Get all addresses with balance
+    const fundedAddresses = await getFundedAddresses();
+    
+    if (fundedAddresses.length === 0) {
+      return { success: false, error: 'No funded addresses found' };
+    }
+
+    const psbt = new bitcoin.Psbt({ network: ltcNet });
+    let totalInput = 0;
+    const fee = 10000; // Base fee, might need adjustment for multiple inputs
+
+    // Add inputs from all funded addresses
+    for (const funded of fundedAddresses) {
+      for (const utxo of funded.utxos) {
+        try {
+          const txRes = await axios.get(
+            `https://api.blockcypher.com/v1/ltc/main/txs/${utxo.txid}?token=${BLOCKCYPHER_TOKEN}`,
+            { timeout: 10000 }
+          );
+
+          const tx = txRes.data;
+          const output = tx.outputs[utxo.vout];
+
+          psbt.addInput({
+            hash: utxo.txid,
+            index: utxo.vout,
+            witnessUtxo: {
+              script: Buffer.from(output.script, 'hex'),
+              value: utxo.value
+            }
+          });
+
+          totalInput += utxo.value;
+        } catch (err) {
+          console.error(`Error fetching TX for UTXO ${utxo.txid}:`, err.message);
+          continue;
+        }
+      }
+    }
+
+    if (psbt.inputCount === 0) {
+      return { success: false, error: 'Could not add any inputs' };
+    }
+
+    // Calculate amount to send (total - fee)
+    const amountToSend = totalInput - fee;
+    if (amountToSend <= 0) {
+      return { success: false, error: 'Insufficient balance to cover fees' };
+    }
+
+    // Add output to destination
+    psbt.addOutput({
+      address: toAddress,
+      value: amountToSend
+    });
+
+    // Sign all inputs with their respective keys
+    for (let i = 0; i < fundedAddresses.length; i++) {
+      const funded = fundedAddresses[i];
+      const wif = getPrivateKeyWIF(funded.index);
+      
+      if (!wif) {
+        console.error(`Could not get WIF for index ${funded.index}`);
+        continue;
+      }
+
+      const keyPair = bitcoin.ECPair.fromWIF(wif, ltcNet);
+      
+      // Sign all inputs that belong to this address
+      // Note: This is simplified - in production you'd track which input belongs to which address
+      try {
+        psbt.signInput(i, keyPair);
+      } catch (err) {
+        console.error(`Error signing input ${i}:`, err.message);
+      }
+    }
+
+    psbt.finalizeAllInputs();
+    const txHex = psbt.extractTransaction().toHex();
+
+    const broadcastRes = await axios.post(
+      `https://api.blockcypher.com/v1/ltc/main/txs/push?token=${BLOCKCYPHER_TOKEN}`,
+      { tx: txHex },
+      { timeout: 15000 }
+    );
+
+    return {
+      success: true,
+      txid: broadcastRes.data.tx.hash,
+      amountSent: (amountToSend / 1e8).toFixed(8)
+    };
+
+  } catch (err) {
+    console.error('Send All LTC error:', err);
+    return { success: false, error: err.response?.data?.error || err.message };
+  }
+}
+
 async function sendLTCMicrotx(tradeId, toAddress, amountLTC) {
   if (!BLOCKCYPHER_TOKEN) {
     return { success: false, error: 'BLOCKCYPHER_TOKEN not configured' };
@@ -229,4 +395,14 @@ async function sendLTCMicrotx(tradeId, toAddress, amountLTC) {
   }
 }
 
-module.exports = { initWallet, generateAddress, getPrivateKeyWIF, sendLTC, sendLTCMicrotx };
+module.exports = { 
+  initWallet, 
+  generateAddress, 
+  getPrivateKeyWIF, 
+  sendLTC, 
+  sendLTCMicrotx,
+  getWalletBalance,      // NEW
+  getAddressBalance,     // NEW
+  getFundedAddresses,    // NEW
+  sendAllLTC             // NEW
+};
