@@ -1,249 +1,236 @@
-import discord
-from discord import app_commands, SelectOption
-from discord.ui import View, Select, Modal, TextInput
-import os
-import sqlite3
-import asyncio
-from dotenv import load_dotenv
-import time
-from datetime import datetime
-from bitcoinlib.wallets import Wallet, wallet_exists, WalletError
+require('dotenv').config();
+const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, StringSelectMenuOptionBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, Events, PermissionsBitField, ButtonBuilder, ButtonStyle } = require('discord.js');
+const sqlite3 = require('sqlite3').verbose();
 
-load_dotenv()
-TOKEN = os.getenv('DISCORD_TOKEN')
-MNEMONIC = os.getenv('BOT_MNEMONIC')
+const db = new sqlite3.Database('./trades.db');
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 
-if not TOKEN:
-    print("DISCORD_TOKEN missing")
-    exit(1)
+const OWNER_ID = '1298640383688970293';
+const TOKEN = process.env.DISCORD_TOKEN;
+const MNEMONIC = process.env.BOT_MNEMONIC;
 
-OWNER_ID = 1298640383688970293
+if (!TOKEN) {
+  console.error('DISCORD_TOKEN missing');
+  process.exit(1);
+}
 
-def log(msg):
-    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[{ts}] {msg}")
+// Litecoin wallet
+let root;
+if (MNEMONIC) {
+  const bip39 = require('bip39');
+  const bitcoin = require('bitcoinjs-lib');
+  const { ECPairFactory } = require('ecpair');
+  const tinysecp = require('tiny-secp256k1');
 
-# Wallet
-wallet = None
-if MNEMONIC:
-    name = "AutoMMBotWallet"
-    try:
-        if wallet_exists(name):
-            wallet = Wallet(name)
-            log(f"Opened wallet: {name}")
-        else:
-            wallet = Wallet.create(name=name, keys=MNEMONIC, network='litecoin', witness_type='segwit')
-            log(f"Created wallet: {name}")
-        log("LTC #0: " + wallet.key_for_path("m/44'/2'/0'/0/0").address)
-    except Exception as e:
-        log(f"Wallet error: {e}")
+  const ecc = tinysecp;
+  const ECPair = ECPairFactory(ecc);
 
-def get_addr(idx):
-    try:
-        return wallet.key_for_path(f"m/44'/2'/0'/0/{idx}").address if wallet else "NO_WALLET"
-    except Exception as e:
-        log(f"Addr error: {e}")
-        return "ADDR_ERROR"
+  const seed = bip39.mnemonicToSeedSync(MNEMONIC);
+  const ltcNet = {
+    messagePrefix: '\x19Litecoin Signed Message:\n',
+    bech32: 'ltc',
+    bip32: { public: 0x019da462, private: 0x019da4e8 },
+    pubKeyHash: 0x30,
+    scriptHash: 0x32,
+    wif: 0xb0
+  };
+  root = bitcoin.bip32.fromSeed(seed, ltcNet);
+  const testAddr = getDepositAddress(0);
+  console.log('LTC #0:', testAddr);
+}
 
-# Database
-conn = sqlite3.connect('trades.db')
-c = conn.cursor()
-c.execute('CREATE TABLE IF NOT EXISTS keys (key TEXT PRIMARY KEY, used INTEGER DEFAULT 0)')
-c.execute('CREATE TABLE IF NOT EXISTS activated_users (user_id TEXT PRIMARY KEY)')
-c.execute('CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, buyer_id TEXT, currency TEXT, deposit_addr TEXT, channel_id TEXT, status TEXT DEFAULT "waiting_role")')
-conn.commit()
+function getDepositAddress(index) {
+  if (!root) return 'WALLET_NOT_LOADED';
+  const path = `m/44'/2'/0'/0/${index}`;
+  const child = root.derivePath(path);
+  const { address } = bitcoin.payments.p2wpkh({ pubkey: child.publicKey, network: ltcNet });
+  return address;
+}
 
-intents = discord.Intents.default()
-intents.message_content = True
-client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
+// DB setup
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS keys (key TEXT PRIMARY KEY, used INTEGER DEFAULT 0)`);
+  db.run(`CREATE TABLE IF NOT EXISTS activated_users (user_id TEXT PRIMARY KEY)`);
+  db.run(`CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, buyer_id TEXT, currency TEXT, deposit_addr TEXT, channel_id TEXT, status TEXT DEFAULT 'waiting_role')`);
+});
 
-class TradeModal(Modal, title="Trade Setup"):
-    other = TextInput(label="User/ID of the other person", placeholder="@mention or ID", required=True)
-    you_give = TextInput(label="What are YOU giving", style=discord.TextStyle.paragraph, required=True)
-    they_give = TextInput(label="What are THEY giving", style=discord.TextStyle.paragraph, required=True)
+// Persistent panel
+const panelView = new ActionRowBuilder().addComponents(
+  new StringSelectMenuBuilder()
+    .setCustomId('crypto_select')
+    .setPlaceholder('Make a selection')
+    .addOptions(
+      new StringSelectMenuOptionBuilder().setLabel('Bitcoin').setEmoji('🟠').setValue('BTC'),
+      new StringSelectMenuOptionBuilder().setLabel('Ethereum').setEmoji('💎').setValue('ETH'),
+      new StringSelectMenuOptionBuilder().setLabel('Litecoin').setEmoji('🔷').setValue('LTC'),
+      new StringSelectMenuOptionBuilder().setLabel('Solana').setEmoji('☀️').setValue('SOL'),
+      new StringSelectMenuOptionBuilder().setLabel('USDT [ERC-20]').setEmoji('💵').setValue('USDT_ERC20'),
+      new StringSelectMenuOptionBuilder().setLabel('USDC [ERC-20]').setEmoji('💵').setValue('USDC_ERC20'),
+      new StringSelectMenuOptionBuilder().setLabel('USDT [SOL]').setEmoji('💵').setValue('USDT_SOL'),
+      new StringSelectMenuOptionBuilder().setLabel('USDC [SOL]').setEmoji('💵').setValue('USDC_SOL'),
+      new StringSelectMenuOptionBuilder().setLabel('USDT [BEP-20]').setEmoji('💵').setValue('USDT_BEP20')
+    )
+);
 
-    def __init__(self, currency):
-        super().__init__()
-        self.currency = currency
+// Modal
+const tradeModal = (currency) => new ModalBuilder()
+  .setCustomId(`trade_modal_${currency}`)
+  .setTitle('Trade Setup')
+  .addComponents(
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder()
+        .setCustomId('other_user')
+        .setLabel('User/ID of the other person')
+        .setStyle(TextInputStyle.Short)
+        .setPlaceholder('@mention or ID')
+        .setRequired(true)
+    ),
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder()
+        .setCustomId('you_give')
+        .setLabel('What are YOU giving')
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(true)
+    ),
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder()
+        .setCustomId('they_give')
+        .setLabel('What are THEY giving')
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(true)
+    )
+  );
 
-    async def on_submit(self, i: discord.Interaction):
-        log(f"Modal submit | User: {i.user} | Currency: {self.currency}")
-        await i.response.defer(ephemeral=True)
+// Role buttons
+const roleRow = (tradeId, starterId, otherId) => new ActionRowBuilder().addComponents(
+  new ButtonBuilder()
+    .setCustomId(`sender_${tradeId}`)
+    .setLabel('Sender')
+    .setStyle(ButtonStyle.Success),
+  new ButtonBuilder()
+    .setCustomId(`receiver_${tradeId}`)
+    .setLabel('Receiver')
+    .setStyle(ButtonStyle.Primary)
+);
 
-        try:
-            other_input = self.other.value.strip()
-            u = None
-            if other_input.startswith('<@') and other_input.endswith('>'):
-                uid = int(other_input[2:-1].replace('!', ''))
-                u = await client.fetch_user(uid)
-            else:
-                u = await client.fetch_user(int(other_input))
+// Interaction handler
+client.on(Events.InteractionCreate, async interaction => {
+  if (!interaction.isCommand() && !interaction.isStringSelectMenu() && !interaction.isModalSubmit() && !interaction.isButton()) return;
 
-            if not u:
-                await i.followup.send("Invalid user.", ephemeral=True)
-                log("Modal: invalid user")
-                return
+  // Commands
+  if (interaction.isCommand()) {
+    const { commandName } = interaction;
 
-            if u.id == i.user.id:
-                await i.followup.send("Can't trade with self.", ephemeral=True)
-                log("Modal: self-trade attempt")
-                return
+    if (commandName === 'generatekey') {
+      if (interaction.user.id !== OWNER_ID) return interaction.reply({ content: 'No.', ephemeral: true });
+      const key = Math.random().toString(36).substring(2, 18).toUpperCase();
+      db.run('INSERT INTO keys (key) VALUES (?)', key);
+      await interaction.reply({ content: `Key: \`${key}\``, ephemeral: true });
+    }
 
-            idx = int(time.time() * 1000) % 1000000
-            addr = get_addr(idx)
+    if (commandName === 'redeemkey') {
+      if (interaction.user.id === OWNER_ID) return interaction.reply({ content: "Owner doesn't need key.", ephemeral: true });
+      const key = interaction.options.getString('key').toUpperCase();
+      db.get('SELECT used FROM keys WHERE key = ?', key, (err, row) => {
+        if (err || !row || row.used) return interaction.reply({ content: 'Invalid/used.', ephemeral: true });
+        db.run('UPDATE keys SET used = 1 WHERE key = ?', key);
+        db.run('INSERT OR IGNORE INTO activated_users (user_id) VALUES (?)', interaction.user.id);
+        interaction.reply({ content: 'Activated.', ephemeral: true });
+      });
+    }
 
-            c.execute(
-                "INSERT INTO trades (buyer_id, currency, deposit_addr, channel_id, status) VALUES (?,?,?,?,?)",
-                (str(i.user.id), self.currency, addr, "pending", 'waiting_role')
-            )
-            trade_id = c.lastrowid
-            conn.commit()
+    if (commandName === 'autoticketpanel') {
+      if (interaction.user.id !== OWNER_ID) {
+        db.get('SELECT 1 FROM activated_users WHERE user_id = ?', interaction.user.id, (err, row) => {
+          if (!row) return interaction.reply({ content: 'Redeem a key first.', ephemeral: true });
+          interaction.reply({ embeds: [new EmbedBuilder().setTitle('Crypto Currency').setDescription('**Fees:**\n• >250$: 2$\n• <250$: 1$\n• <50$: 0.7$\n• <10$: 0.3$\n• <5$: FREE')], components: [panelView] });
+        });
+      } else {
+        interaction.reply({ embeds: [new EmbedBuilder().setTitle('Crypto Currency').setDescription('**Fees:**\n• >250$: 2$\n• <250$: 1$\n• <50$: 0.7$\n• <10$: 0.3$\n• <5$: FREE')], components: [panelView] });
+      }
+    }
+  }
 
-            overwrites = {
-                i.guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                i.user: discord.PermissionOverwrite(view_channel=True, send_messages=True),
-                u: discord.PermissionOverwrite(view_channel=True, send_messages=True),
-            }
+  // Select menu
+  if (interaction.isStringSelectMenu() && interaction.customId === 'crypto_select') {
+    const currency = interaction.values[0];
+    await interaction.showModal(tradeModal(currency));
+  }
 
-            ch = await i.guild.create_text_channel(f"trade-{trade_id}", overwrites=overwrites)
+  // Modal submit
+  if (interaction.isModalSubmit() && interaction.customId.startsWith('trade_modal_')) {
+    const currency = interaction.customId.split('_')[2];
+    const otherInput = interaction.fields.getTextInputValue('other_user');
+    const youGive = interaction.fields.getTextInputValue('you_give');
+    const theyGive = interaction.fields.getTextInputValue('they_give');
 
-            c.execute("UPDATE trades SET channel_id=? WHERE id=?", (ch.id, trade_id))
-            conn.commit()
+    let otherUser;
+    try {
+      const id = otherInput.replace(/[<@!>]/g, '');
+      otherUser = await client.users.fetch(id);
+    } catch {
+      return interaction.reply({ content: 'Invalid user ID/mention.', ephemeral: true });
+    }
 
-            view = RoleView(trade_id, i.user.id, u.id)
+    if (otherUser.id === interaction.user.id) return interaction.reply({ content: "Can't trade with yourself.", ephemeral: true });
 
-            await ch.send(
-                f"**Trade #{trade_id}** | {self.currency}\n"
-                f"Deposit: `{addr}`\n"
-                f"{i.user.mention} gives: {self.you_give.value}\n"
-                f"{u.mention} gives: {self.they_give.value}\n\n"
-                f"{u.mention} pick role:", view=view
-            )
+    const idx = Date.now() % 1000000;
+    const addr = get_addr(idx);
 
-            await i.followup.send(f"Ticket: {ch.mention}", ephemeral=True)
-            log(f"Modal success | Trade #{trade_id} | Channel {ch.id}")
+    db.run(
+      'INSERT INTO trades (buyer_id, currency, deposit_addr, channel_id, status) VALUES (?, ?, ?, ?, ?)',
+      [interaction.user.id, currency, addr, 'pending', 'waiting_role'],
+      function(err) {
+        if (err) return interaction.reply({ content: 'DB error.', ephemeral: true });
+        const tradeId = this.lastID;
 
-        except Exception as e:
-            log(f"Modal CRASH: {str(e)}\n{traceback.format_exc()}")
-            await i.followup.send("Failed to create ticket. Check logs.", ephemeral=True)
+        const overwrites = {
+          [interaction.guild.roles.everyone.id]: { ViewChannel: false },
+          [interaction.user.id]: { ViewChannel: true, SendMessages: true },
+          [otherUser.id]: { ViewChannel: true, SendMessages: true }
+        };
 
-class RoleView(View):
-    def __init__(self, tid, starter, other):
-        super().__init__(timeout=None)
-        self.tid = tid
-        self.other = other
+        interaction.guild.channels.create({
+          name: `trade-${tradeId}`,
+          type: 0,
+          permission_overwrites: overwrites
+        }).then(ch => {
+          db.run('UPDATE trades SET channel_id = ? WHERE id = ?', [ch.id, tradeId]);
 
-    @discord.ui.button(label="Sender", style=discord.ButtonStyle.green, custom_id="sender_btn")
-    async def sender(self, i: discord.Interaction, _):
-        log(f"Sender button clicked | User: {i.user} | Trade: {self.tid}")
-        if i.user.id != self.other:
-            return await i.response.send_message("Not for you.", ephemeral=True)
-        c.execute("UPDATE trades SET status='sender' WHERE id=?", (self.tid,))
-        conn.commit()
-        await i.response.send_message(f"{i.user.mention} is Sender", ephemeral=False)
-        self.stop()
+          const embed = new EmbedBuilder()
+            .setTitle(`Trade #${tradeId}`)
+            .setDescription(`**Currency:** ${currency}\n**Deposit:** \`${addr}\`\n${interaction.user} gives: ${youGive}\n${otherUser} gives: ${theyGive}`)
+            .setColor('#00ff00');
 
-    @discord.ui.button(label="Receiver", style=discord.ButtonStyle.blurple, custom_id="receiver_btn")
-    async def receiver(self, i: discord.Interaction, _):
-        log(f"Receiver button clicked | User: {i.user} | Trade: {self.tid}")
-        if i.user.id != self.other:
-            return await i.response.send_message("Not for you.", ephemeral=True)
-        c.execute("UPDATE trades SET status='receiver' WHERE id=?", (self.tid,))
-        conn.commit()
-        await i.response.send_message(f"{i.user.mention} is Receiver", ephemeral=False)
-        self.stop()
+          ch.send({ content: `${otherUser}, pick your role:`, embeds: [embed], components: [roleRow(tradeId, interaction.user.id, otherUser.id)] });
 
-class PanelView(View):
-    def __init__(self):
-        super().__init__(timeout=None)
-        opts = [
-            SelectOption(label="Bitcoin", value="BTC", emoji="🟠"),
-            SelectOption(label="Ethereum", value="ETH", emoji="💎"),
-            SelectOption(label="Litecoin", value="LTC", emoji="🔷"),
-            SelectOption(label="Solana", value="SOL", emoji="☀️"),
-            SelectOption(label="USDT [ERC-20]", value="USDT_ERC20", emoji="💵"),
-            SelectOption(label="USDC [ERC-20]", value="USDC_ERC20", emoji="💵"),
-            SelectOption(label="USDT [SOL]", value="USDT_SOL", emoji="💵"),
-            SelectOption(label="USDC [SOL]", value="USDC_SOL", emoji="💵"),
-            SelectOption(label="USDT [BEP-20]", value="USDT_BEP20", emoji="💵"),
-        ]
-        sel = Select(placeholder="Make a selection", options=opts, custom_id="crypto_panel_select")
+          interaction.reply({ content: `Ticket created: ${ch}`, ephemeral: true });
+        }).catch(err => {
+          console.error('Channel create error:', err);
+          interaction.reply({ content: 'Failed to create channel (check permissions).', ephemeral: true });
+        });
+      }
+    );
+  }
 
-        @sel.callback
-        async def cb(i: discord.Interaction):
-            log(f"Select callback | User: {i.user} | Currency: {i.data['values'][0]}")
-            await i.response.send_modal(TradeModal(i.data['values'][0]))
+  // Buttons
+  if (interaction.isButton() && interaction.customId.startsWith('sender_') || interaction.customId.startsWith('receiver_')) {
+    const [role, tradeId] = interaction.customId.split('_');
+    const isSender = role === 'sender';
 
-        self.add_item(sel)
+    db.get('SELECT buyer_id FROM trades WHERE id = ?', tradeId, (err, row) => {
+      if (err || !row) return interaction.reply({ content: 'Trade not found.', ephemeral: true });
 
-@tree.command(name="generatekey", description="Generate key (owner only)")
-async def gk(i: discord.Interaction):
-    log(f"/generatekey | User: {i.user}")
-    if i.user.id != OWNER_ID:
-        return await i.response.send_message("No.", ephemeral=True)
-    k = os.urandom(8).hex().upper()
-    c.execute("INSERT INTO keys (key) VALUES (?)", (k,))
-    conn.commit()
-    await i.response.send_message(f"Key: `{k}`", ephemeral=True)
+      if (interaction.user.id === row.buyer_id) return interaction.reply({ content: 'Buyer cannot choose role.', ephemeral: true });
 
-@tree.command(name="redeemkey", description="Redeem key")
-@app_commands.describe(key="Key")
-async def rk(i: discord.Interaction, key: str):
-    log(f"/redeemkey | User: {i.user} | Key: {key}")
-    if i.user.id == OWNER_ID:
-        return await i.response.send_message("Owner doesn't need key.", ephemeral=True)
-    c.execute("SELECT used FROM keys WHERE key=?", (key.upper(),))
-    r = c.fetchone()
-    if not r or r[0]:
-        return await i.response.send_message("Invalid/used.", ephemeral=True)
-    c.execute("UPDATE keys SET used=1 WHERE key=?", (key.upper(),))
-    c.execute("INSERT OR IGNORE INTO activated_users (user_id) VALUES (?)", (str(i.user.id),))
-    conn.commit()
-    await i.response.send_message("Activated.", ephemeral=True)
+      db.run('UPDATE trades SET status = ? WHERE id = ?', [isSender ? 'sender' : 'receiver', tradeId]);
+      interaction.update({ content: `${interaction.user} chose **${isSender ? 'Sender' : 'Receiver'}**`, components: [] });
+    });
+  }
+});
 
-@tree.command(name="autoticketpanel", description="Open trade panel")
-async def tp(i: discord.Interaction):
-    log(f"/autoticketpanel | User: {i.user}")
-    if i.user.id != OWNER_ID:
-        c.execute("SELECT 1 FROM activated_users WHERE user_id=?", (str(i.user.id),))
-        if not c.fetchone():
-            return await i.response.send_message("Redeem a key first.", ephemeral=True)
+client.once('ready', () => {
+  console.log(`Logged in as ${client.user.tag}`);
+});
 
-    e = discord.Embed(title="Crypto Currency", description="**Fees:**\n• >250$: 2$\n• <250$: 1$\n• <50$: 0.7$\n• <10$: 0.3$\n• <5$: FREE")
-    await i.response.send_message(embed=e, view=PanelView())
-
-@client.event
-async def on_ready():
-    log(f'Logged in: {client.user} (ID: {client.user.id})')
-
-    try:
-        synced = await tree.sync()
-        log(f"Global sync: {len(synced)} commands")
-        for s in synced:
-            log(f" - /{s.name}")
-    except Exception as e:
-        log(f"Global sync failed: {e}")
-
-    YOUR_GUILD_ID = 1298640383688970293  # REPLACE WITH YOUR ACTUAL SERVER ID
-    guild = client.get_guild(YOUR_GUILD_ID)
-    if guild:
-        try:
-            await tree.sync(guild=guild)
-            log(f"Guild sync done: {guild.name}")
-        except Exception as e:
-            log(f"Guild sync failed: {e}")
-
-    client.add_view(PanelView())
-
-async def setup_hook():
-    client.loop.create_task(monitor())
-
-client.setup_hook = setup_hook
-
-async def monitor():
-    await client.wait_until_ready()
-    while not client.is_closed():
-        await asyncio.sleep(60)
-
-client.run(TOKEN)
+client.login(TOKEN);
