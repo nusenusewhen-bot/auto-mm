@@ -17,7 +17,7 @@ const client = new Client({
   ]
 });
 
-const OWNER_ID = 'YOUR_OWNER_ID';
+const OWNER_ID = '1298640383688970293';
 const TOKEN = process.env.DISCORD_TOKEN;
 const OWNER_LTC_ADDRESS = 'LeDdjh2BDbPkrhG2pkWBko3HRdKQzprJMX';
 
