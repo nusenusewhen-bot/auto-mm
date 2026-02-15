@@ -1,7 +1,9 @@
 {
   "name": "auto-mm-bot",
   "version": "1.0.0",
+  "description": "Discord Litecoin auto middleman escrow bot",
   "main": "index.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
@@ -12,7 +14,7 @@
     "bip39": "^3.1.0",
     "bitcoinjs-lib": "^6.1.6",
     "tiny-secp256k1": "^2.2.3",
-    "ecpair": "^2.1.0"
+    "bip32": "^5.0.0"
   },
   "engines": {
     "node": ">=20"
