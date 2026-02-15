@@ -28,7 +28,6 @@ async function getLtcPriceUSD() {
   }
 }
 
-// Check if LTC deposit has reached the expected USD amount
 async function checkPayment(address, expectedUsd) {
   if (!BLOCKCYPHER_TOKEN) {
     console.error('BLOCKCYPHER_TOKEN not configured');
@@ -57,11 +56,9 @@ async function checkPayment(address, expectedUsd) {
       `[Payment Check] ${address}: $${confirmedUsd.toFixed(2)} confirmed + $${unconfirmedUsd.toFixed(2)} unconfirmed = $${totalUsd.toFixed(2)} / $${expectedUsd} expected`
     );
 
-    // Allow small tolerance (1%) for price fluctuations
     const tolerance = expectedUsd * 0.01;
     const requiredAmount = expectedUsd - tolerance;
 
-    // Check if total (confirmed + unconfirmed) meets requirement
     if (totalUsd >= requiredAmount) {
       if (res.data.unconfirmed_n_tx > 0) {
         console.log(`[Payment Check] Payment detected with ${res.data.unconfirmed_n_tx} unconfirmed tx(s)`);
