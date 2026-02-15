@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, StringSelectMenuOptionBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, Events, PermissionsBitField, ButtonBuilder, ButtonStyle, ChannelType } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, Events, PermissionsBitField, ChannelType, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 const sqlite3 = require('sqlite3').verbose();
 
 const db = new sqlite3.Database('./trades.db');
@@ -16,6 +16,7 @@ const OWNER_ID = '1298640383688970293';
 const TOKEN = process.env.DISCORD_TOKEN;
 const OWNER_LTC_ADDRESS = 'LeDdjh2BDbPkrhG2pkWBko3HRdKQzprJMX';
 const FEE_USD = 0.3;
+const CURRENCY = 'LTC';
 
 if (!TOKEN) {
   console.error('DISCORD_TOKEN missing');
@@ -26,7 +27,7 @@ function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
-// Wallet - fixed bip32 access
+// Wallet (Litecoin only)
 let root;
 const mnemonic = process.env.BOT_MNEMONIC;
 if (mnemonic) {
@@ -51,13 +52,13 @@ if (mnemonic) {
     };
 
     root = bitcoin.bip32.fromSeed(seed, ltcNet);
-    log(`Wallet loaded. Address #0: ${getDepositAddress(0)}`);
+    log(`Litecoin wallet loaded. Address #0: ${getDepositAddress(0)}`);
   } catch (err) {
     log(`Wallet init failed: ${err.message}`);
     root = null;
   }
 } else {
-  log('No BOT_MNEMONIC - wallet disabled');
+  log('No BOT_MNEMONIC set - wallet disabled');
 }
 
 function getDepositAddress(index) {
@@ -76,7 +77,7 @@ db.serialize(() => {
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     buyer_id TEXT,
     seller_id TEXT,
-    currency TEXT,
+    currency TEXT DEFAULT 'LTC',
     deposit_addr TEXT,
     amount REAL,
     fee REAL DEFAULT ${FEE_USD},
@@ -90,25 +91,20 @@ db.serialize(() => {
   )`);
 });
 
-// Panel
-const panelRow = new ActionRowBuilder().addComponents(
-  new StringSelectMenuBuilder()
-    .setCustomId('crypto_select')
-    .setPlaceholder('Make a selection')
-    .addOptions(
-      new StringSelectMenuOptionBuilder().setLabel('Bitcoin').setEmoji('🟠').setValue('BTC'),
-      new StringSelectMenuOptionBuilder().setLabel('Ethereum').setEmoji('💎').setValue('ETH'),
-      new StringSelectMenuOptionBuilder().setLabel('Litecoin').setEmoji('🔷').setValue('LTC'),
-      new StringSelectMenuOptionBuilder().setLabel('Solana').setEmoji('☀️').setValue('SOL'),
-      new StringSelectMenuOptionBuilder().setLabel('USDT [ERC-20]').setEmoji('💵').setValue('USDT_ERC20'),
-      new StringSelectMenuOptionBuilder().setLabel('USDC [ERC-20]').setEmoji('💵').setValue('USDC_ERC20'),
-      new StringSelectMenuOptionBuilder().setLabel('USDT [SOL]').setEmoji('💵').setValue('USDT_SOL'),
-      new StringSelectMenuOptionBuilder().setLabel('USDC [SOL]').setEmoji('💵').setValue('USDC_SOL'),
-      new StringSelectMenuOptionBuilder().setLabel('USDT [BEP-20]').setEmoji('💵').setValue('USDT_BEP20')
-    )
+// Litecoin panel
+const ltcEmbed = new EmbedBuilder()
+  .setTitle('Litecoin Escrow')
+  .setDescription('**Fees:**\n• Deals over 250$: **2$**\n• Deals under 250$: **1$**\n• Deals under 50$: **0.7$**\n• Deals under 10$: **0.3$**\n• Deals under 5$: **FREE**')
+  .setColor('#00aaff');
+
+const startButtonRow = new ActionRowBuilder().addComponents(
+  new ButtonBuilder()
+    .setCustomId('start_ltc_trade')
+    .setLabel('Start LTC Trade')
+    .setStyle(ButtonStyle.Primary)
 );
 
-// Interaction handler
+// Commands
 client.on(Events.InteractionCreate, async interaction => {
   if (interaction.isCommand()) {
     const { commandName } = interaction;
@@ -125,7 +121,7 @@ client.on(Events.InteractionCreate, async interaction => {
       if (interaction.user.id === OWNER_ID) return interaction.reply({ content: "Owner doesn't need key.", ephemeral: true });
 
       db.get('SELECT used FROM keys WHERE key = ?', key, (err, row) => {
-        if (err || !row || row.used) return interaction.reply({ content: 'Invalid or used.', ephemeral: true });
+        if (err || !row || row.used) return interaction.reply({ content: 'Invalid/used.', ephemeral: true });
         db.run('UPDATE keys SET used = 1 WHERE key = ?', key);
         db.run('INSERT OR IGNORE INTO activated_users (user_id) VALUES (?)', interaction.user.id);
         interaction.reply({ content: 'Activated!', ephemeral: true });
@@ -136,12 +132,7 @@ client.on(Events.InteractionCreate, async interaction => {
       db.get('SELECT 1 FROM activated_users WHERE user_id = ?', interaction.user.id, (err, row) => {
         if (interaction.user.id !== OWNER_ID && !row) return interaction.reply({ content: 'Redeem a key first.', ephemeral: true });
 
-        const embed = new EmbedBuilder()
-          .setTitle('Crypto Currency')
-          .setDescription('**Fees:**\n• Deals over 250$: **2$**\n• Deals under 250$: **1$**\n• Deals under 50$: **0.7$**\n• Deals under 10$: **0.3$**\n• Deals under 5$: **FREE**')
-          .setColor('#0099ff');
-
-        interaction.reply({ embeds: [embed], components: [panelRow] });
+        interaction.reply({ embeds: [ltcEmbed], components: [startButtonRow] });
       });
     }
 
@@ -154,11 +145,11 @@ client.on(Events.InteractionCreate, async interaction => {
     }
   }
 
-  if (interaction.isStringSelectMenu() && interaction.customId === 'crypto_select') {
-    const currency = interaction.values[0];
+  // Start LTC trade
+  if (interaction.isButton() && interaction.customId === 'start_ltc_trade') {
     const modal = new ModalBuilder()
-      .setCustomId(`trade_modal_${currency}`)
-      .setTitle('Trade Setup')
+      .setCustomId('trade_modal_ltc')
+      .setTitle('Litecoin Trade Setup')
       .addComponents(
         new ActionRowBuilder().addComponents(
           new TextInputBuilder()
@@ -187,8 +178,8 @@ client.on(Events.InteractionCreate, async interaction => {
     await interaction.showModal(modal);
   }
 
-  if (interaction.isModalSubmit() && interaction.customId.startsWith('trade_modal_')) {
-    const currency = interaction.customId.split('_')[2];
+  // Modal submit
+  if (interaction.isModalSubmit() && interaction.customId === 'trade_modal_ltc') {
     const otherInput = interaction.fields.getTextInputValue('other_user');
     const youGive = interaction.fields.getTextInputValue('you_give');
     const theyGive = interaction.fields.getTextInputValue('they_give');
@@ -208,7 +199,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
     db.run(
       'INSERT INTO trades (buyer_id, currency, deposit_addr, channel_id, status) VALUES (?, ?, ?, ?, ?)',
-      [interaction.user.id, currency, addr, 'pending', 'waiting_role'],
+      [interaction.user.id, CURRENCY, addr, 'pending', 'waiting_role'],
       function(err) {
         if (err) return interaction.reply({ content: 'DB error.', ephemeral: true });
         const tradeId = this.lastID;
@@ -227,9 +218,9 @@ client.on(Events.InteractionCreate, async interaction => {
           db.run('UPDATE trades SET channel_id = ? WHERE id = ?', [ch.id, tradeId]);
 
           const embed = new EmbedBuilder()
-            .setTitle(`Trade #${tradeId}`)
-            .setDescription(`**Currency:** ${currency}\n**Deposit:** \`${addr}\`\n${interaction.user} gives: ${youGive}\n${otherUser} gives: ${theyGive}`)
-            .setColor('#00ff00');
+            .setTitle(`Litecoin Trade #${tradeId}`)
+            .setDescription(`**Deposit:** \`${addr}\`\n${interaction.user} gives: ${youGive}\n${otherUser} gives: ${theyGive}`)
+            .setColor('#00aaff');
 
           const row = new ActionRowBuilder().addComponents(
             new ButtonBuilder()
@@ -242,9 +233,9 @@ client.on(Events.InteractionCreate, async interaction => {
               .setStyle(ButtonStyle.Primary)
           );
 
-          ch.send({ content: `${interaction.user} started trade with ${otherUser}.\nBoth can choose role:`, embeds: [embed], components: [row] });
+          ch.send({ content: `${interaction.user} started LTC trade with ${otherUser}.\nBoth can choose role:`, embeds: [embed], components: [row] });
 
-          interaction.reply({ content: `Ticket created: ${ch}`, ephemeral: true });
+          interaction.reply({ content: `Litecoin ticket created: ${ch}`, ephemeral: true });
         }).catch(err => {
           console.error('Channel create error:', err);
           interaction.reply({ content: 'Failed to create channel (bot needs Manage Channels permission).', ephemeral: true });
@@ -253,6 +244,7 @@ client.on(Events.InteractionCreate, async interaction => {
     );
   }
 
+  // Button handler
   if (interaction.isButton()) {
     const [action, tradeId, role] = interaction.customId.split('_');
 
@@ -305,7 +297,7 @@ client.on(Events.InteractionCreate, async interaction => {
           if (isNaN(amount)) return interaction.followup({ content: 'Invalid amount.', ephemeral: true });
 
           const total = amount + FEE_USD;
-          interaction.followup({ content: `Send **${total.toFixed(2)}$** (amount + ${FEE_USD}$ fee to owner)\nFee address: ${OWNER_LTC_ADDRESS}\nDeposit address: ${getDepositAddress(tradeId)}`, ephemeral: true });
+          interaction.followup({ content: `Send **${total.toFixed(2)} LTC** (amount + ${FEE_USD}$ fee converted to LTC)\nFee address: ${OWNER_LTC_ADDRESS}\nDeposit address: ${getDepositAddress(tradeId)}`, ephemeral: true });
 
           db.run('UPDATE trades SET amount = ? WHERE id = ?', [amount, tradeId]);
         });
@@ -313,18 +305,16 @@ client.on(Events.InteractionCreate, async interaction => {
     }
 
     if (action === 'refund') {
-      db.get('SELECT buyer_id FROM trades WHERE id = ?', tradeId, (err, row) => {
-        const confirmRow = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(`confirm_refund_${tradeId}`).setLabel('Confirm Refund').setStyle(ButtonStyle.Danger),
-          new ButtonBuilder().setCustomId(`cancel_refund_${tradeId}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary)
-        );
+      const confirmRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`confirm_refund_${tradeId}`).setLabel('Confirm Refund').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId(`cancel_refund_${tradeId}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary)
+      );
 
-        interaction.reply({ content: 'Refund requires confirmation from both users.', components: [confirmRow], ephemeral: false });
-      });
+      interaction.reply({ content: 'Refund requires confirmation from both users.', components: [confirmRow], ephemeral: false });
     }
 
     if (action === 'confirm_refund') {
-      // TODO: refund to buyer
+      // TODO: implement refund logic
       interaction.update({ content: 'Refund confirmed and processed.', components: [] });
     }
 
