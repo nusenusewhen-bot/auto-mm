@@ -11,23 +11,56 @@ const {
   TextInputStyle,
   ChannelType,
   PermissionsBitField,
-  Events
+  Events,
+  SlashCommandBuilder,
+  Routes,
 } = require('discord.js');
 
 const db = require('./database');
 const { initWallet, generateAddress } = require('./wallet');
 const { checkPayment } = require('./blockchain');
+const { REST } = require('@discordjs/rest');
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ]
+    GatewayIntentBits.MessageContent,
+  ],
 });
+
+// Bot config
+const OWNER_ID = process.env.OWNER_ID;
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 
 initWallet(process.env.BOT_MNEMONIC);
 
+// ---------- Register Slash Commands ----------
+const commands = [
+  new SlashCommandBuilder()
+    .setName('autoticketpanel')
+    .setDescription('Show the auto trade panel'),
+  new SlashCommandBuilder()
+    .setName('logchannel')
+    .setDescription('Set a log channel')
+    .addStringOption((opt) =>
+      opt.setName('channelid').setDescription('Channel ID').setRequired(true)
+    ),
+].map((cmd) => cmd.toJSON());
+
+const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
+
+(async () => {
+  try {
+    console.log('Refreshing slash commands...');
+    await rest.put(Routes.applicationCommands(client.user?.id || '0'), { body: commands });
+    console.log('Slash commands registered.');
+  } catch (err) {
+    console.error(err);
+  }
+})();
+
+// ---------- Utilities ----------
 function calculateFee(amount) {
   if (amount <= 5) return 0;
   if (amount <= 10) return 0.3;
@@ -37,150 +70,163 @@ function calculateFee(amount) {
   return 0;
 }
 
-function log(guild, message) {
+function log(guild, msg) {
   const row = db.prepare(`SELECT value FROM config WHERE key='logChannel'`).get();
   if (!row) return;
-  const channel = guild.channels.cache.get(row.value);
-  if (channel) channel.send(message);
+  const ch = guild.channels.cache.get(row.value);
+  if (ch) ch.send(msg);
 }
 
+// ---------- Client Ready ----------
 client.once(Events.ClientReady, () => {
   console.log(`Logged in as ${client.user.tag}`);
 });
 
-client.on(Events.InteractionCreate, async interaction => {
-
+// ---------- Interactions ----------
+client.on(Events.InteractionCreate, async (interaction) => {
+  // ----- Slash commands -----
   if (interaction.isChatInputCommand()) {
+    const { commandName } = interaction;
 
-    if (interaction.commandName === 'logchannel') {
+    if (commandName === 'logchannel') {
+      if (interaction.user.id !== OWNER_ID)
+        return interaction.reply({ content: 'Only owner.', flags: 64 });
+
       const id = interaction.options.getString('channelid');
-      db.prepare(`INSERT OR REPLACE INTO config(key,value) VALUES('logChannel',?)`).run(id);
-      return interaction.reply({ content: `Log channel set.`, flags: 64 });
+      db.prepare(
+        `INSERT OR REPLACE INTO config(key,value) VALUES('logChannel',?)`
+      ).run(id);
+      return interaction.reply({ content: 'Log channel set.', flags: 64 });
     }
 
-    if (interaction.commandName === 'autoticketpanel') {
+    if (commandName === 'autoticketpanel') {
       const embed = new EmbedBuilder()
-        .setTitle("Litecoin Auto MM")
-        .setDescription("Click below to start a trade.")
-        .setColor("Green");
+        .setTitle('USD Auto MM Panel')
+        .setDescription('Click below to start a trade.')
+        .setColor('Green');
 
       const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
-          .setCustomId("start_trade")
-          .setLabel("Start Trade")
+          .setCustomId('start_trade')
+          .setLabel('Start Trade')
           .setStyle(ButtonStyle.Primary)
       );
 
-      return interaction.reply({ embeds: [embed], components: [row] });
+      return interaction.reply({ embeds: [embed], components: [row], flags: 64 });
     }
   }
 
+  // ----- Button Interactions -----
   if (interaction.isButton()) {
-
-    if (interaction.customId === "start_trade") {
+    // Start trade modal
+    if (interaction.customId === 'start_trade') {
       const modal = new ModalBuilder()
-        .setCustomId("trade_modal")
-        .setTitle("Start Trade");
+        .setCustomId('trade_modal')
+        .setTitle('Start Trade');
 
       modal.addComponents(
         new ActionRowBuilder().addComponents(
           new TextInputBuilder()
-            .setCustomId("otherUser")
-            .setLabel("Other User ID")
+            .setCustomId('otherUser')
+            .setLabel('Other User ID')
             .setStyle(TextInputStyle.Short)
             .setRequired(true)
         ),
         new ActionRowBuilder().addComponents(
           new TextInputBuilder()
-            .setCustomId("amount")
-            .setLabel("Trade Amount (LTC)")
-            .setStyle(TextInputStyle.Short)
+            .setCustomId('youGive')
+            .setLabel('What YOU give')
+            .setStyle(TextInputStyle.Paragraph)
+            .setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('theyGive')
+            .setLabel('What THEY give')
+            .setStyle(TextInputStyle.Paragraph)
             .setRequired(true)
         )
       );
 
       return interaction.showModal(modal);
     }
+
+    // Sender/Receiver selection (just flags)
+    if (interaction.customId.startsWith('choose_role_')) {
+      const [_, tradeId, role] = interaction.customId.split('_');
+      const isSender = role === 'sender';
+
+      db.prepare(
+        `UPDATE trades SET ${isSender ? 'senderChosen' : 'receiverChosen'}=1 WHERE id=?`
+      ).run(tradeId);
+
+      return interaction.update({
+        content: `${interaction.user} chose ${role}`,
+        components: interaction.message.components,
+      });
+    }
   }
 
-  if (interaction.isModalSubmit()) {
+  // ----- Modal submit -----
+  if (interaction.isModalSubmit() && interaction.customId === 'trade_modal') {
+    const otherUserId = interaction.fields.getTextInputValue('otherUser');
+    const youGive = interaction.fields.getTextInputValue('youGive');
+    const theyGive = interaction.fields.getTextInputValue('theyGive');
 
-    if (interaction.customId === "trade_modal") {
+    const tradeIndex = db.prepare(`SELECT COUNT(*) as count FROM trades`).get().count;
+    const depositAddress = generateAddress(tradeIndex);
 
-      const otherUserId = interaction.fields.getTextInputValue("otherUser");
-      const amount = parseFloat(interaction.fields.getTextInputValue("amount"));
+    // Create trade ticket channel
+    const channel = await interaction.guild.channels.create({
+      name: `trade-${Date.now()}`,
+      type: ChannelType.GuildText,
+      permissionOverwrites: [
+        { id: interaction.guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
+        { id: interaction.user.id, allow: [PermissionsBitField.Flags.ViewChannel] },
+        { id: otherUserId, allow: [PermissionsBitField.Flags.ViewChannel] },
+      ],
+    });
 
-      if (isNaN(amount)) {
-        return interaction.reply({ content: "Invalid amount.", flags: 64 });
-      }
+    db.prepare(
+      `INSERT INTO trades(channelId,senderId,receiverId,youGive,theyGive,depositAddress,status) VALUES(?,?,?,?,?,?,?)`
+    ).run(channel.id, interaction.user.id, otherUserId, youGive, theyGive, depositAddress, 'waiting');
 
-      const fee = calculateFee(amount);
-      const total = amount + fee;
+    const embed = new EmbedBuilder()
+      .setTitle('Trade Created')
+      .setDescription(
+        `Deposit Address:\n\`${depositAddress}\`\n\n` +
+          `You give: ${youGive}\n` +
+          `They give: ${theyGive}\n` +
+          `Amount: $0 (set by sender)\n` +
+          `Fee: $0`
+      )
+      .setColor('Blue');
 
-      const tradeIndex = db.prepare(`SELECT COUNT(*) as count FROM trades`).get().count;
-      const wallet = generateAddress(tradeIndex);
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`choose_role_${tradeIndex}_sender`)
+        .setLabel('Sender')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`choose_role_${tradeIndex}_receiver`)
+        .setLabel('Receiver')
+        .setStyle(ButtonStyle.Primary)
+    );
 
-      const channel = await interaction.guild.channels.create({
-        name: `trade-${Date.now()}`,
-        type: ChannelType.GuildText,
-        permissionOverwrites: [
-          { id: interaction.guild.roles.everyone, deny: [PermissionsBitField.Flags.ViewChannel] },
-          { id: interaction.user.id, allow: [PermissionsBitField.Flags.ViewChannel] },
-          { id: otherUserId, allow: [PermissionsBitField.Flags.ViewChannel] }
-        ]
-      });
+    await channel.send({
+      content: `Trade started by <@${interaction.user.id}>`,
+      embeds: [embed],
+      components: [row],
+    });
 
-      db.prepare(`
-        INSERT INTO trades(channelId,senderId,receiverId,amount,fee,depositAddress,status)
-        VALUES(?,?,?,?,?,?,?)
-      `).run(
-        channel.id,
-        interaction.user.id,
-        otherUserId,
-        amount,
-        fee,
-        wallet.address,
-        "pending"
-      );
+    await interaction.reply({
+      content: `Trade channel created: ${channel}`,
+      flags: 64,
+    });
 
-      const embed = new EmbedBuilder()
-        .setTitle("Trade Created")
-        .setDescription(
-          `Deposit Address:\n\`${wallet.address}\`\n\n` +
-          `Amount: ${amount} LTC\n` +
-          `Fee: ${fee} LTC\n` +
-          `Total To Send: ${total} LTC`
-        )
-        .setColor("Blue");
-
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId("release")
-          .setLabel("Release")
-          .setStyle(ButtonStyle.Success),
-        new ButtonBuilder()
-          .setCustomId("refund")
-          .setLabel("Refund")
-          .setStyle(ButtonStyle.Danger)
-      );
-
-      await channel.send({ embeds: [embed], components: [row] });
-      await interaction.reply({ content: `Trade channel created: ${channel}`, flags: 64 });
-
-      log(interaction.guild, `Trade created: ${channel.id}`);
-
-      // Auto payment monitor
-      const interval = setInterval(async () => {
-        const paid = await checkPayment(wallet.address, total);
-        if (paid) {
-          clearInterval(interval);
-          db.prepare(`UPDATE trades SET status='paid' WHERE channelId=?`).run(channel.id);
-          channel.send("Payment detected and confirmed.");
-          log(interaction.guild, `Payment confirmed in ${channel.id}`);
-        }
-      }, 30000);
-    }
+    log(interaction.guild, `Trade created: ${channel.id}`);
   }
 });
 
-client.login(process.env.DISCORD_TOKEN);
+// ---------- Login ----------
+client.login(DISCORD_TOKEN);
