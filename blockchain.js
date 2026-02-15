@@ -41,41 +41,56 @@ async function checkPayment(address, expectedUsd) {
       return false;
     }
 
+    console.log(`[Payment Check] Checking: ${address}, Expecting: $${expectedUsd}, LTC Price: $${price}`);
+
     const res = await axios.get(
       `https://api.blockcypher.com/v1/ltc/main/addrs/${address}/balance?token=${BLOCKCYPHER_TOKEN}`,
       { timeout: 10000 }
     );
 
-    const confirmedLtc = res.data.total_received / 1e8;
+    console.log(`[Payment Check] Raw data: total_received=${res.data.total_received}, unconfirmed_received=${res.data.unconfirmed_received}, n_tx=${res.data.n_tx}, unconfirmed_n_tx=${res.data.unconfirmed_n_tx}`);
+
+    const confirmedLtc = (res.data.total_received || 0) / 1e8;
     const confirmedUsd = confirmedLtc * price;
-    const unconfirmedLtc = res.data.unconfirmed_received / 1e8;
+    const unconfirmedLtc = (res.data.unconfirmed_received || 0) / 1e8;
     const unconfirmedUsd = unconfirmedLtc * price;
+    const totalLtc = confirmedLtc + unconfirmedLtc;
     const totalUsd = confirmedUsd + unconfirmedUsd;
 
     console.log(
-      `[Payment Check] ${address}: $${confirmedUsd.toFixed(2)} confirmed + $${unconfirmedUsd.toFixed(2)} unconfirmed = $${totalUsd.toFixed(2)} / $${expectedUsd} expected`
+      `[Payment Check] ${address}: ${confirmedLtc.toFixed(8)} LTC ($${confirmedUsd.toFixed(4)}) confirmed + ` +
+      `${unconfirmedLtc.toFixed(8)} LTC ($${unconfirmedUsd.toFixed(4)}) unconfirmed = ` +
+      `${totalLtc.toFixed(8)} LTC ($${totalUsd.toFixed(4)}) total`
     );
 
-    const tolerance = expectedUsd * 0.01;
-    const requiredAmount = expectedUsd - tolerance;
+    const tolerance = Math.max(expectedUsd * 0.02, 0.001);
+    const requiredAmount = Math.max(0, expectedUsd - tolerance);
 
-    if (totalUsd >= requiredAmount) {
+    console.log(`[Payment Check] Required: $${requiredAmount.toFixed(4)}, Have: $${totalUsd.toFixed(4)}, Needed LTC: ${(expectedUsd/price).toFixed(8)}`);
+
+    if (totalUsd >= requiredAmount && totalLtc > 0) {
       if (res.data.unconfirmed_n_tx > 0) {
-        console.log(`[Payment Check] Payment detected with ${res.data.unconfirmed_n_tx} unconfirmed tx(s)`);
+        console.log(`[Payment Check] ✅ Found transaction! ${res.data.unconfirmed_n_tx} unconfirmed`);
+      } else {
+        console.log(`[Payment Check] ✅ Payment confirmed!`);
       }
       return true;
     }
 
+    console.log(`[Payment Check] ❌ Not enough funds yet`);
     return false;
 
   } catch (err) {
     if (err.response?.status === 429) {
       console.error('BlockCypher rate limit hit');
     } else if (err.response?.status === 404) {
-      console.log(`[Payment Check] ${address}: No transactions yet`);
+      console.log(`[Payment Check] ${address}: No transactions yet (404)`);
       return false;
     } else {
       console.error('Error checking payment:', err.message);
+      if (err.response?.data) {
+        console.error('Response:', JSON.stringify(err.response.data));
+      }
     }
     return false;
   }
