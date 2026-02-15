@@ -17,11 +17,11 @@ const client = new Client({
   ]
 });
 
-const OWNER_ID = '1298640383688970293';
+const OWNER_ID = 'YOUR_OWNER_ID';
 const TOKEN = process.env.DISCORD_TOKEN;
 const OWNER_LTC_ADDRESS = 'LeDdjh2BDbPkrhG2pkWBko3HRdKQzprJMX';
 
-// ---------------- Initialization ----------------
+// ---------------- Initialize Wallet ----------------
 client.once(Events.ClientReady, () => {
   console.log(`Logged in as ${client.user.tag}`);
   initWallet(process.env.BOT_MNEMONIC);
@@ -36,6 +36,8 @@ db.serialize(() => {
     channel_id TEXT,
     sender_id TEXT,
     receiver_id TEXT,
+    you_give TEXT,
+    they_give TEXT,
     amount REAL,
     fee REAL,
     deposit_addr TEXT,
@@ -58,16 +60,15 @@ function sendEmbed(channel, title, description, color='#00aaff', components=[]){
     .setTitle(title)
     .setDescription(description)
     .setColor(color);
-  channel.send({ embeds:[embed], components });
+  return channel.send({ embeds:[embed], components });
 }
 
 // ---------------- Commands ----------------
 client.on(Events.InteractionCreate, async interaction => {
   if(interaction.isCommand()){
-
     const { commandName } = interaction;
 
-    // ---- Owner generates key ----
+    // Owner generates key
     if(commandName === 'generatekey'){
       if(interaction.user.id !== OWNER_ID)
         return interaction.reply({ content:'Only owner.', ephemeral:true });
@@ -76,12 +77,11 @@ client.on(Events.InteractionCreate, async interaction => {
       return interaction.reply({ content:`Key: \`${key}\``, ephemeral:true });
     }
 
-    // ---- Redeem Key ----
+    // Redeem key
     if(commandName === 'redeemkey'){
       const key = interaction.options.getString('key').toUpperCase();
       if(interaction.user.id === OWNER_ID) 
         return interaction.reply({ content:"Owner doesn't need key.", ephemeral:true });
-
       db.get('SELECT used FROM keys WHERE key=?', key, (err,row)=>{
         if(err || !row || row.used) return interaction.reply({ content:'Invalid/used key.', ephemeral:true });
         db.run('UPDATE keys SET used=1 WHERE key=?', key);
@@ -90,7 +90,7 @@ client.on(Events.InteractionCreate, async interaction => {
       });
     }
 
-    // ---- LTC Trade Panel ----
+    // LTC Panel
     if(commandName === 'autoticketpanel'){
       db.get('SELECT 1 FROM activated_users WHERE user_id=?', interaction.user.id, (err,row)=>{
         if(interaction.user.id !== OWNER_ID && !row)
@@ -113,7 +113,7 @@ client.on(Events.InteractionCreate, async interaction => {
   if(interaction.isButton()){
     const [action, tradeId, extra] = interaction.customId.split('_');
 
-    // ---- Start Trade Modal ----
+    // Start Trade Modal
     if(interaction.customId === 'start_trade'){
       const modal = new ModalBuilder()
         .setCustomId('trade_modal')
@@ -126,12 +126,26 @@ client.on(Events.InteractionCreate, async interaction => {
               .setStyle(TextInputStyle.Short)
               .setPlaceholder('@mention or ID')
               .setRequired(true)
+          ),
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('you_give')
+              .setLabel('What are YOU giving')
+              .setStyle(TextInputStyle.Paragraph)
+              .setRequired(true)
+          ),
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('they_give')
+              .setLabel('What are THEY giving')
+              .setStyle(TextInputStyle.Paragraph)
+              .setRequired(true)
           )
         );
       return interaction.showModal(modal);
     }
 
-    // ---- Choose Roles ----
+    // Choose roles
     if(action === 'choose'){
       db.get('SELECT * FROM trades WHERE id=?', tradeId, (err,row)=>{
         if(!row) return interaction.reply({ content:'Trade not found', ephemeral:true });
@@ -158,19 +172,19 @@ client.on(Events.InteractionCreate, async interaction => {
       });
     }
 
-    // ---- Confirm Trade ----
+    // Confirm trade
     if(action === 'confirm' && extra === 'trade'){
       db.run('UPDATE trades SET status=? WHERE id=?', ['confirmed', tradeId]);
-      sendEmbed(interaction.channel, 'Trade Confirmed', 'Sender, input the deal amount using modal', '#00aaff');
+      sendEmbed(interaction.channel, 'Trade Confirmed', 'Sender, input the deal value using modal', '#00aaff');
     }
 
-    // ---- Release / Refund ----
+    // Release / Refund
     if(action === 'release'){
       db.get('SELECT sender_id FROM trades WHERE id=?', tradeId, (err,row)=>{
         if(!row) return;
         if(interaction.user.id !== row.sender_id && interaction.user.id !== OWNER_ID) 
           return interaction.reply({ content:'Only sender/owner can release', ephemeral:true });
-        sendEmbed(interaction.channel, 'Release Selected', 'Sender, input LTC address', '#00ff00');
+        sendEmbed(interaction.channel, 'Release Selected', 'Sender, input LTC address using modal', '#00ff00');
       });
     }
 
@@ -188,6 +202,9 @@ client.on(Events.InteractionCreate, async interaction => {
   if(interaction.isModalSubmit()){
     if(interaction.customId === 'trade_modal'){
       const otherInput = interaction.fields.getTextInputValue('other_user');
+      const youGive = interaction.fields.getTextInputValue('you_give');
+      const theyGive = interaction.fields.getTextInputValue('they_give');
+
       let otherUser;
       try {
         const id = otherInput.replace(/[<@!>]/g,'');
@@ -199,7 +216,8 @@ client.on(Events.InteractionCreate, async interaction => {
       if(otherUser.id === interaction.user.id)
         return interaction.reply({ content:"Can't trade with yourself.", ephemeral:true });
 
-      db.run('INSERT INTO trades(channel_id, status) VALUES (?,?)', ['pending','waiting_role'], function(err){
+      // Create trade ticket
+      db.run('INSERT INTO trades(channel_id,status,you_give,they_give) VALUES (?,?,?,?)', ['pending','waiting_role',youGive,theyGive], function(err){
         if(err) return interaction.reply({ content:'DB error', ephemeral:true });
         const tradeId = this.lastID;
         const depositAddr = getDepositAddress(tradeId);
@@ -214,7 +232,8 @@ client.on(Events.InteractionCreate, async interaction => {
           ]
         }).then(ch=>{
           db.run('UPDATE trades SET channel_id=?, deposit_addr=? WHERE id=?', [ch.id, depositAddr, tradeId]);
-          sendEmbed(ch, `Litecoin Trade #${tradeId}`, `Deposit: ${depositAddr}\n${interaction.user} vs ${otherUser}`, '#00aaff', [
+          sendEmbed(ch, `Litecoin Trade #${tradeId}`, 
+            `Deposit Address: ${depositAddr}\n**${interaction.user} gives:** ${youGive}\n**${otherUser} gives:** ${theyGive}`, '#00aaff', [
             new ActionRowBuilder().addComponents(
               new ButtonBuilder().setCustomId(`choose_${tradeId}_sender`).setLabel('Sender').setStyle(ButtonStyle.Success),
               new ButtonBuilder().setCustomId(`choose_${tradeId}_receiver`).setLabel('Receiver').setStyle(ButtonStyle.Primary)
