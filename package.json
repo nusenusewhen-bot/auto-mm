@@ -1,22 +1,19 @@
 {
-  "name": "auto-mm-bot",
+  "name": "auto-ltc-mm",
   "version": "1.0.0",
-  "description": "Discord Litecoin auto middleman escrow bot",
+  "description": "Automatic Litecoin Middleman Bot",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "discord.js": "^14.16.3",
-    "dotenv": "^16.4.5",
-    "sqlite3": "^5.1.7",
+    "axios": "^1.6.0",
+    "better-sqlite3": "^9.4.0",
     "bip39": "^3.1.0",
-    "bitcoinjs-lib": "^6.1.6",
-    "tiny-secp256k1": "^2.2.3",
-    "bip32": "^5.0.0"
-  },
-  "engines": {
-    "node": ">=20"
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.3.1",
+    "hdkey": "^2.1.0",
+    "litecore-lib": "^0.15.0"
   }
 }
