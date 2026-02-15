@@ -27,7 +27,7 @@ function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
-// Wallet (Litecoin only - fixed bip32 access)
+// Wallet – FIXED for bitcoinjs-lib v6+
 let root;
 const mnemonic = process.env.BOT_MNEMONIC;
 if (mnemonic) {
@@ -143,7 +143,7 @@ client.on(Events.InteractionCreate, async interaction => {
     }
   }
 
-  // Start LTC trade
+  // Start LTC trade button
   if (interaction.isButton() && interaction.customId === 'start_ltc_trade') {
     const modal = new ModalBuilder()
       .setCustomId('trade_modal_ltc')
@@ -351,7 +351,7 @@ client.on(Events.InteractionCreate, async interaction => {
   }
 });
 
-client.once('ready', () => {
+client.once(Events.ClientReady, () => {
   log(`Logged in as ${client.user.tag}`);
 });
 
