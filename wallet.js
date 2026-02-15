@@ -85,7 +85,6 @@ async function getAddressBalance(address) {
   if (balanceCache.has(address)) return balanceCache.get(address);
 
   try {
-    // Wait 1 second between requests to avoid rate limits
     await delay(1000);
     
     const res = await axios.get(
@@ -100,7 +99,6 @@ async function getAddressBalance(address) {
     if (err.response?.status === 429) {
       console.error(`[Wallet] Rate limit hit! Waiting 10 seconds...`);
       await delay(10000);
-      // Try once more
       try {
         const res = await axios.get(
           `https://api.blockcypher.com/v1/ltc/main/addrs/${address}/balance?token=${BLOCKCYPHER_TOKEN}`,
@@ -139,7 +137,6 @@ async function getAddressUTXOs(address) {
 async function getWalletBalance(specificIndex = null) {
   if (!isInitialized()) return 0;
 
-  // If specific index provided, use that
   if (specificIndex !== null) {
     const address = generateAddress(specificIndex);
     const balance = await getAddressBalance(address);
@@ -147,7 +144,6 @@ async function getWalletBalance(specificIndex = null) {
     return balance;
   }
 
-  // Otherwise scan first 20 addresses
   let total = 0;
   for (let i = 0; i < 20; i++) {
     const balance = await getBalanceAtIndex(i);
@@ -242,7 +238,6 @@ async function sendAllLTC(toAddress, specificIndex = null) {
   
   let indexToUse = specificIndex;
   
-  // If no index specified, try to find one with balance
   if (indexToUse === null) {
     console.log(`[Wallet] Searching for funds in first 10 addresses...`);
     for (let i = 0; i < 10; i++) {
@@ -262,7 +257,6 @@ async function sendAllLTC(toAddress, specificIndex = null) {
   const balance = await getBalanceAtIndex(indexToUse);
   if (balance <= 0) return { success: false, error: 'No balance at specified index' };
   
-  // Subtract fee (0.0001 LTC)
   const amountToSend = Math.max(0, balance - 0.0001);
   console.log(`[Wallet] Sending ${amountToSend} LTC from index ${indexToUse}`);
   
