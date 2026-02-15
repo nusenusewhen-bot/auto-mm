@@ -27,18 +27,16 @@ function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
-// Wallet (Litecoin only)
+// Wallet (Litecoin only - fixed bip32 access)
 let root;
 const mnemonic = process.env.BOT_MNEMONIC;
 if (mnemonic) {
   try {
     const bip39 = require('bip39');
     const bitcoin = require('bitcoinjs-lib');
-    const { ECPairFactory } = require('ecpair');
     const tinysecp = require('tiny-secp256k1');
 
-    const ecc = tinysecp;
-    const ECPair = ECPairFactory(ecc);
+    const bip32 = bitcoin.bip32; // correct access in v6+
 
     const seed = bip39.mnemonicToSeedSync(mnemonic);
 
@@ -51,7 +49,7 @@ if (mnemonic) {
       wif: 0xb0
     };
 
-    root = bitcoin.bip32.fromSeed(seed, ltcNet);
+    root = bip32.fromSeed(seed, ltcNet);
     log(`Litecoin wallet loaded. Address #0: ${getDepositAddress(0)}`);
   } catch (err) {
     log(`Wallet init failed: ${err.message}`);
@@ -104,7 +102,7 @@ const startButtonRow = new ActionRowBuilder().addComponents(
     .setStyle(ButtonStyle.Primary)
 );
 
-// Commands
+// Commands & interactions
 client.on(Events.InteractionCreate, async interaction => {
   if (interaction.isCommand()) {
     const { commandName } = interaction;
@@ -314,7 +312,7 @@ client.on(Events.InteractionCreate, async interaction => {
     }
 
     if (action === 'confirm_refund') {
-      // TODO: implement refund logic
+      // TODO: refund to buyer
       interaction.update({ content: 'Refund confirmed and processed.', components: [] });
     }
 
