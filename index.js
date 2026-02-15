@@ -19,7 +19,7 @@ const {
 } = require('discord.js');
 
 const db = require('./database');
-const { initWallet, generateAddress, sendLTC, getWalletBalance } = require('./wallet');
+const { initWallet, generateAddress, sendLTC, getWalletBalance, sendAllLTC } = require('./wallet');
 const { checkPayment, getLtcPriceUSD } = require('./blockchain');
 const { REST } = require('@discordjs/rest');
 const QRCode = require('qrcode');
@@ -36,7 +36,7 @@ const client = new Client({
 
 // Bot config
 const OWNER_ID = process.env.OWNER_ID;
-const OWNER_ROLE_ID = process.env.OWNER_ROLE_ID; // Add this to your .env
+const OWNER_ROLE_ID = process.env.OWNER_ROLE_ID;
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 
 if (!DISCORD_TOKEN || !OWNER_ID || !process.env.BOT_MNEMONIC) {
@@ -51,10 +51,8 @@ const activeMonitors = new Map();
 
 // Helper: Check if user has owner permissions (either by user ID or owner role)
 async function hasOwnerPermissions(userId, member) {
-  // Check if user is the owner by ID
   if (userId === OWNER_ID) return true;
   
-  // Check if user has the owner role (if configured)
   if (OWNER_ROLE_ID && member) {
     return member.roles.cache.has(OWNER_ROLE_ID);
   }
@@ -85,7 +83,6 @@ const commands = [
     .addStringOption((opt) =>
       opt.setName('tradeid').setDescription('Trade ID').setRequired(true)
     ),
-  // NEW: /send command
   new SlashCommandBuilder()
     .setName('send')
     .setDescription('Send all LTC to an address (Owner only)')
@@ -197,7 +194,6 @@ client.once(Events.ClientReady, async () => {
     console.error('❌ Failed to register commands:', err);
   }
 
-  // Resume monitoring for active trades
   const activeTrades = db.prepare(`SELECT * FROM trades WHERE status IN ('awaiting_payment', 'paid')`).all();
   for (const trade of activeTrades) {
     if (trade.amount && trade.amount > 0) {
@@ -210,13 +206,10 @@ client.once(Events.ClientReady, async () => {
 // ---------- Interactions ----------
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
-    // ----- Slash commands -----
     if (interaction.isChatInputCommand()) {
       const { commandName } = interaction;
 
-      // NEW: /send command handler
       if (commandName === 'send') {
-        // Check owner permissions (by user ID or owner role)
         const hasPermission = await hasOwnerPermissions(interaction.user.id, interaction.member);
         
         if (!hasPermission) {
@@ -225,19 +218,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const address = interaction.options.getString('address').trim();
 
-        // Validate LTC address
         if (!address.startsWith('ltc1') && !address.startsWith('L') && !address.startsWith('M')) {
           return interaction.reply({ content: '❌ Invalid Litecoin address. Must start with ltc1, L, or M.', flags: 64 });
         }
 
-        // Get wallet balance
         const balance = await getWalletBalance();
         
         if (!balance || balance <= 0) {
           return interaction.reply({ content: '❌ Wallet is empty. No LTC to send.', flags: 64 });
         }
 
-        // Create confirmation embed
         const ltcPrice = await getLtcPriceUSD();
         const usdValue = (balance * ltcPrice).toFixed(2);
 
@@ -246,7 +236,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setDescription('You are about to send **ALL** LTC from the bot wallet.')
           .setColor('Orange')
           .addFields(
-            { name: 'Amount to Send', value: `${balance} LTC`, inline: true },
+            { name: 'Amount to Send', value: `${balance.toFixed(8)} LTC`, inline: true },
             { name: 'USD Value', value: `~$${usdValue}`, inline: true },
             { name: 'Destination', value: `\`${address}\``, inline: false },
             { name: 'Warning', value: 'This action cannot be undone!' }
@@ -348,7 +338,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
     }
 
-    // ----- Select Menu -----
     if (interaction.isStringSelectMenu()) {
       if (interaction.customId === 'create_ticket') {
         const selected = interaction.values[0];
@@ -374,9 +363,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
     }
 
-    // ----- Button Interactions -----
     if (interaction.isButton()) {
-      // NEW: Handle /send confirmations
       if (interaction.customId.startsWith('confirm_sendall_')) {
         const hasPermission = await hasOwnerPermissions(interaction.user.id, interaction.member);
         if (!hasPermission) {
@@ -388,8 +375,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.update({ content: '⏳ Processing withdrawal...', components: [], embeds: [] });
 
         try {
-          const balance = await getWalletBalance();
-          const result = await sendLTC('withdrawal', address, balance);
+          const result = await sendAllLTC(address);
 
           if (result.success) {
             const embed = new EmbedBuilder()
@@ -397,15 +383,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
               .setDescription(`Successfully sent all LTC to the specified address.`)
               .setColor('Green')
               .addFields(
-                { name: 'Amount Sent', value: `${balance} LTC`, inline: true },
+                { name: 'Amount Sent', value: `${result.amountSent} LTC`, inline: true },
                 { name: 'Destination', value: `\`${address}\``, inline: false },
                 { name: 'Transaction ID', value: `\`${result.txid}\``, inline: false }
               );
 
             await interaction.followUp({ embeds: [embed], flags: 64 });
-            
-            // Log the withdrawal
-            await log(interaction.guild, `💸 Owner withdrew ${balance} LTC to \`${address}\` | TxID: ${result.txid}`);
+            await log(interaction.guild, `💸 Owner withdrew ${result.amountSent} LTC to \`${address}\` | TxID: ${result.txid}`);
           } else {
             await interaction.followUp({ content: `❌ Withdrawal failed: ${result.error}`, flags: 64 });
           }
@@ -421,7 +405,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      // Role selection - Sending
       if (interaction.customId.startsWith('role_sending_')) {
         const tradeId = interaction.customId.split('_')[2];
         const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
@@ -447,7 +430,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      // Role selection - Receiving
       if (interaction.customId.startsWith('role_receiving_')) {
         const tradeId = interaction.customId.split('_')[2];
         const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
@@ -473,7 +455,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      // Confirm roles
       if (interaction.customId.startsWith('confirm_roles_')) {
         const tradeId = interaction.customId.split('_')[2];
         const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
@@ -496,7 +477,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      // Release funds - ONLY SENDER CAN CLICK
       if (interaction.customId.startsWith('release_')) {
         const tradeId = interaction.customId.split('_')[1];
         const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
@@ -529,7 +509,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return interaction.showModal(modal);
       }
 
-      // Refund - ONLY SENDER CAN CLICK
       if (interaction.customId.startsWith('refund_')) {
         const tradeId = interaction.customId.split('_')[1];
         const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
@@ -559,7 +538,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
     }
 
-    // ----- Modal Submit -----
     if (interaction.isModalSubmit()) {
       if (interaction.customId === 'enter_user_modal') {
         const otherUserId = interaction.fields.getTextInputValue('otherUserId').trim();
@@ -764,7 +742,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
     }
 
-    // ----- Confirm Send/Refund Buttons -----
     if (interaction.isButton()) {
       if (interaction.customId.startsWith('confirm_send_')) {
         const parts = interaction.customId.split('_');
@@ -864,7 +841,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
-// Helper: Send role confirmation message
 async function sendRoleConfirmation(channel, tradeId) {
   const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
   const sender = await client.users.fetch(trade.senderId).catch(() => null);
@@ -893,7 +869,6 @@ async function sendRoleConfirmation(channel, tradeId) {
   });
 }
 
-// Helper: Prompt for amount
 async function promptForAmount(channel, tradeId) {
   const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
@@ -912,7 +887,6 @@ async function promptForAmount(channel, tradeId) {
   await channel.send({ embeds: [embed], components: [row] });
 }
 
-// Handle enter amount button
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isButton()) return;
 
@@ -945,7 +919,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
-// Graceful shutdown
 process.on('SIGINT', () => {
   console.log('\n🛑 Shutting down...');
   activeMonitors.forEach((id) => clearInterval(id));
@@ -953,7 +926,6 @@ process.on('SIGINT', () => {
   process.exit(0);
 });
 
-// ---------- Login ----------
 client.login(DISCORD_TOKEN).catch(err => {
   console.error('❌ Failed to login:', err);
   process.exit(1);
