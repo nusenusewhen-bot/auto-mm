@@ -1,49 +1,19 @@
 import discord
 from discord import app_commands
 import os
-import sqlite3
 import asyncio
 from dotenv import load_dotenv
-from bitcoinlib.wallets import Wallet, wallet_exists, WalletError
-
-# Import views AFTER defining shared functions (no circular)
-from views import PanelView
+from shared import conn, c, get_addr, wallet  # Safe shared import
+from views import PanelView  # UI only
 
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
-MNEMONIC = os.getenv('BOT_MNEMONIC')
 
 if not TOKEN:
     print("DISCORD_TOKEN missing")
     exit(1)
 
 OWNER_ID = 1298640383688970293
-
-# Shared DB connection (passed to views)
-conn = sqlite3.connect('trades.db')
-c = conn.cursor()
-c.execute('CREATE TABLE IF NOT EXISTS keys (key TEXT PRIMARY KEY, used INTEGER DEFAULT 0)')
-c.execute('CREATE TABLE IF NOT EXISTS activated_users (user_id TEXT PRIMARY KEY)')
-c.execute('CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, buyer_id TEXT, currency TEXT, deposit_addr TEXT, channel_id TEXT, status TEXT DEFAULT "waiting_role")')
-conn.commit()
-
-# Wallet
-wallet = None
-if MNEMONIC:
-    name = "AutoMMBotWallet"
-    try:
-        if wallet_exists(name):
-            wallet = Wallet(name)
-            print(f"Opened wallet: {name}")
-        else:
-            wallet = Wallet.create(name=name, keys=MNEMONIC, network='litecoin', witness_type='segwit')
-            print(f"Created wallet: {name}")
-        print("LTC #0:", wallet.key_for_path("m/44'/2'/0'/0/0").address)
-    except Exception as e:
-        print(f"Wallet error: {e}")
-
-def get_addr(idx):
-    return wallet.key_for_path(f"m/44'/2'/0'/0/{idx}").address if wallet else "NO_WALLET"
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -54,22 +24,22 @@ tree = app_commands.CommandTree(client)
 async def on_ready():
     print(f'Logged in: {client.user} (ID: {client.user.id})')
 
-    # Force sync for commands
+    # Force sync
     try:
         synced = await tree.sync()
-        print(f"Synced {len(synced)} global commands")
+        print(f"Global sync: {len(synced)} commands")
         for s in synced:
             print(f" - /{s.name}")
     except Exception as e:
         print(f"Global sync failed: {e}")
 
-    # Guild sync for instant updates (CHANGE YOUR_GUILD_ID)
-    YOUR_GUILD_ID = 123456789012345678  # REPLACE WITH YOUR SERVER ID
+    # Instant guild sync (CHANGE TO YOUR SERVER ID)
+    YOUR_GUILD_ID = 123456789012345678  # ← REPLACE THIS
     guild = client.get_guild(YOUR_GUILD_ID)
     if guild:
         try:
             await tree.sync(guild=guild)
-            print(f"Instant guild sync: {guild.name}")
+            print(f"Guild sync done: {guild.name}")
         except Exception as e:
             print(f"Guild sync failed: {e}")
 
