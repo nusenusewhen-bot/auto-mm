@@ -98,7 +98,7 @@ async function getFeePercent() {
 function startPaymentMonitor(tradeId, channelId, expectedUsd) {
   if (activeMonitors.has(tradeId)) return;
 
-  console.log(`[Monitor] Starting payment monitor for trade ${tradeId}`);
+  console.log(`[Monitor] Starting payment monitor for trade ${tradeId}, expecting $${expectedUsd}`);
 
   const intervalId = setInterval(async () => {
     try {
@@ -170,10 +170,12 @@ client.once(Events.ClientReady, async () => {
     console.error('❌ Failed to register commands:', err);
   }
 
+  // Resume monitoring for active trades
   const activeTrades = db.prepare(`SELECT * FROM trades WHERE status IN ('awaiting_payment', 'paid')`).all();
   for (const trade of activeTrades) {
     if (trade.amount && trade.amount > 0) {
-      startPaymentMonitor(trade.id, trade.channelId, trade.amount);
+      const totalUsd = trade.amount + trade.fee;
+      startPaymentMonitor(trade.id, trade.channelId, totalUsd);
     }
   }
 });
@@ -505,8 +507,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const depositAddress = generateAddress(tradeId);
 
         db.prepare(
-          `UPDATE trades SET amount = ?, fee = ?, ltcPrice = ?, ltcAmount = ?, depositAddress = ?, status = 'awaiting_payment' WHERE id = ?`
-        ).run(amount, fee, ltcPrice, ltcAmount, depositAddress, tradeId);
+          `UPDATE trades SET amount = ?, fee = ?, ltcPrice = ?, ltcAmount = ?, totalLtc = ?, depositAddress = ?, status = 'awaiting_payment' WHERE id = ?`
+        ).run(amount, fee, ltcPrice, ltcAmount, totalLtc, depositAddress, tradeId);
 
         await interaction.reply({ content: '✅ Amount set! Generating invoice...', flags: 64 });
 
