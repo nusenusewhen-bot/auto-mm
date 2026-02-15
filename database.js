@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS trades (
   feePercent REAL DEFAULT 5,
   ltcPrice REAL DEFAULT 0,
   ltcAmount TEXT,
+  totalLtc TEXT,
   depositAddress TEXT,
   receiverAddress TEXT,
   refundAddress TEXT,
