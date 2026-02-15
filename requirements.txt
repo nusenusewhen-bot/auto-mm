@@ -1,4 +1,0 @@
-discord.py==2.3.2
-python-dotenv
-bitcoinlib==0.7.7  # or latest, but test with 0.7.6/0.7.7
-audioop-lts
