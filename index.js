@@ -4,7 +4,7 @@ const sqlite3 = require('sqlite3').verbose();
 const bip39 = require('bip39');
 const bitcoin = require('bitcoinjs-lib');
 const tinysecp = require('tiny-secp256k1');
-const { BIP32Factory } = require('bitcoinjs-lib/src/bip32');
+const { BIP32Factory } = require('bitcoinjs-lib/lib/bip32'); // correct import path
 
 const bip32 = BIP32Factory(tinysecp);
 
@@ -56,7 +56,7 @@ if (mnemonic) {
     root = null;
   }
 } else {
-  log('No BOT_MNEMONIC set – wallet disabled');
+  log('No BOT_MNEMONIC set - wallet disabled');
 }
 
 function getDepositAddress(index) {
