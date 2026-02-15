@@ -1,7 +1,7 @@
 import discord
 from discord.ui import View, Select, Modal, TextInput
 import time
-from bot import get_addr, conn, c, client  # Import shared from bot.py (safe now)
+from shared import get_addr, conn, c, client  # Safe shared import
 
 class TradeModal(Modal, title="Trade Setup"):
     other = TextInput(label="User/ID of the other person", placeholder="@mention or ID", required=True)
@@ -66,7 +66,7 @@ class TradeModal(Modal, title="Trade Setup"):
             f"{u.mention} pick role:", view=view
         )
 
-        await i.followup.send(f"Ticket created: {ch.mention}", ephemeral=True)
+        await i.followup.send(f"Ticket: {ch.mention}", ephemeral=True)
 
 class RoleView(View):
     def __init__(self, tid, starter, other):
