@@ -65,6 +65,12 @@ const commands = [
     .addNumberOption((opt) =>
       opt.setName('percentage').setDescription('Fee % (e.g., 5 for 5%)').setRequired(true)
     ),
+  new SlashCommandBuilder()
+    .setName('check')
+    .setDescription('Manually check payment status (Admin only)')
+    .addStringOption((opt) =>
+      opt.setName('tradeid').setDescription('Trade ID').setRequired(true)
+    ),
 ].map((cmd) => cmd.toJSON());
 
 // ---------- Utilities ----------
@@ -130,10 +136,10 @@ function startPaymentMonitor(tradeId, channelId, expectedUsd) {
           );
 
           await channel.send({
-            content: `✅ **Transaction Confirmed!**\n\n` +
+            content: `✅ **Found transaction!**\n\n` +
                     `**Sender:** ${sender ? sender.tag : 'Unknown'}\n` +
                     `**Receiver:** ${receiver ? receiver.tag : 'Unknown'}\n\n` +
-                    `Waiting for sender to release the funds...`,
+                    `Payment confirmed. Click **Release** to send funds to receiver, or **Refund** to return to sender.`,
             components: [row]
           });
 
@@ -215,6 +221,31 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         db.prepare(`INSERT OR REPLACE INTO config(key,value) VALUES('feePercent',?)`).run(percent.toString());
         return interaction.reply({ content: `✅ Fee set to ${percent}%.`, flags: 64 });
+      }
+
+      if (commandName === 'check') {
+        if (interaction.user.id !== OWNER_ID) {
+          return interaction.reply({ content: '❌ Only owner can use this.', flags: 64 });
+        }
+
+        const tradeId = interaction.options.getString('tradeid');
+        const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+
+        if (!trade) {
+          return interaction.reply({ content: '❌ Trade not found.', flags: 64 });
+        }
+
+        await interaction.reply({ content: `🔍 Checking trade #${tradeId}...`, flags: 64 });
+
+        const totalUsd = trade.amount + trade.fee;
+        const paid = await checkPayment(trade.depositAddress, totalUsd);
+
+        if (paid) {
+          await interaction.followUp({ content: `✅ Payment detected for trade #${tradeId}!`, flags: 64 });
+        } else {
+          await interaction.followUp({ content: `❌ No payment yet for trade #${tradeId}.\nAddress: \`${trade.depositAddress}\`\nExpected: $${totalUsd.toFixed(4)}`, flags: 64 });
+        }
+        return;
       }
 
       if (commandName === 'panel') {
@@ -521,20 +552,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const embed = new EmbedBuilder()
           .setTitle('💳 Payment Invoice')
-          .setDescription(`Please send **${totalLtc} LTC** to the address below:`)
+          .setDescription(`**Send exactly ${totalLtc} LTC to the address below**`)
           .setColor('Blue')
           .addFields(
-            { name: 'Amount (USD)', value: `$${amount}`, inline: true },
-            { name: 'Fee', value: `$${fee.toFixed(2)} (${feePercent}%)`, inline: true },
-            { name: 'Total (USD)', value: `$${total.toFixed(2)}`, inline: true },
-            { name: 'LTC Amount', value: `${totalLtc} LTC`, inline: true },
-            { name: 'Exchange Rate', value: `$${ltcPrice}/LTC`, inline: true },
-            { name: 'Deposit Address', value: `\`${depositAddress}\``, inline: false }
+            { name: '📦 Trade Amount', value: `$${amount}`, inline: true },
+            { name: '💸 Fee', value: `$${fee.toFixed(2)} (${feePercent}%)`, inline: true },
+            { name: '💰 TOTAL TO SEND', value: `$${total.toFixed(2)}`, inline: true },
+            { name: '⛓️ LTC Amount', value: `**${totalLtc} LTC**`, inline: true },
+            { name: '💱 Exchange Rate', value: `$${ltcPrice}/LTC`, inline: true },
+            { name: '📍 Deposit Address', value: `\`${depositAddress}\``, inline: false }
           )
+          .setFooter({ text: 'Scan QR code or copy address. Send exact amount!' })
           .setImage(`attachment://qr_${tradeId}.png`);
 
         await interaction.channel.send({
-          content: `<@${trade.senderId}> Please complete the payment.`,
+          content: `<@${trade.senderId}> **Please send the TOTAL amount including fee:**`,
           embeds: [embed],
           files: [{ attachment: qrPath, name: `qr_${tradeId}.png` }]
         });
