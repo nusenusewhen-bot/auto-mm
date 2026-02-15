@@ -16,6 +16,8 @@ if not TOKEN:
     print("DISCORD_TOKEN missing")
     exit(1)
 
+OWNER_ID = 1298640383688970293
+
 # Wallet
 wallet = None
 if MNEMONIC:
@@ -23,38 +25,28 @@ if MNEMONIC:
     try:
         if wallet_exists(name):
             wallet = Wallet(name)
-            print(f"Opened wallet: {name}")
+            print(f"Opened: {name}")
         else:
             wallet = Wallet.create(name=name, keys=MNEMONIC, network='litecoin', witness_type='segwit')
-            print(f"Created wallet: {name}")
-        print("Bot LTC #0:", wallet.key_for_path("m/44'/2'/0'/0/0").address)
+            print(f"Created: {name}")
+        print("LTC #0:", wallet.key_for_path("m/44'/2'/0'/0/0").address)
     except Exception as e:
         print(f"Wallet error: {e}")
 
 def get_addr(idx):
     return wallet.key_for_path(f"m/44'/2'/0'/0/{idx}").address if wallet else "NO_WALLET"
 
-# Database - FIXED AUTOINCREMENT
 conn = sqlite3.connect('trades.db')
 c = conn.cursor()
-c.execute('''CREATE TABLE IF NOT EXISTS keys (key TEXT PRIMARY KEY, used INTEGER DEFAULT 0)''')
-c.execute('''CREATE TABLE IF NOT EXISTS activated_users (user_id TEXT PRIMARY KEY)''')
-c.execute('''CREATE TABLE IF NOT EXISTS trades (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    buyer_id TEXT,
-    currency TEXT,
-    deposit_addr TEXT,
-    channel_id TEXT,
-    status TEXT DEFAULT "waiting_role"
-)''')
+c.execute('CREATE TABLE IF NOT EXISTS keys (key TEXT PRIMARY KEY, used INTEGER DEFAULT 0)')
+c.execute('CREATE TABLE IF NOT EXISTS activated_users (user_id TEXT PRIMARY KEY)')
+c.execute('CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, buyer_id TEXT, currency TEXT, deposit_addr TEXT, channel_id TEXT, status TEXT DEFAULT "waiting_role")')
 conn.commit()
 
-# Bot
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
-OWNER_ID = 1298640383688970293
 
 # Modal
 class TradeModal(Modal, title="Trade Setup"):
@@ -67,7 +59,7 @@ class TradeModal(Modal, title="Trade Setup"):
         self.currency = currency
 
     async def on_submit(self, i: discord.Interaction):
-        await i.response.defer(ephemeral=True)  # Prevents "interaction failed"
+        await i.response.defer(ephemeral=True)
 
         other_input = self.other.value.strip()
         u = None
@@ -120,16 +112,15 @@ class TradeModal(Modal, title="Trade Setup"):
             f"{u.mention} pick role:", view=view
         )
 
-        await i.followup.send(f"Ticket created: {ch.mention}", ephemeral=True)
+        await i.followup.send(f"Ticket: {ch.mention}", ephemeral=True)
 
-# Role view
 class RoleView(View):
     def __init__(self, tid, starter, other):
         super().__init__(timeout=None)
         self.tid = tid
         self.other = other
 
-    @discord.ui.button(label="Sender", style=discord.ButtonStyle.green, custom_id="sender_btn")
+    @discord.ui.button(label="Sender", style=discord.ButtonStyle.green, custom_id="sender_btn_unique")
     async def sender(self, i: discord.Interaction, _):
         if i.user.id != self.other:
             return await i.response.send_message("Not for you.", ephemeral=True)
@@ -138,7 +129,7 @@ class RoleView(View):
         await i.response.send_message(f"{i.user.mention} is Sender", ephemeral=False)
         self.stop()
 
-    @discord.ui.button(label="Receiver", style=discord.ButtonStyle.blurple, custom_id="receiver_btn")
+    @discord.ui.button(label="Receiver", style=discord.ButtonStyle.blurple, custom_id="receiver_btn_unique")
     async def receiver(self, i: discord.Interaction, _):
         if i.user.id != self.other:
             return await i.response.send_message("Not for you.", ephemeral=True)
@@ -147,7 +138,6 @@ class RoleView(View):
         await i.response.send_message(f"{i.user.mention} is Receiver", ephemeral=False)
         self.stop()
 
-# Panel
 class PanelView(View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -162,7 +152,7 @@ class PanelView(View):
             SelectOption(label="USDC [SOL]", value="USDC_SOL", emoji="💵"),
             SelectOption(label="USDT [BEP-20]", value="USDT_BEP20", emoji="💵"),
         ]
-        sel = Select(placeholder="Make a selection", options=opts, custom_id="crypto_sel")
+        sel = Select(placeholder="Make a selection", options=opts, custom_id="crypto_panel_select")
 
         @sel.callback
         async def cb(i: discord.Interaction):
@@ -170,8 +160,7 @@ class PanelView(View):
 
         self.add_item(sel)
 
-# Commands
-@tree.command(name="generatekey", description="New key (owner)")
+@tree.command(name="generatekey", description="Generate key (owner only)")
 async def gk(i: discord.Interaction):
     if i.user.id != OWNER_ID:
         return await i.response.send_message("No.", ephemeral=True)
@@ -183,34 +172,55 @@ async def gk(i: discord.Interaction):
 @tree.command(name="redeemkey", description="Redeem key")
 @app_commands.describe(key="Key")
 async def rk(i: discord.Interaction, key: str):
+    if i.user.id == OWNER_ID:
+        return await i.response.send_message("Owner doesn't need a key.", ephemeral=True)
     c.execute("SELECT used FROM keys WHERE key=?", (key.upper(),))
     r = c.fetchone()
     if not r or r[0]:
-        return await i.response.send_message("Bad key.", ephemeral=True)
+        return await i.response.send_message("Invalid/used.", ephemeral=True)
     c.execute("UPDATE keys SET used=1 WHERE key=?", (key.upper(),))
     c.execute("INSERT OR IGNORE INTO activated_users (user_id) VALUES (?)", (str(i.user.id),))
     conn.commit()
     await i.response.send_message("Activated.", ephemeral=True)
 
-@tree.command(name="autoticketpanel", description="Trade panel")
+@tree.command(name="autoticketpanel", description="Open trade panel")
 async def tp(i: discord.Interaction):
-    c.execute("SELECT 1 FROM activated_users WHERE user_id=?", (str(i.user.id),))
-    if not c.fetchone():
-        return await i.response.send_message("Activate first.", ephemeral=True)
-    e = discord.Embed(title="Crypto Currency", description="**Fees:**\n• >250$: 2$\n• <250$: 1$\n• <50$: 0.7$\n• <10$: 0.3$\n• <5$: FREE")
+    # Owner can always use it, others need activation
+    if i.user.id != OWNER_ID:
+        c.execute("SELECT 1 FROM activated_users WHERE user_id=?", (str(i.user.id),))
+        if not c.fetchone():
+            return await i.response.send_message("Redeem a key first.", ephemeral=True)
+
+    e = discord.Embed(
+        title="Crypto Currency",
+        description="**Fees:**\n• Deals over 250$: **2$**\n• Deals under 250$: **1$**\n• Deals under 50$: **0.7$**\n• Deals under 10$: **0.3$**\n• Deals under 5$: **FREE**"
+    )
     await i.response.send_message(embed=e, view=PanelView())
 
 @client.event
 async def on_ready():
     print(f'Logged in: {client.user}')
     try:
+        # Global sync
         synced = await tree.sync()
-        print(f"Synced {len(synced)} commands")
+        print(f"Synced {len(synced)} global commands")
         for s in synced:
             print(f" - /{s.name}")
     except Exception as e:
-        print(f"Sync fail: {e}")
+        print(f"Global sync failed: {e}")
+
+    # Instant guild sync for testing - REPLACE WITH YOUR SERVER ID
+    YOUR_GUILD_ID = 123456789012345678  # ← CHANGE THIS TO YOUR SERVER ID
+    guild = client.get_guild(YOUR_GUILD_ID)
+    if guild:
+        try:
+            await tree.sync(guild=guild)
+            print(f"Instantly synced commands to guild: {guild.name}")
+        except Exception as e:
+            print(f"Guild sync failed: {e}")
+
     client.add_view(PanelView())
+    print("Bot ready")
 
 async def setup():
     client.loop.create_task(monitor())
