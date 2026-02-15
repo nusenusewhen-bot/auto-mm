@@ -6,7 +6,8 @@ import sqlite3
 import asyncio
 from dotenv import load_dotenv
 import time
-from bitcoinlib.wallets import Wallet, wallet_exists, WalletError
+import traceback
+from datetime import datetime
 
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
@@ -18,23 +19,33 @@ if not TOKEN:
 
 OWNER_ID = 1298640383688970293
 
+# Logging helper
+def log(msg):
+    ts = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[{ts}] {msg}")
+
 # Wallet
 wallet = None
 if MNEMONIC:
     name = "AutoMMBotWallet"
     try:
+        from bitcoinlib.wallets import Wallet, wallet_exists, WalletError
         if wallet_exists(name):
             wallet = Wallet(name)
-            print(f"Opened wallet: {name}")
+            log(f"Opened wallet: {name}")
         else:
             wallet = Wallet.create(name=name, keys=MNEMONIC, network='litecoin', witness_type='segwit')
-            print(f"Created wallet: {name}")
-        print("LTC #0:", wallet.key_for_path("m/44'/2'/0'/0/0").address)
+            log(f"Created wallet: {name}")
+        log("LTC #0: " + wallet.key_for_path("m/44'/2'/0'/0/0").address)
     except Exception as e:
-        print(f"Wallet error: {e}")
+        log(f"Wallet error: {e}")
 
 def get_addr(idx):
-    return wallet.key_for_path(f"m/44'/2'/0'/0/{idx}").address if wallet else "NO_WALLET"
+    try:
+        return wallet.key_for_path(f"m/44'/2'/0'/0/{idx}").address if wallet else "NO_WALLET"
+    except Exception as e:
+        log(f"Addr gen error: {e}")
+        return "ADDR_ERROR"
 
 # Database
 conn = sqlite3.connect('trades.db')
@@ -49,7 +60,6 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-# Modal
 class TradeModal(Modal, title="Trade Setup"):
     other = TextInput(label="User/ID of the other person", placeholder="@mention or ID", required=True)
     you_give = TextInput(label="What are YOU giving", style=discord.TextStyle.paragraph, required=True)
@@ -60,62 +70,66 @@ class TradeModal(Modal, title="Trade Setup"):
         self.currency = currency
 
     async def on_submit(self, i: discord.Interaction):
+        log(f"Modal submit started | User: {i.user} | Currency: {self.currency}")
         await i.response.defer(ephemeral=True)
 
-        other_input = self.other.value.strip()
-        u = None
-        if other_input.startswith('<@') and other_input.endswith('>'):
-            try:
+        try:
+            other_input = self.other.value.strip()
+            u = None
+            if other_input.startswith('<@') and other_input.endswith('>'):
                 uid = int(other_input[2:-1].replace('!', ''))
                 u = await client.fetch_user(uid)
-            except:
-                pass
-        else:
-            try:
+            else:
                 u = await client.fetch_user(int(other_input))
-            except:
-                pass
 
-        if not u:
-            return await i.followup.send("Invalid user.", ephemeral=True)
+            if not u:
+                await i.followup.send("Invalid user.", ephemeral=True)
+                log("Modal failed: invalid user")
+                return
 
-        if u.id == i.user.id:
-            return await i.followup.send("Can't trade with self.", ephemeral=True)
+            if u.id == i.user.id:
+                await i.followup.send("Can't trade with self.", ephemeral=True)
+                log("Modal failed: self-trade")
+                return
 
-        idx = int(time.time() * 1000) % 1000000
-        addr = get_addr(idx)
+            idx = int(time.time() * 1000) % 1000000
+            addr = get_addr(idx)
 
-        c.execute(
-            "INSERT INTO trades (buyer_id, currency, deposit_addr, channel_id, status) VALUES (?,?,?,?,?)",
-            (str(i.user.id), self.currency, addr, "pending", 'waiting_role')
-        )
-        trade_id = c.lastrowid
-        conn.commit()
+            c.execute(
+                "INSERT INTO trades (buyer_id, currency, deposit_addr, channel_id, status) VALUES (?,?,?,?,?)",
+                (str(i.user.id), self.currency, addr, "pending", 'waiting_role')
+            )
+            trade_id = c.lastrowid
+            conn.commit()
 
-        overwrites = {
-            i.guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            i.user: discord.PermissionOverwrite(view_channel=True, send_messages=True),
-            u: discord.PermissionOverwrite(view_channel=True, send_messages=True),
-        }
+            overwrites = {
+                i.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                i.user: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+                u: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+            }
 
-        ch = await i.guild.create_text_channel(f"trade-{trade_id}", overwrites=overwrites)
+            ch = await i.guild.create_text_channel(f"trade-{trade_id}", overwrites=overwrites)
 
-        c.execute("UPDATE trades SET channel_id=? WHERE id=?", (ch.id, trade_id))
-        conn.commit()
+            c.execute("UPDATE trades SET channel_id=? WHERE id=?", (ch.id, trade_id))
+            conn.commit()
 
-        view = RoleView(trade_id, i.user.id, u.id)
+            view = RoleView(trade_id, i.user.id, u.id)
 
-        await ch.send(
-            f"**Trade #{trade_id}** | {self.currency}\n"
-            f"Deposit: `{addr}`\n"
-            f"{i.user.mention} gives: {self.you_give.value}\n"
-            f"{u.mention} gives: {self.they_give.value}\n\n"
-            f"{u.mention} pick role:", view=view
-        )
+            await ch.send(
+                f"**Trade #{trade_id}** | {self.currency}\n"
+                f"Deposit: `{addr}`\n"
+                f"{i.user.mention} gives: {self.you_give.value}\n"
+                f"{u.mention} gives: {self.they_give.value}\n\n"
+                f"{u.mention} pick role:", view=view
+            )
 
-        await i.followup.send(f"Ticket created: {ch.mention}", ephemeral=True)
+            await i.followup.send(f"Ticket created: {ch.mention}", ephemeral=True)
+            log(f"Modal success | Trade #{trade_id} | Channel: {ch.id}")
 
-# Role view
+        except Exception as e:
+            log(f"Modal CRASH: {e}\n{traceback.format_exc()}")
+            await i.followup.send("Something broke. Check logs.", ephemeral=True)
+
 class RoleView(View):
     def __init__(self, tid, starter, other):
         super().__init__(timeout=None)
@@ -124,23 +138,32 @@ class RoleView(View):
 
     @discord.ui.button(label="Sender", style=discord.ButtonStyle.green, custom_id="sender_btn")
     async def sender(self, i: discord.Interaction, _):
+        log(f"Button 'Sender' clicked | User: {i.user} | Trade: {self.tid}")
         if i.user.id != self.other:
             return await i.response.send_message("Not for you.", ephemeral=True)
-        c.execute("UPDATE trades SET status='sender' WHERE id=?", (self.tid,))
-        conn.commit()
-        await i.response.send_message(f"{i.user.mention} is Sender", ephemeral=False)
+        try:
+            c.execute("UPDATE trades SET status='sender' WHERE id=?", (self.tid,))
+            conn.commit()
+            await i.response.send_message(f"{i.user.mention} is Sender", ephemeral=False)
+            log(f"Sender role set for trade {self.tid}")
+        except Exception as e:
+            log(f"Sender button crash: {e}")
         self.stop()
 
     @discord.ui.button(label="Receiver", style=discord.ButtonStyle.blurple, custom_id="receiver_btn")
     async def receiver(self, i: discord.Interaction, _):
+        log(f"Button 'Receiver' clicked | User: {i.user} | Trade: {self.tid}")
         if i.user.id != self.other:
             return await i.response.send_message("Not for you.", ephemeral=True)
-        c.execute("UPDATE trades SET status='receiver' WHERE id=?", (self.tid,))
-        conn.commit()
-        await i.response.send_message(f"{i.user.mention} is Receiver", ephemeral=False)
+        try:
+            c.execute("UPDATE trades SET status='receiver' WHERE id=?", (self.tid,))
+            conn.commit()
+            await i.response.send_message(f"{i.user.mention} is Receiver", ephemeral=False)
+            log(f"Receiver role set for trade {self.tid}")
+        except Exception as e:
+            log(f"Receiver button crash: {e}")
         self.stop()
 
-# Panel
 class PanelView(View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -155,17 +178,18 @@ class PanelView(View):
             SelectOption(label="USDC [SOL]", value="USDC_SOL", emoji="💵"),
             SelectOption(label="USDT [BEP-20]", value="USDT_BEP20", emoji="💵"),
         ]
-        sel = Select(placeholder="Make a selection", options=opts, custom_id="crypto_select_unique")
+        sel = Select(placeholder="Make a selection", options=opts, custom_id="crypto_panel_select")
 
         @sel.callback
         async def cb(i: discord.Interaction):
+            log(f"Select callback | User: {i.user} | Selected: {i.data['values'][0]}")
             await i.response.send_modal(TradeModal(i.data['values'][0]))
 
         self.add_item(sel)
 
-# Commands
 @tree.command(name="generatekey", description="Generate key (owner only)")
 async def gk(i: discord.Interaction):
+    log(f"/generatekey | User: {i.user}")
     if i.user.id != OWNER_ID:
         return await i.response.send_message("No.", ephemeral=True)
     k = os.urandom(8).hex().upper()
@@ -176,6 +200,7 @@ async def gk(i: discord.Interaction):
 @tree.command(name="redeemkey", description="Redeem key")
 @app_commands.describe(key="Key")
 async def rk(i: discord.Interaction, key: str):
+    log(f"/redeemkey | User: {i.user} | Key: {key}")
     if i.user.id == OWNER_ID:
         return await i.response.send_message("Owner doesn't need key.", ephemeral=True)
     c.execute("SELECT used FROM keys WHERE key=?", (key.upper(),))
@@ -189,6 +214,7 @@ async def rk(i: discord.Interaction, key: str):
 
 @tree.command(name="autoticketpanel", description="Open trade panel")
 async def tp(i: discord.Interaction):
+    log(f"/autoticketpanel | User: {i.user}")
     if i.user.id != OWNER_ID:
         c.execute("SELECT 1 FROM activated_users WHERE user_id=?", (str(i.user.id),))
         if not c.fetchone():
@@ -208,8 +234,7 @@ async def on_ready():
     except Exception as e:
         print(f"Global sync failed: {e}")
 
-    # Instant guild sync - CHANGE TO YOUR SERVER ID
-    YOUR_GUILD_ID = 123456789012345678  # REPLACE WITH YOUR REAL SERVER ID
+    YOUR_GUILD_ID = 123456789012345678  # REPLACE WITH YOUR SERVER ID
     guild = client.get_guild(YOUR_GUILD_ID)
     if guild:
         try:
