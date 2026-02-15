@@ -5,7 +5,9 @@ import sqlite3
 import asyncio
 from dotenv import load_dotenv
 from bitcoinlib.wallets import Wallet, wallet_exists, WalletError
-from views import PanelView, TradeModal, RoleView  # Import from views.py
+
+# Import views AFTER defining shared functions (no circular)
+from views import PanelView
 
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
@@ -16,6 +18,14 @@ if not TOKEN:
     exit(1)
 
 OWNER_ID = 1298640383688970293
+
+# Shared DB connection (passed to views)
+conn = sqlite3.connect('trades.db')
+c = conn.cursor()
+c.execute('CREATE TABLE IF NOT EXISTS keys (key TEXT PRIMARY KEY, used INTEGER DEFAULT 0)')
+c.execute('CREATE TABLE IF NOT EXISTS activated_users (user_id TEXT PRIMARY KEY)')
+c.execute('CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, buyer_id TEXT, currency TEXT, deposit_addr TEXT, channel_id TEXT, status TEXT DEFAULT "waiting_role")')
+conn.commit()
 
 # Wallet
 wallet = None
@@ -35,14 +45,6 @@ if MNEMONIC:
 def get_addr(idx):
     return wallet.key_for_path(f"m/44'/2'/0'/0/{idx}").address if wallet else "NO_WALLET"
 
-# Database
-conn = sqlite3.connect('trades.db')
-c = conn.cursor()
-c.execute('CREATE TABLE IF NOT EXISTS keys (key TEXT PRIMARY KEY, used INTEGER DEFAULT 0)')
-c.execute('CREATE TABLE IF NOT EXISTS activated_users (user_id TEXT PRIMARY KEY)')
-c.execute('CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, buyer_id TEXT, currency TEXT, deposit_addr TEXT, channel_id TEXT, status TEXT DEFAULT "waiting_role")')
-conn.commit()
-
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
@@ -52,26 +54,25 @@ tree = app_commands.CommandTree(client)
 async def on_ready():
     print(f'Logged in: {client.user} (ID: {client.user.id})')
 
-    # Guild sync for instant command appearance (CHANGE YOUR_GUILD_ID)
-    YOUR_GUILD_ID = 123456789012345678  # ← REPLACE WITH YOUR SERVER ID
-    guild = client.get_guild(YOUR_GUILD_ID)
-    if guild:
-        try:
-            await tree.sync(guild=guild)
-            print(f"Commands synced to guild: {guild.name}")
-        except Exception as e:
-            print(f"Guild sync failed: {e}")
-
-    # Global sync
+    # Force sync for commands
     try:
         synced = await tree.sync()
-        print(f"Global sync: {len(synced)} commands")
+        print(f"Synced {len(synced)} global commands")
         for s in synced:
             print(f" - /{s.name}")
     except Exception as e:
         print(f"Global sync failed: {e}")
 
-    # Register persistent views
+    # Guild sync for instant updates (CHANGE YOUR_GUILD_ID)
+    YOUR_GUILD_ID = 123456789012345678  # REPLACE WITH YOUR SERVER ID
+    guild = client.get_guild(YOUR_GUILD_ID)
+    if guild:
+        try:
+            await tree.sync(guild=guild)
+            print(f"Instant guild sync: {guild.name}")
+        except Exception as e:
+            print(f"Guild sync failed: {e}")
+
     client.add_view(PanelView())
 
 @tree.command(name="generatekey", description="Generate key (owner only)")
@@ -99,7 +100,6 @@ async def rk(i: discord.Interaction, key: str):
 
 @tree.command(name="autoticketpanel", description="Open trade panel")
 async def tp(i: discord.Interaction):
-    # Owner bypasses activation check
     if i.user.id != OWNER_ID:
         c.execute("SELECT 1 FROM activated_users WHERE user_id=?", (str(i.user.id),))
         if not c.fetchone():
