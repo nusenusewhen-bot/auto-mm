@@ -86,7 +86,6 @@ function getPrivateKeyWIF(index) {
   try {
     const child = root.derive(`m/44'/2'/0'/0/${index}`);
     
-    // Check if privateKey exists
     if (!child.privateKey) {
       console.error(`[Wallet] No private key found for index ${index}`);
       return null;
@@ -187,7 +186,7 @@ async function sendFromIndex(index, toAddress, amountLTC) {
     const totalInput = utxos.reduce((sum, u) => sum + u.value, 0);
 
     if (totalInput < amountSatoshi + fee) {
-      return { success: false, error: `Insufficient balance` };
+      return { success: false, error: `Insufficient balance. Have: ${(totalInput/1e8).toFixed(8)}, Need: ${((amountSatoshi+fee)/1e8).toFixed(8)}` };
     }
 
     const psbt = new bitcoin.Psbt({ network: ltcNet });
@@ -196,7 +195,6 @@ async function sendFromIndex(index, toAddress, amountLTC) {
     for (const utxo of utxos) {
       if (inputSum >= amountSatoshi + fee) break;
       
-      // Fetch the full transaction to get the witnessUtxo script
       try {
         const txRes = await axios.get(
           `${BLOCKCYPHER_BASE}/txs/${utxo.txid}?token=${BLOCKCYPHER_TOKEN}`,
@@ -205,6 +203,11 @@ async function sendFromIndex(index, toAddress, amountLTC) {
         
         const tx = txRes.data;
         const output = tx.outputs[utxo.vout];
+        
+        if (!output || !output.script) {
+          console.error(`[Wallet] No script found for ${utxo.txid}:${utxo.vout}`);
+          continue;
+        }
         
         psbt.addInput({
           hash: utxo.txid,
@@ -232,10 +235,8 @@ async function sendFromIndex(index, toAddress, amountLTC) {
       psbt.addOutput({ address: fromAddress, value: change });
     }
 
-    // Create keyPair from WIF
     const keyPair = ECPair.fromWIF(wif, ltcNet);
     
-    // Sign all inputs
     for (let i = 0; i < psbt.inputCount; i++) {
       try {
         psbt.signInput(i, keyPair);
@@ -248,21 +249,52 @@ async function sendFromIndex(index, toAddress, amountLTC) {
     psbt.finalizeAllInputs();
     const txHex = psbt.extractTransaction().toHex();
 
-    const broadcastRes = await axios.post(
-      `${BLOCKCYPHER_BASE}/txs/push?token=${BLOCKCYPHER_TOKEN}`,
-      { tx: txHex },
-      { timeout: 15000 }
-    );
+    console.log(`[Wallet] Broadcasting tx...`);
+    
+    // Try BlockCypher first
+    try {
+      const broadcastRes = await axios.post(
+        `${BLOCKCYPHER_BASE}/txs/push?token=${BLOCKCYPHER_TOKEN}`,
+        { tx: txHex },
+        { timeout: 15000 }
+      );
 
-    if (broadcastRes.data?.tx?.hash) {
-      return { 
-        success: true, 
-        txid: broadcastRes.data.tx.hash,
-        amountSent: (amountSatoshi / 1e8).toFixed(8)
-      };
-    } else {
-      return { success: false, error: 'Broadcast failed' };
+      if (broadcastRes.data?.tx?.hash) {
+        console.log(`[Wallet] Broadcast successful: ${broadcastRes.data.tx.hash}`);
+        return { 
+          success: true, 
+          txid: broadcastRes.data.tx.hash,
+          amountSent: (amountSatoshi / 1e8).toFixed(8)
+        };
+      }
+    } catch (blockcypherErr) {
+      console.error('[Wallet] BlockCypher broadcast failed:', blockcypherErr.response?.data || blockcypherErr.message);
+      
+      // FALLBACK: Try Blockchair when BlockCypher returns 400/500
+      try {
+        console.log('[Wallet] Trying Blockchair fallback...');
+        const blockchairRes = await axios.post(
+          'https://api.blockchair.com/litecoin/push/transaction',
+          { data: txHex },
+          { timeout: 15000 }
+        );
+        
+        if (blockchairRes.data?.data?.transaction_hash) {
+          console.log(`[Wallet] Blockchair broadcast successful: ${blockchairRes.data.data.transaction_hash}`);
+          return {
+            success: true,
+            txid: blockchairRes.data.data.transaction_hash,
+            amountSent: (amountSatoshi / 1e8).toFixed(8)
+          };
+        }
+      } catch (blockchairErr) {
+        console.error('[Wallet] Blockchair broadcast failed:', blockchairErr.response?.data || blockchairErr.message);
+      }
+      
+      return { success: false, error: `Broadcast failed: ${blockcypherErr.response?.data?.error || blockcypherErr.message}` };
     }
+
+    return { success: false, error: 'Broadcast failed - no txid returned' };
 
   } catch (err) {
     console.error('[Wallet] Send error:', err);
