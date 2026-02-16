@@ -10,6 +10,10 @@ if (!BLOCKCYPHER_TOKEN) {
 let priceCache = { value: 0, timestamp: 0 };
 const CACHE_DURATION = 60000;
 
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 async function getLtcPriceUSD() {
   const now = Date.now();
   if (now - priceCache.timestamp < CACHE_DURATION && priceCache.value > 0) {
@@ -34,7 +38,10 @@ async function checkTransactionMempool(address) {
   
   try {
     const url = `${BLOCKCYPHER_BASE}/addrs/${address}?token=${BLOCKCYPHER_TOKEN}`;
-    const res = await axios.get(url, { timeout: 10000 });
+    const res = await axios.get(url, { 
+      timeout: 10000,
+      headers: { 'User-Agent': 'LTC-Bot/1.0' }
+    });
     
     if (res.data.unconfirmed_n_tx > 0 && res.data.unconfirmed_txrefs?.length > 0) {
       return res.data.unconfirmed_txrefs[0].tx_hash;
@@ -51,7 +58,10 @@ async function checkPayment(address, expectedUsd) {
     if (price === 0) return false;
 
     const url = `${BLOCKCYPHER_BASE}/addrs/${address}/balance?token=${BLOCKCYPHER_TOKEN}`;
-    const res = await axios.get(url, { timeout: 10000 });
+    const res = await axios.get(url, { 
+      timeout: 10000,
+      headers: { 'User-Agent': 'LTC-Bot/1.0' }
+    });
 
     const confirmedLtc = (res.data.balance || 0) / 1e8;
     const unconfirmedLtc = (res.data.unconfirmed_balance || 0) / 1e8;
@@ -74,7 +84,10 @@ async function checkPayment(address, expectedUsd) {
 async function getAddressInfo(address) {
   try {
     const url = `${BLOCKCYPHER_BASE}/addrs/${address}/balance?token=${BLOCKCYPHER_TOKEN}`;
-    const res = await axios.get(url, { timeout: 10000 });
+    const res = await axios.get(url, { 
+      timeout: 10000,
+      headers: { 'User-Agent': 'LTC-Bot/1.0' }
+    });
     return res.data;
   } catch (err) {
     console.error('Error fetching address info:', err.message);
@@ -85,7 +98,10 @@ async function getAddressInfo(address) {
 async function getTransaction(txid) {
   try {
     const url = `${BLOCKCYPHER_BASE}/txs/${txid}?token=${BLOCKCYPHER_TOKEN}`;
-    const res = await axios.get(url, { timeout: 10000 });
+    const res = await axios.get(url, { 
+      timeout: 10000,
+      headers: { 'User-Agent': 'LTC-Bot/1.0' }
+    });
     return res.data;
   } catch (err) {
     console.error('Error fetching transaction:', err.message);
@@ -95,49 +111,43 @@ async function getTransaction(txid) {
 
 async function getAddressUTXOs(address) {
   try {
-    // Try BlockCypher first
+    // Use unspentOnly=true to get only unspent outputs
     const url = `${BLOCKCYPHER_BASE}/addrs/${address}?unspentOnly=true&token=${BLOCKCYPHER_TOKEN}`;
-    const res = await axios.get(url, { timeout: 10000 });
+    console.log(`[Blockchain] Fetching UTXOs for ${address}`);
+    
+    const res = await axios.get(url, { 
+      timeout: 10000,
+      headers: { 'User-Agent': 'LTC-Bot/1.0' }
+    });
     
     if (res.data.txrefs && res.data.txrefs.length > 0) {
-      return res.data.txrefs.map(utxo => ({
+      const utxos = res.data.txrefs.map(utxo => ({
         txid: utxo.tx_hash,
         vout: utxo.tx_output_n,
         value: utxo.value,
         confirmations: utxo.confirmations
       }));
+      console.log(`[Blockchain] Found ${utxos.length} UTXOs`);
+      return utxos;
     }
     
-    // If no UTXOs from BlockCypher, try Blockchair as fallback
-    console.log(`[Blockchain] No UTXOs from BlockCypher, trying Blockchair...`);
-    return await getAddressUTXOsBlockchair(address);
-    
-  } catch (err) {
-    console.error('Error fetching UTXOs from BlockCypher:', err.message);
-    // Try Blockchair as fallback
-    return await getAddressUTXOsBlockchair(address);
-  }
-}
-
-async function getAddressUTXOsBlockchair(address) {
-  try {
-    const url = `https://api.blockchair.com/litecoin/outputs?q=recipient(${address}),is_spent(false)`;
-    const res = await axios.get(url, { timeout: 10000 });
-    
-    if (res.data.data && res.data.data.length > 0) {
-      return res.data.data.map(output => ({
-        txid: output.transaction_hash,
-        vout: output.index,
-        value: output.value,
-        confirmations: output.block_id ? 1 : 0
-      }));
-    }
-    
+    console.log(`[Blockchain] No UTXOs found for ${address}`);
     return [];
   } catch (err) {
-    console.error('Error fetching UTXOs from Blockchair:', err.message);
+    if (err.response?.status === 404) {
+      console.log(`[Blockchain] Address ${address} not found (no UTXOs)`);
+      return [];
+    }
+    console.error('Error fetching UTXOs:', err.message);
     return [];
   }
 }
 
-module.exports = { checkPayment, getLtcPriceUSD, getAddressInfo, getTransaction, checkTransactionMempool, getAddressUTXOs };
+module.exports = { 
+  checkPayment, 
+  getLtcPriceUSD, 
+  getAddressInfo, 
+  getTransaction, 
+  checkTransactionMempool, 
+  getAddressUTXOs 
+};
