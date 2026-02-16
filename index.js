@@ -46,6 +46,9 @@ const TRADE_INDEX = 0;
 // FEES GO TO INDEX 1
 const FEE_INDEX = 1;
 
+// TICKET CATEGORY - SET BY /ticketcategory COMMAND
+let TICKET_CATEGORY = null;
+
 if (!DISCORD_TOKEN || !OWNER_ID || !process.env.BOT_MNEMONIC) {
   console.error('Missing required environment variables. Check your .env file.');
   process.exit(1);
@@ -103,6 +106,10 @@ const commands = [
     .setName('logchannel')
     .setDescription('Set channel for trade logs (Owner only)')
     .addStringOption(opt => opt.setName('channelid').setDescription('Channel ID for trade logs').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('ticketcategory')
+    .setDescription('Set category for ticket channels (Owner only)')
+    .addStringOption(opt => opt.setName('categoryid').setDescription('Category ID').setRequired(true)),
 ].map(cmd => cmd.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
@@ -111,6 +118,10 @@ client.once(Events.ClientReady, async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   console.log(`✅ ALL TICKETS USE INDEX ${TRADE_INDEX}`);
   console.log(`✅ ALL FEES GO TO INDEX ${FEE_INDEX}`);
+  
+  // Load ticket category
+  const catRow = db.prepare("SELECT value FROM config WHERE key='ticketCategory'").get();
+  if (catRow) TICKET_CATEGORY = catRow.value;
   
   try {
     console.log('Deploying commands...');
@@ -288,7 +299,31 @@ async function handleSlashCommand(interaction) {
     await closeTicket(interaction);
   } else if (commandName === 'logchannel') {
     await setLogChannel(interaction);
+  } else if (commandName === 'ticketcategory') {
+    await setTicketCategory(interaction);
   }
+}
+
+async function setTicketCategory(interaction) {
+  if (interaction.user.id !== OWNER_ID) {
+    return interaction.reply({ content: '❌ Only owner.', flags: MessageFlags.Ephemeral });
+  }
+
+  const categoryId = interaction.options.getString('categoryid').trim();
+  
+  // Verify category exists
+  const category = await interaction.guild.channels.fetch(categoryId).catch(() => null);
+  if (!category || category.type !== ChannelType.GuildCategory) {
+    return interaction.reply({ content: '❌ Invalid category ID.', flags: MessageFlags.Ephemeral });
+  }
+
+  TICKET_CATEGORY = categoryId;
+  db.prepare("INSERT OR REPLACE INTO config(key, value) VALUES('ticketCategory', ?)").run(categoryId);
+  
+  return interaction.reply({ 
+    content: `✅ Ticket category set to **${category.name}**`, 
+    flags: MessageFlags.Ephemeral 
+  });
 }
 
 async function setLogChannel(interaction) {
@@ -447,6 +482,7 @@ async function handleTradeDetailsModal(interaction) {
   const channel = await interaction.guild.channels.create({
     name: `ltc-${interaction.user.username}-${otherMember.user.username}`.substring(0, 100),
     type: ChannelType.GuildText,
+    parent: TICKET_CATEGORY, // USE TICKET CATEGORY
     permissionOverwrites: [
       {
         id: interaction.guild.id,
@@ -596,8 +632,67 @@ async function handleAddressModal(interaction) {
   await interaction.reply({ embeds: [embed], components: [row] });
 }
 
+// BUTTON RESTRICTION CHECK
+async function checkButtonRestriction(interaction, customId) {
+  // Extract trade ID from button
+  let tradeId = null;
+  if (customId.includes('_')) {
+    const parts = customId.split('_');
+    tradeId = parts[parts.length - 1];
+  }
+  
+  if (!tradeId) return { restricted: false };
+  
+  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+  if (!trade) return { restricted: false };
+  
+  const userId = interaction.user.id;
+  
+  // Sender-only buttons
+  const senderButtons = ['role_sender_', 'set_amount_', 'confirm_amount_', 'release_', 'confirm_release_'];
+  for (const prefix of senderButtons) {
+    if (customId.startsWith(prefix)) {
+      if (userId !== trade.senderId && userId !== OWNER_ID) {
+        return { restricted: true, message: '❌ Only the **Sender** can use this button.' };
+      }
+      return { restricted: false };
+    }
+  }
+  
+  // Receiver-only buttons  
+  const receiverButtons = ['role_receiver_', 'enter_address_', 'confirm_withdraw_'];
+  for (const prefix of receiverButtons) {
+    if (customId.startsWith(prefix)) {
+      if (userId !== trade.receiverId && userId !== OWNER_ID) {
+        return { restricted: true, message: '❌ Only the **Receiver** can use this button.' };
+      }
+      return { restricted: false };
+    }
+  }
+  
+  // Role selection - can't select if already selected other role
+  if (customId.startsWith('role_sender_')) {
+    if (userId === trade.receiverId) {
+      return { restricted: true, message: '❌ You are already the **Receiver**! You cannot be both.' };
+    }
+  }
+  if (customId.startsWith('role_receiver_')) {
+    if (userId === trade.senderId) {
+      return { restricted: true, message: '❌ You are already the **Sender**! You cannot be both.' };
+    }
+  }
+  
+  return { restricted: false };
+}
+
 async function handleButton(interaction) {
   const customId = interaction.customId;
+  
+  // CHECK BUTTON RESTRICTION FIRST
+  const restriction = await checkButtonRestriction(interaction, customId);
+  if (restriction.restricted) {
+    return interaction.reply({ content: restriction.message, flags: MessageFlags.Ephemeral });
+  }
   
   const interactionKey = `${interaction.user.id}_${customId}`;
   if (confirmedInteractions.has(interactionKey)) {
