@@ -2,6 +2,10 @@ const bip39 = require('bip39');
 const hdkey = require('hdkey');
 const bitcoin = require('bitcoinjs-lib');
 const axios = require('axios');
+const { ECPairFactory } = require('ecpair');
+const tinysecp = require('tiny-secp256k1');
+
+const ECPair = ECPairFactory(tinysecp);
 
 const BLOCKCYPHER_TOKEN = process.env.BLOCKCYPHER_TOKEN;
 
@@ -89,11 +93,11 @@ function getPrivateKeyWIF(index) {
   
   try {
     const child = root.derive(`m/44'/2'/0'/0/${index}`);
-    // Fix: Use bitcoinjs-lib's ECPair factory properly
-    const keyPair = bitcoin.ECPair.fromPrivateKey(child.privateKey, { network: ltcNet });
+    const keyPair = ECPair.fromPrivateKey(child.privateKey, { network: ltcNet });
     return keyPair.toWIF();
   } catch (err) {
     console.error(`[Wallet] Failed to get private key for index ${index}:`, err.message);
+    console.error(`[Wallet] Error details:`, err);
     return null;
   }
 }
@@ -225,8 +229,12 @@ async function sendFromIndex(index, toAddress, amountLTC) {
   
   console.log(`[Wallet] fromAddress=${fromAddress}, wif=${wif ? 'exists' : 'null'}`);
 
-  if (!fromAddress || !wif) {
-    return { success: false, error: 'Could not derive private key or address' };
+  if (!fromAddress) {
+    return { success: false, error: 'Could not generate address' };
+  }
+  
+  if (!wif) {
+    return { success: false, error: 'Could not derive private key - check wallet initialization' };
   }
 
   try {
@@ -293,7 +301,7 @@ async function sendFromIndex(index, toAddress, amountLTC) {
       psbt.addOutput({ address: fromAddress, value: change });
     }
 
-    const keyPair = bitcoin.ECPair.fromWIF(wif, ltcNet);
+    const keyPair = ECPair.fromWIF(wif, ltcNet);
     for (let i = 0; i < psbt.inputCount; i++) {
       try { 
         psbt.signInput(i, keyPair); 
@@ -342,7 +350,7 @@ async function sendAllLTC(toAddress, specificIndex = null) {
   if (indexToUse === null) {
     console.log(`[Wallet] Searching for funds...`);
     for (let i = 0; i <= 20; i++) {
-      const balance = await getBalanceAtIndex(i, true); // Force refresh
+      const balance = await getBalanceAtIndex(i, true);
       if (balance > 0) {
         indexToUse = i;
         console.log(`[Wallet] Found funds at index ${i}: ${balance} LTC`);
