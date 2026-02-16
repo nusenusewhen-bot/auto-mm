@@ -417,24 +417,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         let indexToUse = specificIndex;
         
         if (indexToUse === null) {
-          console.log(`[Send] Auto-detecting funded index (using cache)...`);
-          for (let i = 0; i <= 20; i++) {
-            const balance = await getBalanceAtIndex(i, false);
-            if (balance > 0) {
-              indexToUse = i;
-              console.log(`[Send] Found funds at index ${i}: ${balance} LTC`);
-              break;
-            }
-          }
-        }
-        
-        if (indexToUse === null) {
-          console.log(`[Send] Retrying with force refresh...`);
+          console.log(`[Send] Auto-detecting funded index...`);
           for (let i = 0; i <= 20; i++) {
             const balance = await getBalanceAtIndex(i, true);
             if (balance > 0) {
               indexToUse = i;
-              console.log(`[Send] Found funds at index ${i}: ${balance} LTC (force refresh)`);
+              console.log(`[Send] Found funds at index ${i}: ${balance} LTC`);
               break;
             }
           }
@@ -444,7 +432,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return interaction.editReply({ content: '❌ No funded addresses found (checked indices 0-20). Use /balance to see all indices, or specify an index: /send address:YOUR_ADDRESS index:1' });
         }
 
-        const balance = await getBalanceAtIndex(indexToUse, false);
+        const balance = await getBalanceAtIndex(indexToUse, true);
         console.log(`[Send] Index ${indexToUse} balance: ${balance} LTC`);
 
         if (!balance || balance <= 0) {
@@ -620,7 +608,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      // FIXED ROLE SELECTION - Users can switch roles by clicking the other button
+      // FIXED ROLE SELECTION - Users can only have one role, but can switch
       if (interaction.customId.startsWith('role_sending_')) {
         const tradeId = interaction.customId.split('_')[2];
         const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
@@ -631,10 +619,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return interaction.reply({ content: '❌ You are not part of this trade.', flags: MessageFlags.Ephemeral });
         }
 
-        // Allow switching roles - if already receiver, switch to sender
-        db.prepare(`UPDATE trades SET senderId = ?, receiverId = CASE WHEN receiverId = ? THEN NULL ELSE receiverId END WHERE id = ?`).run(interaction.user.id, interaction.user.id, tradeId);
-
-        await interaction.reply({ content: `✅ <@${interaction.user.id}> is now the **Sender** (will pay LTC)!` });
+        // If user was receiver, remove them from receiver and set as sender
+        // If user was already sender, just confirm
+        const wasReceiver = trade.receiverId === interaction.user.id;
+        
+        if (wasReceiver) {
+          db.prepare(`UPDATE trades SET senderId = ?, receiverId = NULL WHERE id = ?`).run(interaction.user.id, tradeId);
+          await interaction.reply({ content: `✅ <@${interaction.user.id}> switched to **Sender** (will pay LTC)!` });
+        } else {
+          db.prepare(`UPDATE trades SET senderId = ? WHERE id = ?`).run(interaction.user.id, tradeId);
+          await interaction.reply({ content: `✅ <@${interaction.user.id}> is now the **Sender** (will pay LTC)!` });
+        }
 
         const updated = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
         if (updated.senderId && updated.receiverId) {
@@ -653,10 +648,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return interaction.reply({ content: '❌ You are not part of this trade.', flags: MessageFlags.Ephemeral });
         }
 
-        // Allow switching roles - if already sender, switch to receiver
-        db.prepare(`UPDATE trades SET receiverId = ?, senderId = CASE WHEN senderId = ? THEN NULL ELSE senderId END WHERE id = ?`).run(interaction.user.id, interaction.user.id, tradeId);
-
-        await interaction.reply({ content: `✅ <@${interaction.user.id}> is now the **Receiver** (will get LTC)!` });
+        // If user was sender, remove them from sender and set as receiver
+        // If user was already receiver, just confirm
+        const wasSender = trade.senderId === interaction.user.id;
+        
+        if (wasSender) {
+          db.prepare(`UPDATE trades SET receiverId = ?, senderId = NULL WHERE id = ?`).run(interaction.user.id, tradeId);
+          await interaction.reply({ content: `✅ <@${interaction.user.id}> switched to **Receiver** (will get LTC)!` });
+        } else {
+          db.prepare(`UPDATE trades SET receiverId = ? WHERE id = ?`).run(interaction.user.id, tradeId);
+          await interaction.reply({ content: `✅ <@${interaction.user.id}> is now the **Receiver** (will get LTC)!` });
+        }
 
         const updated = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
         if (updated.senderId && updated.receiverId) {
