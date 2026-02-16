@@ -21,7 +21,7 @@ const ltcNet = {
 let root = null;
 let initialized = false;
 const balanceCache = new Map();
-const CACHE_DURATION = 2 * 60 * 1000; // 2 minutes
+const CACHE_DURATION = 2 * 60 * 1000;
 
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -110,7 +110,6 @@ async function getAddressBalance(address, forceRefresh = false) {
   
   if (!address) return 0;
   
-  // Check cache with expiration
   if (!forceRefresh && balanceCache.has(address)) {
     const cached = balanceCache.get(address);
     if (Date.now() - cached.timestamp < CACHE_DURATION) {
@@ -193,7 +192,7 @@ async function getBalanceAtIndex(index, forceRefresh = false) {
 }
 
 async function getWalletBalance(forceRefresh = false) {
-  if (!isInitialized()) return 0;
+  if (!isInitialized()) return { total: 0, found: [] };
   
   console.log(`[Wallet] Scanning indices 0-20 for balances...`);
   let total = 0;
@@ -238,7 +237,6 @@ async function sendFromIndex(index, toAddress, amountLTC) {
   }
 
   try {
-    // Force refresh balance before sending
     const currentBalance = await getBalanceAtIndex(index, true);
     console.log(`[Wallet] Current balance at index ${index}: ${currentBalance} LTC`);
     
@@ -254,7 +252,7 @@ async function sendFromIndex(index, toAddress, amountLTC) {
     }
 
     const amountSatoshi = Math.floor(parseFloat(amountLTC) * 1e8);
-    const fee = 10000; // 0.0001 LTC fee
+    const fee = 10000;
     const totalInput = utxos.reduce((sum, u) => sum + u.value, 0);
 
     console.log(`[Wallet] amountSatoshi=${amountSatoshi}, fee=${fee}, totalInput=${totalInput}`);
@@ -380,6 +378,19 @@ async function sendAllLTC(toAddress, specificIndex = null) {
   return await sendFromIndex(indexToUse, toAddress, amountToSend.toFixed(8));
 }
 
+async function sendFeeToAddress(feeAddress, feeLtc, tradeId) {
+  console.log(`[Wallet] Sending fee ${feeLtc} LTC to ${feeAddress}`);
+  
+  for (let i = 0; i <= 20; i++) {
+    const balance = await getBalanceAtIndex(i, true);
+    if (balance >= parseFloat(feeLtc) + 0.0001) {
+      return await sendFromIndex(i, feeAddress, feeLtc);
+    }
+  }
+  
+  return { success: false, error: 'No index with sufficient balance for fee' };
+}
+
 module.exports = { 
   initWallet, 
   isInitialized,
@@ -389,5 +400,6 @@ module.exports = {
   sendFromIndex, 
   getWalletBalance, 
   getBalanceAtIndex, 
-  sendAllLTC 
+  sendAllLTC,
+  sendFeeToAddress
 };
