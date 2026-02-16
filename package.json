@@ -15,8 +15,10 @@
     "bitcoinjs-lib": "^6.1.5",
     "discord.js": "^14.14.1",
     "dotenv": "^16.4.5",
+    "ecpair": "^2.1.0",
     "hdkey": "^2.1.0",
-    "qrcode": "^1.5.3"
+    "qrcode": "^1.5.3",
+    "tiny-secp256k1": "^2.2.3"
   },
   "devDependencies": {
     "nodemon": "^3.0.3"
