@@ -1,18 +1,25 @@
 {
   "name": "ltc-middleman-bot",
-  "version": "2.0.0",
-  "description": "Litecoin middleman bot",
+  "version": "1.0.0",
+  "description": "Discord bot for Litecoin middleman trades",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "nodemon index.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "sqlite3": "^5.1.6",
-    "bitcoinjs-lib": "^6.1.0",
-    "ecpair": "^6.0.0",
-    "dotenv": "^16.3.1",
-    "axios": "^1.6.6"
+    "@discordjs/rest": "^2.2.0",
+    "axios": "^1.6.7",
+    "better-sqlite3": "^9.4.3",
+    "bip39": "^3.1.0",
+    "bitcoinjs-lib": "^6.1.5",
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.4.5",
+    "hdkey": "^2.1.0",
+    "qrcode": "^1.5.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.3"
   },
   "engines": {
     "node": ">=18.0.0"
