@@ -170,6 +170,12 @@ client.on(Events.MessageCreate, async (message) => {
     
     const channel = client.channels.cache.get(targetChannelId);
     if (channel) {
+      // Restore permissions before deleting
+      try {
+        await channel.permissionOverwrites.delete(trade.senderId);
+        await channel.permissionOverwrites.delete(trade.receiverId);
+      } catch(e) {}
+      
       await channel.send({
         embeds: [
           new EmbedBuilder()
@@ -208,6 +214,9 @@ client.on(Events.MessageCreate, async (message) => {
     if (!channel) {
       return message.reply('❌ Channel not found.');
     }
+    
+    // Enable receiver, disable sender
+    await setActiveUser(channel, trade, 'receiver');
     
     // Prompt for receiver address in the trade channel
     const embed = new EmbedBuilder()
@@ -406,11 +415,12 @@ async function handleTradeDetailsModal(interaction) {
     ],
   });
 
-  // Create trade in DB with trade details
+  // Create trade in DB with trade details - ALWAYS use index 0 for deposit
+  const depositAddress = generateAddress(0);
   const result = db.prepare(`
-    INSERT INTO trades (channelId, user1Id, user2Id, senderId, receiverId, amount, status, createdAt, youGiving, theyGiving)
-    VALUES (?, ?, ?, NULL, NULL, 0, 'role_selection', datetime('now'), ?, ?)
-  `).run(channel.id, interaction.user.id, otherUserId, youGiving, theyGiving);
+    INSERT INTO trades (channelId, user1Id, user2Id, senderId, receiverId, amount, status, createdAt, youGiving, theyGiving, depositAddress, depositIndex)
+    VALUES (?, ?, ?, NULL, NULL, 0, 'role_selection', datetime('now'), ?, ?, ?, 0)
+  `).run(channel.id, interaction.user.id, otherUserId, youGiving, theyGiving, depositAddress);
 
   const tradeId = result.lastInsertRowid;
 
@@ -418,7 +428,7 @@ async function handleTradeDetailsModal(interaction) {
 
   // Send initial embed with trade details
   const embed = new EmbedBuilder()
-    .setTitle('👋 Malieno\'s Auto Middleman Service')
+    .setTitle('👋 Schior\'s Auto Middleman Service')
     .setDescription('Make sure to follow the steps and read the instructions thoroughly.\nPlease explicitly state the trade details if the information below is inaccurate.')
     .addFields(
       { name: `${interaction.user.username}'s side:`, value: youGiving || 'Waiting...', inline: true },
@@ -461,6 +471,11 @@ async function handleTradeDetailsModal(interaction) {
 async function handleAmountModal(interaction) {
   const tradeId = interaction.customId.split('_')[2];
   const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+
+  // Only sender can set amount
+  if (interaction.user.id !== trade.senderId && interaction.user.id !== OWNER_ID) {
+    return interaction.reply({ content: '❌ Only the sender can set the amount!', flags: MessageFlags.Ephemeral });
+  }
 
   const amountStr = interaction.fields.getTextInputValue('usd_amount');
   const amount = parseFloat(amountStr);
@@ -821,6 +836,9 @@ async function handleConfirmInfo(interaction) {
 async function promptForAmount(channel, tradeId) {
   const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
+  // Enable sender, disable receiver for amount setting
+  await setActiveUser(channel, trade, 'sender');
+
   const embed = new EmbedBuilder()
     .setDescription('💵 **Set the amount in USD value**')
     .setColor(0x5865F2);
@@ -841,8 +859,9 @@ async function handleSetAmount(interaction) {
 
   if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
 
-  if (interaction.user.id !== trade.senderId) {
-    return interaction.reply({ content: '❌ Only the sender can set the amount.', flags: MessageFlags.Ephemeral });
+  // Only sender can set amount
+  if (interaction.user.id !== trade.senderId && interaction.user.id !== OWNER_ID) {
+    return interaction.reply({ content: '❌ Only the sender can set the amount!', flags: MessageFlags.Ephemeral });
   }
 
   const modal = new ModalBuilder()
@@ -889,11 +908,11 @@ async function handleConfirmAmount(interaction) {
 async function sendPaymentInstructions(channel, tradeId) {
   const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
   
-  const depositIndex = tradeId;
-  const depositAddress = generateAddress(depositIndex);
+  // ALWAYS use index 0 - same address for all trades
+  const depositAddress = generateAddress(0);
 
-  db.prepare("UPDATE trades SET depositAddress = ?, depositIndex = ?, status = 'awaiting_payment' WHERE id = ?")
-    .run(depositAddress, depositIndex, tradeId);
+  db.prepare("UPDATE trades SET depositAddress = ?, depositIndex = 0, status = 'awaiting_payment' WHERE id = ?")
+    .run(depositAddress, tradeId);
 
   const feePercent = await getFeePercent();
   const feeUsd = trade.fee || calculateFee(trade.amount, feePercent);
@@ -1021,6 +1040,9 @@ async function handleTransactionConfirmed(tradeId) {
 
   await channel.send({ embeds: [embed] });
 
+  // Enable both for trade completion phase
+  await setBothActive(channel, trade);
+
   const proceedEmbed = new EmbedBuilder()
     .setTitle('✅ You may proceed with your trade.')
     .setDescription(`1. <@${trade.receiverId}> **Give your trader the items or payment you agreed on.**\n\n2. <@${trade.senderId}> **Once you have received your items, click "Release" so your trader can claim the LTC.**`)
@@ -1046,7 +1068,8 @@ async function handleRelease(interaction) {
 
   if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
 
-  if (interaction.user.id !== trade.senderId) {
+  // Only sender can release
+  if (interaction.user.id !== trade.senderId && interaction.user.id !== OWNER_ID) {
     return interaction.reply({ content: '❌ Only the sender can release funds!', flags: MessageFlags.Ephemeral });
   }
 
@@ -1073,6 +1096,9 @@ async function promptForAddress(interaction, tradeId) {
   const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
   const channel = interaction.channel;
 
+  // Enable receiver, disable sender for address entry
+  await setActiveUser(channel, trade, 'receiver');
+
   const embed = new EmbedBuilder()
     .setDescription('💰 **What\'s Your LTC Address?**\nMake sure to paste your correct LTC address.')
     .setColor(0x5865F2);
@@ -1084,21 +1110,7 @@ async function promptForAddress(interaction, tradeId) {
       .setStyle(ButtonStyle.Primary)
   );
 
-  // Send the message with receiver mention but restrict sender from clicking
-  const message = await channel.send({ content: `<@${trade.receiverId}>`, embeds: [embed], components: [row] });
-
-  // Restrict sender from typing in channel (optional - remove send permission)
-  try {
-    const senderMember = await channel.guild.members.fetch(trade.senderId);
-    if (senderMember) {
-      await channel.permissionOverwrites.edit(trade.senderId, {
-        SendMessages: false
-      });
-      console.log(`[Trade ${tradeId}] Restricted sender ${trade.senderId} from sending messages`);
-    }
-  } catch (err) {
-    console.error(`[Trade ${tradeId}] Failed to restrict sender permissions:`, err.message);
-  }
+  await channel.send({ content: `<@${trade.receiverId}>`, embeds: [embed], components: [row] });
 }
 
 async function handleConfirmWithdraw(interaction) {
@@ -1144,25 +1156,70 @@ async function handleConfirmWithdraw(interaction) {
 
       await interaction.editReply({ embeds: [successEmbed], components: [row] });
 
-      // Restore sender's send permission after completion
-      try {
-        const channel = interaction.channel;
-        await channel.permissionOverwrites.edit(trade.senderId, {
-          SendMessages: true
-        });
-      } catch (err) {
-        console.error(`[Trade ${tradeId}] Failed to restore sender permissions:`, err.message);
-      }
+      // Restore both permissions after completion
+      await setBothActive(interaction.channel, trade);
 
       setTimeout(() => {
         interaction.channel.delete().catch(() => {});
       }, 120000);
     } else {
+      // Restore receiver permission on failure so they can try again
+      await setActiveUser(interaction.channel, trade, 'receiver');
       await interaction.editReply({ content: `❌ Withdrawal failed: ${result.error}`, components: [] });
     }
   } catch (err) {
     console.error('Withdrawal error:', err);
+    // Restore receiver permission on error
+    await setActiveUser(interaction.channel, trade, 'receiver');
     await interaction.editReply({ content: '❌ Withdrawal failed. Check console.', components: [] });
+  }
+}
+
+// Helper function to set only one user as active (can send messages)
+async function setActiveUser(channel, trade, activeRole) {
+  try {
+    if (activeRole === 'sender') {
+      // Enable sender, disable receiver
+      await channel.permissionOverwrites.edit(trade.senderId, {
+        ViewChannel: true,
+        SendMessages: true
+      });
+      await channel.permissionOverwrites.edit(trade.receiverId, {
+        ViewChannel: true,
+        SendMessages: false
+      });
+      console.log(`[Trade ${trade.id}] Set active: SENDER, disabled: RECEIVER`);
+    } else {
+      // Enable receiver, disable sender
+      await channel.permissionOverwrites.edit(trade.receiverId, {
+        ViewChannel: true,
+        SendMessages: true
+      });
+      await channel.permissionOverwrites.edit(trade.senderId, {
+        ViewChannel: true,
+        SendMessages: false
+      });
+      console.log(`[Trade ${trade.id}] Set active: RECEIVER, disabled: SENDER`);
+    }
+  } catch (err) {
+    console.error(`[Trade ${trade.id}] Failed to set active user:`, err.message);
+  }
+}
+
+// Helper function to enable both users
+async function setBothActive(channel, trade) {
+  try {
+    await channel.permissionOverwrites.edit(trade.senderId, {
+      ViewChannel: true,
+      SendMessages: true
+    });
+    await channel.permissionOverwrites.edit(trade.receiverId, {
+      ViewChannel: true,
+      SendMessages: true
+    });
+    console.log(`[Trade ${trade.id}] Both users enabled`);
+  } catch (err) {
+    console.error(`[Trade ${trade.id}] Failed to enable both users:`, err.message);
   }
 }
 
