@@ -503,6 +503,11 @@ async function handleAddressModal(interaction) {
   const tradeId = interaction.customId.split('_')[2];
   const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
+  // Check if user is the receiver (only receiver can enter address)
+  if (interaction.user.id !== trade.receiverId && interaction.user.id !== OWNER_ID) {
+    return interaction.reply({ content: '❌ Only the receiver can enter their address!', flags: MessageFlags.Ephemeral });
+  }
+
   const address = interaction.fields.getTextInputValue('ltc_address').trim();
 
   if (!address.startsWith('ltc1') && !address.startsWith('L') && !address.startsWith('M')) {
@@ -596,6 +601,12 @@ async function handleButton(interaction) {
 
   if (customId.startsWith('enter_address_')) {
     const tradeId = customId.split('_')[2];
+    const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+    
+    // Check if user is the receiver (only receiver can click this button)
+    if (interaction.user.id !== trade.receiverId && interaction.user.id !== OWNER_ID) {
+      return interaction.reply({ content: '❌ Only the receiver can enter their address!', flags: MessageFlags.Ephemeral });
+    }
     
     const modal = new ModalBuilder()
       .setCustomId(`address_modal_${tradeId}`)
@@ -929,14 +940,24 @@ function startPaymentMonitor(tradeId, channelId, expectedLtc) {
         return;
       }
 
+      // Only check if we're awaiting payment
+      if (trade.status !== 'awaiting_payment') {
+        return;
+      }
+
       const balance = await getAddressBalance(trade.depositAddress, true);
+      console.log(`[Monitor] Trade ${tradeId} - Confirmed: ${balance.confirmed}, Unconfirmed: ${balance.unconfirmed}, Expected: ${expectedLtc}`);
       
-      if (!detected && balance.unconfirmed > 0) {
+      // Require at least 0.0001 LTC to trigger detection (prevent false positives)
+      const minDetectionThreshold = 0.0001;
+      
+      if (!detected && balance.unconfirmed > minDetectionThreshold) {
         detected = true;
         await handleTransactionDetected(tradeId, balance.unconfirmed, false);
       }
 
-      if (balance.confirmed >= expectedLtc * 0.99) {
+      // Require 99% of expected amount in confirmed balance
+      if (balance.confirmed >= expectedLtc * 0.99 && balance.confirmed > minDetectionThreshold) {
         clearInterval(intervalId);
         activeMonitors.delete(tradeId);
         await handleTransactionConfirmed(tradeId);
@@ -1050,6 +1071,7 @@ async function handleRelease(interaction) {
 
 async function promptForAddress(interaction, tradeId) {
   const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+  const channel = interaction.channel;
 
   const embed = new EmbedBuilder()
     .setDescription('💰 **What\'s Your LTC Address?**\nMake sure to paste your correct LTC address.')
@@ -1062,10 +1084,20 @@ async function promptForAddress(interaction, tradeId) {
       .setStyle(ButtonStyle.Primary)
   );
 
-  if (interaction.replied || interaction.deferred) {
-    await interaction.editReply({ content: `<@${trade.receiverId}>`, embeds: [embed], components: [row] });
-  } else {
-    await interaction.update({ content: `<@${trade.receiverId}>`, embeds: [embed], components: [row] });
+  // Send the message with receiver mention but restrict sender from clicking
+  const message = await channel.send({ content: `<@${trade.receiverId}>`, embeds: [embed], components: [row] });
+
+  // Restrict sender from typing in channel (optional - remove send permission)
+  try {
+    const senderMember = await channel.guild.members.fetch(trade.senderId);
+    if (senderMember) {
+      await channel.permissionOverwrites.edit(trade.senderId, {
+        SendMessages: false
+      });
+      console.log(`[Trade ${tradeId}] Restricted sender ${trade.senderId} from sending messages`);
+    }
+  } catch (err) {
+    console.error(`[Trade ${tradeId}] Failed to restrict sender permissions:`, err.message);
   }
 }
 
@@ -1111,6 +1143,16 @@ async function handleConfirmWithdraw(interaction) {
       );
 
       await interaction.editReply({ embeds: [successEmbed], components: [row] });
+
+      // Restore sender's send permission after completion
+      try {
+        const channel = interaction.channel;
+        await channel.permissionOverwrites.edit(trade.senderId, {
+          SendMessages: true
+        });
+      } catch (err) {
+        console.error(`[Trade ${tradeId}] Failed to restore sender permissions:`, err.message);
+      }
 
       setTimeout(() => {
         interaction.channel.delete().catch(() => {});
@@ -1236,7 +1278,4 @@ process.on('SIGINT', () => {
   process.exit(0);
 });
 
-client.login(DISCORD_TOKEN).catch(err => {
-  console.error('❌ Failed to login:', err);
-  process.exit(1);
-});
+client.login(DISCO
