@@ -1,32 +1,51 @@
 const Database = require('better-sqlite3');
-const path = require('path');
+const db = new Database('database.db');
 
-const db = new Database(path.join(__dirname, 'tickets.db'));
+// Create trades table if not exists
+db.prepare(`
+CREATE TABLE IF NOT EXISTS trades (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  channelId TEXT NOT NULL,
+  user1Id TEXT NOT NULL,
+  user2Id TEXT NOT NULL,
+  senderId TEXT,
+  receiverId TEXT,
+  amount REAL DEFAULT 0,
+  fee REAL DEFAULT 0,
+  feePercent REAL DEFAULT 5,
+  ltcPrice REAL DEFAULT 0,
+  ltcAmount REAL DEFAULT 0,
+  totalLtc REAL DEFAULT 0,
+  depositAddress TEXT,
+  depositIndex INTEGER DEFAULT 0,
+  receiverAddress TEXT,
+  txid TEXT,
+  status TEXT DEFAULT 'role_selection',
+  createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+  paidAt DATETIME,
+  completedAt DATETIME,
+  youGiving TEXT,
+  theyGiving TEXT
+)`).run();
 
-// Create tables if they don't exist
-db.exec(`
-  CREATE TABLE IF NOT EXISTS tickets (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ticket_id TEXT UNIQUE NOT NULL,
-    sender_id TEXT NOT NULL,
-    receiver_id TEXT NOT NULL,
-    giving TEXT NOT NULL,
-    receiving TEXT NOT NULL,
-    ltc_amount REAL NOT NULL,
-    escrow_address TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'waiting_deposit',
-    channel_id TEXT,
-    message_id TEXT,
-    deposit_amount REAL,
-    tx_hash TEXT,
-    created_at TEXT NOT NULL,
-    completed_at TEXT
-  );
+// Add new columns if they don't exist (for existing databases)
+try {
+  db.prepare("ALTER TABLE trades ADD COLUMN youGiving TEXT").run();
+} catch(e) {
+  // Column already exists
+}
 
-  CREATE INDEX IF NOT EXISTS idx_ticket_id ON tickets(ticket_id);
-  CREATE INDEX IF NOT EXISTS idx_channel_id ON tickets(channel_id);
-  CREATE INDEX IF NOT EXISTS idx_status ON tickets(status);
-`);
+try {
+  db.prepare("ALTER TABLE trades ADD COLUMN theyGiving TEXT").run();
+} catch(e) {
+  // Column already exists
+}
+
+db.prepare(`
+CREATE TABLE IF NOT EXISTS config (
+  key TEXT PRIMARY KEY,
+  value TEXT
+)`).run();
 
 console.log('✅ Database initialized');
 
