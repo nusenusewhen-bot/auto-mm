@@ -111,6 +111,129 @@ client.once(Events.ClientReady, async () => {
   }
 });
 
+// ==================== TEXT COMMANDS ($refund, $release) ====================
+
+client.on(Events.MessageCreate, async (message) => {
+  if (message.author.bot) return;
+  
+  const args = message.content.trim().split(/\s+/);
+  const command = args[0].toLowerCase();
+  
+  // $refund (channelId) - Owner only
+  if (command === '$refund') {
+    if (!await hasOwnerPermissions(message.author.id, message.member)) {
+      return message.reply('❌ Only owner can use this command.');
+    }
+    
+    const targetChannelId = args[1] || message.channel.id;
+    const trade = db.prepare('SELECT * FROM trades WHERE channelId = ?').get(targetChannelId);
+    
+    if (!trade) {
+      return message.reply('❌ No active trade found in this channel.');
+    }
+    
+    if (trade.status === 'completed' || trade.status === 'cancelled') {
+      return message.reply('❌ Trade is already completed or cancelled.');
+    }
+    
+    // Stop monitor if active
+    if (activeMonitors.has(trade.id)) {
+      clearInterval(activeMonitors.get(trade.id));
+      activeMonitors.delete(trade.id);
+    }
+    
+    // Refund to sender if there's a deposit address with balance
+    if (trade.depositAddress && trade.senderId) {
+      try {
+        const balance = await getAddressBalance(trade.depositAddress, true);
+        
+        if (balance.confirmed > 0 || balance.unconfirmed > 0) {
+          // Get sender's address - we need to ask or use stored address
+          // For now, we'll check if we have a return address stored, otherwise notify owner
+          const sender = await client.users.fetch(trade.senderId).catch(() => null);
+          
+          await message.reply({
+            embeds: [
+              new EmbedBuilder()
+                .setTitle('🔄 Refund Initiated')
+                .setDescription(`Trade #${trade.id} marked for refund.\n**Amount:** ${balance.total.toFixed(8)} LTC\n**Sender:** ${sender ? sender.tag : 'Unknown'}\n\n⚠️ Manual refund required - send back to sender's address.`)
+                .setColor('Orange')
+            ]
+          });
+        } else {
+          await message.reply('ℹ️ No balance to refund.');
+        }
+      } catch (err) {
+        console.error('Refund check error:', err);
+      }
+    }
+    
+    db.prepare("UPDATE trades SET status = 'cancelled' WHERE id = ?").run(trade.id);
+    
+    const channel = client.channels.cache.get(targetChannelId);
+    if (channel) {
+      await channel.send({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('❌ Trade Cancelled & Refunded')
+            .setDescription('This trade has been cancelled by the owner. If funds were sent, they will be refunded.')
+            .setColor('Red')
+        ]
+      });
+    }
+    
+    return;
+  }
+  
+  // $release (channelId) - Owner only
+  if (command === '$release') {
+    if (!await hasOwnerPermissions(message.author.id, message.member)) {
+      return message.reply('❌ Only owner can use this command.');
+    }
+    
+    const targetChannelId = args[1] || message.channel.id;
+    const trade = db.prepare('SELECT * FROM trades WHERE channelId = ?').get(targetChannelId);
+    
+    if (!trade) {
+      return message.reply('❌ No active trade found in this channel.');
+    }
+    
+    if (trade.status !== 'awaiting_release' && trade.status !== 'payment_confirmed') {
+      return message.reply('❌ Trade is not ready for release (payment not confirmed).');
+    }
+    
+    if (!trade.receiverId) {
+      return message.reply('❌ No receiver set for this trade.');
+    }
+    
+    const channel = client.channels.cache.get(targetChannelId);
+    if (!channel) {
+      return message.reply('❌ Channel not found.');
+    }
+    
+    // Prompt for receiver address in the trade channel
+    const embed = new EmbedBuilder()
+      .setTitle('🔓 Owner Force Release')
+      .setDescription(`<@${trade.receiverId}> **Owner has force-released the funds.**\n\nPlease enter your LTC address to receive the funds.`)
+      .setColor('Green');
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`enter_address_${trade.id}`)
+        .setLabel('Enter Your LTC Address')
+        .setStyle(ButtonStyle.Primary)
+    );
+
+    await channel.send({ content: `<@${trade.receiverId}>`, embeds: [embed], components: [row] });
+    
+    // Update status to allow withdrawal
+    db.prepare("UPDATE trades SET status = 'awaiting_release', senderId = ? WHERE id = ?").run(OWNER_ID, trade.id);
+    
+    await message.reply(`✅ Force release initiated in <#${targetChannelId}>`);
+    return;
+  }
+});
+
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (interaction.isChatInputCommand()) {
@@ -745,11 +868,18 @@ async function sendPaymentInstructions(channel, tradeId) {
   db.prepare("UPDATE trades SET depositAddress = ?, depositIndex = ?, status = 'awaiting_payment' WHERE id = ?")
     .run(depositAddress, depositIndex, tradeId);
 
+  // UPDATED: Added fee breakdown to match the image style
+  const feePercent = await getFeePercent();
+  const feeUsd = trade.fee || calculateFee(trade.amount, feePercent);
+  const totalUsd = trade.amount + feeUsd;
+
   const embed = new EmbedBuilder()
     .setDescription(`<@${trade.senderId}> Send the LTC to the following address.`)
     .addFields(
       { name: '📋 Payment Information', value: 'Make sure to send the **EXACT** amount in LTC.' },
       { name: 'USD Amount', value: `$${trade.amount.toFixed(2)}` },
+      { name: 'Fee', value: `$${feeUsd.toFixed(2)} (${feePercent}%)` },
+      { name: 'Total with Fee', value: `$${totalUsd.toFixed(2)}` },
       { name: 'LTC Amount', value: trade.totalLtc.toFixed(5) },
       { name: 'Payment Address', value: `\`${depositAddress}\`` },
       { name: 'Current LTC Price', value: `$${trade.ltcPrice.toFixed(2)}` },
