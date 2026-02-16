@@ -592,12 +592,18 @@ async function handleButton(interaction) {
     return;
   }
 
+  // ENTER ADDRESS BUTTON - ONLY RECEIVER CAN CLICK
   if (customId.startsWith('enter_address_')) {
     const tradeId = customId.split('_')[2];
     const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
     
+    if (!trade) {
+      return interaction.reply({ content: '❌ Trade not found.', flags: MessageFlags.Ephemeral });
+    }
+
+    // CHECK IF USER IS RECEIVER OR OWNER
     if (interaction.user.id !== trade.receiverId && interaction.user.id !== OWNER_ID) {
-      return interaction.reply({ content: '❌ Only the receiver can enter their address!', flags: MessageFlags.Ephemeral });
+      return interaction.reply({ content: '❌ Only receiver can use this.', flags: MessageFlags.Ephemeral });
     }
     
     const modal = new ModalBuilder()
