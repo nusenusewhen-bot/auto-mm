@@ -74,6 +74,11 @@ async function getFeePercent() {
   return row ? parseFloat(row.value) : 5;
 }
 
+async function getLogChannel() {
+  const row = db.prepare("SELECT value FROM config WHERE key='logChannel'").get();
+  return row ? row.value : null;
+}
+
 const commands = [
   new SlashCommandBuilder()
     .setName('panel')
@@ -94,6 +99,10 @@ const commands = [
   new SlashCommandBuilder()
     .setName('close')
     .setDescription('Close this ticket'),
+  new SlashCommandBuilder()
+    .setName('logchannel')
+    .setDescription('Set channel for trade logs (Owner only)')
+    .addStringOption(opt => opt.setName('channelid').setDescription('Channel ID for trade logs').setRequired(true)),
 ].map(cmd => cmd.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
@@ -277,6 +286,65 @@ async function handleSlashCommand(interaction) {
     await setFeeCommand(interaction);
   } else if (commandName === 'close') {
     await closeTicket(interaction);
+  } else if (commandName === 'logchannel') {
+    await setLogChannel(interaction);
+  }
+}
+
+async function setLogChannel(interaction) {
+  if (interaction.user.id !== OWNER_ID) {
+    return interaction.reply({ content: '❌ Only owner can use this command.', flags: MessageFlags.Ephemeral });
+  }
+
+  const channelId = interaction.options.getString('channelid').trim();
+  
+  // Verify channel exists
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+  if (!channel) {
+    return interaction.reply({ content: '❌ Invalid channel ID or bot cannot access that channel.', flags: MessageFlags.Ephemeral });
+  }
+
+  db.prepare("INSERT OR REPLACE INTO config(key, value) VALUES('logChannel', ?)").run(channelId);
+  
+  return interaction.reply({ 
+    content: `✅ Trade log channel set to <#${channelId}>`, 
+    flags: MessageFlags.Ephemeral 
+  });
+}
+
+async function logTradeCompletion(trade, txid) {
+  const logChannelId = await getLogChannel();
+  if (!logChannelId) return;
+
+  const logChannel = await client.channels.fetch(logChannelId).catch(() => null);
+  if (!logChannel) {
+    console.error(`[Log] Could not find log channel ${logChannelId}`);
+    return;
+  }
+
+  const sender = await client.users.fetch(trade.senderId).catch(() => null);
+  const receiver = await client.users.fetch(trade.receiverId).catch(() => null);
+
+  const totalLtc = parseFloat(trade.totalLtc) || 0;
+  const ltcPrice = parseFloat(trade.ltcPrice) || await getLtcPriceUSD() || 0;
+  const totalUsd = totalLtc * ltcPrice;
+
+  const embed = new EmbedBuilder()
+    .setTitle('• Trade Completed')
+    .setDescription(`**${totalLtc.toFixed(8)} LTC** ($${totalUsd.toFixed(2)} USD)`)
+    .addFields(
+      { name: 'Sender', value: sender ? sender.username : 'Anonymous', inline: false },
+      { name: 'Receiver', value: receiver ? receiver.username : 'Anonymous', inline: false },
+      { name: 'Transaction ID', value: `[${txid.substring(0, 10)}...${txid.substring(txid.length-8)}](https://live.blockcypher.com/ltc/tx/${txid})`, inline: false }
+    )
+    .setColor(0x5865F2)
+    .setTimestamp();
+
+  try {
+    await logChannel.send({ embeds: [embed] });
+    console.log(`[Log] Trade ${trade.id} logged to channel ${logChannelId}`);
+  } catch (err) {
+    console.error(`[Log] Failed to send log:`, err.message);
   }
 }
 
@@ -1124,8 +1192,11 @@ async function handleConfirmWithdraw(interaction) {
       // SEND FEE TO INDEX 1 (FEE WALLET)
       await sendFeeToFeeWallet(feeLtc);
 
-      db.prepare("UPDATE trades SET status = 'completed', completedAt = datetime('now'), receiverAddress = ? WHERE id = ?")
-        .run(address, tradeId);
+      db.prepare("UPDATE trades SET status = 'completed', completedAt = datetime('now'), receiverAddress = ?, txid = ? WHERE id = ?")
+        .run(address, result.txid, tradeId);
+
+      // LOG TRADE COMPLETION
+      await logTradeCompletion(trade, result.txid);
 
       const successEmbed = new EmbedBuilder()
         .setTitle('✅ Withdrawal Successful')
