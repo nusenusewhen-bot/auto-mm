@@ -128,9 +128,8 @@ async function getAddressBalance(address, forceRefresh = false) {
     }
   }
 
-  // Try BlockCypher first
   try {
-    await delay(500); // Small delay to avoid rate limits
+    await delay(500);
     
     const url = `${BLOCKCYPHER_BASE}/addrs/${address}/balance?token=${BLOCKCYPHER_TOKEN}`;
     const res = await axios.get(url, { timeout: 15000 });
@@ -150,14 +149,12 @@ async function getAddressBalance(address, forceRefresh = false) {
       console.error(`[Wallet] BlockCypher error:`, err.message);
     }
     
-    // Fallback to Blockchair
     const blockchairBalance = await getAddressBalanceBlockchair(address);
     if (blockchairBalance > 0) {
       balanceCache.set(address, { balance: blockchairBalance, timestamp: Date.now() });
       return blockchairBalance;
     }
     
-    // If both fail, return cached value if available (even if expired)
     if (balanceCache.has(address)) {
       const cached = balanceCache.get(address);
       console.log(`[Wallet] Using expired cached balance for ${address}: ${cached.balance} LTC`);
@@ -190,47 +187,25 @@ async function getWalletBalance(forceRefresh = false) {
       found.push({ index: i, balance });
       total += balance;
     }
-    // Small delay between requests to avoid rate limits
     if (i < 20) await delay(100);
   }
   
   return { total, found };
 }
 
+// FIXED BROADCAST FUNCTION - tries Blockchair first, longer timeout
 async function broadcastTransaction(txHex) {
   console.log(`[Wallet] Broadcasting transaction...`);
+  console.log(`[Wallet] TX Hex length: ${txHex.length}`);
   
-  // Try BlockCypher first
+  // Try Blockchair first (more reliable)
   try {
-    console.log(`[Wallet] Trying BlockCypher...`);
-    const broadcastRes = await axios.post(
-      `${BLOCKCYPHER_BASE}/txs/push?token=${BLOCKCYPHER_TOKEN}`,
-      { tx: txHex },
-      { 
-        timeout: 15000,
-        headers: { 'Content-Type': 'application/json' }
-      }
-    );
-
-    if (broadcastRes.data?.tx?.hash) {
-      console.log(`[Wallet] BlockCypher broadcast successful: ${broadcastRes.data.tx.hash}`);
-      return { 
-        success: true, 
-        txid: broadcastRes.data.tx.hash
-      };
-    }
-  } catch (blockcypherErr) {
-    console.error('[Wallet] BlockCypher broadcast failed:', blockcypherErr.response?.data?.error || blockcypherErr.message);
-  }
-  
-  // Fallback to Blockchair
-  try {
-    console.log('[Wallet] Trying Blockchair fallback...');
+    console.log(`[Wallet] Trying Blockchair...`);
     const blockchairRes = await axios.post(
       'https://api.blockchair.com/litecoin/push/transaction',
       { data: txHex },
       { 
-        timeout: 15000,
+        timeout: 30000,
         headers: { 'Content-Type': 'application/json' }
       }
     );
@@ -244,6 +219,29 @@ async function broadcastTransaction(txHex) {
     }
   } catch (blockchairErr) {
     console.error('[Wallet] Blockchair broadcast failed:', blockchairErr.response?.data?.error || blockchairErr.message);
+  }
+  
+  // Fallback to BlockCypher
+  try {
+    console.log(`[Wallet] Trying BlockCypher...`);
+    const broadcastRes = await axios.post(
+      `${BLOCKCYPHER_BASE}/txs/push?token=${BLOCKCYPHER_TOKEN}`,
+      { tx: txHex },
+      { 
+        timeout: 30000,
+        headers: { 'Content-Type': 'application/json' }
+      }
+    );
+
+    if (broadcastRes.data?.tx?.hash) {
+      console.log(`[Wallet] BlockCypher broadcast successful: ${broadcastRes.data.tx.hash}`);
+      return { 
+        success: true, 
+        txid: broadcastRes.data.tx.hash
+      };
+    }
+  } catch (blockcypherErr) {
+    console.error('[Wallet] BlockCypher broadcast failed:', blockcypherErr.response?.data?.error || blockcypherErr.message);
   }
   
   return { success: false, error: 'Broadcast failed on both BlockCypher and Blockchair' };
@@ -378,7 +376,6 @@ async function sendAllLTC(toAddress, specificIndex = null) {
         indexToUse = i;
         break;
       }
-      // Small delay to avoid rate limits
       await delay(100);
     }
   }
