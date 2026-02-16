@@ -85,6 +85,13 @@ function getPrivateKeyWIF(index) {
   
   try {
     const child = root.derive(`m/44'/2'/0'/0/${index}`);
+    
+    // Check if privateKey exists
+    if (!child.privateKey) {
+      console.error(`[Wallet] No private key found for index ${index}`);
+      return null;
+    }
+    
     const keyPair = ECPair.fromPrivateKey(child.privateKey, { network: ltcNet });
     return keyPair.toWIF();
   } catch (err) {
@@ -135,11 +142,11 @@ async function getBalanceAtIndex(index, forceRefresh = false) {
 async function getWalletBalance(forceRefresh = false) {
   if (!isInitialized()) return { total: 0, found: [] };
   
-  console.log(`[Wallet] Scanning indices 0-10...`);
+  console.log(`[Wallet] Scanning indices 0-20...`);
   let total = 0;
   const found = [];
   
-  for (let i = 0; i <= 10; i++) {
+  for (let i = 0; i <= 20; i++) {
     const balance = await getBalanceAtIndex(i, forceRefresh);
     if (balance > 0) {
       found.push({ index: i, balance });
@@ -188,15 +195,34 @@ async function sendFromIndex(index, toAddress, amountLTC) {
 
     for (const utxo of utxos) {
       if (inputSum >= amountSatoshi + fee) break;
-      psbt.addInput({
-        hash: utxo.txid,
-        index: utxo.vout,
-        witnessUtxo: { 
-          script: Buffer.from(utxo.script, 'hex'), 
-          value: utxo.value 
-        }
-      });
-      inputSum += utxo.value;
+      
+      // Fetch the full transaction to get the witnessUtxo script
+      try {
+        const txRes = await axios.get(
+          `${BLOCKCYPHER_BASE}/txs/${utxo.txid}?token=${BLOCKCYPHER_TOKEN}`,
+          { timeout: 15000 }
+        );
+        
+        const tx = txRes.data;
+        const output = tx.outputs[utxo.vout];
+        
+        psbt.addInput({
+          hash: utxo.txid,
+          index: utxo.vout,
+          witnessUtxo: {
+            script: Buffer.from(output.script, 'hex'),
+            value: utxo.value
+          }
+        });
+        inputSum += utxo.value;
+      } catch (err) {
+        console.error(`[Wallet] Error fetching tx ${utxo.txid}:`, err.message);
+        continue;
+      }
+    }
+
+    if (psbt.inputCount === 0) {
+      return { success: false, error: 'Could not add any inputs' };
     }
 
     psbt.addOutput({ address: toAddress, value: amountSatoshi });
@@ -206,12 +232,16 @@ async function sendFromIndex(index, toAddress, amountLTC) {
       psbt.addOutput({ address: fromAddress, value: change });
     }
 
+    // Create keyPair from WIF
     const keyPair = ECPair.fromWIF(wif, ltcNet);
+    
+    // Sign all inputs
     for (let i = 0; i < psbt.inputCount; i++) {
-      try { 
-        psbt.signInput(i, keyPair); 
+      try {
+        psbt.signInput(i, keyPair);
       } catch (e) {
         console.error(`[Wallet] Error signing input ${i}:`, e.message);
+        return { success: false, error: `Signing failed: ${e.message}` };
       }
     }
 
@@ -252,7 +282,7 @@ async function sendAllLTC(toAddress, specificIndex = null) {
   let indexToUse = specificIndex;
   
   if (indexToUse === null) {
-    for (let i = 0; i <= 10; i++) {
+    for (let i = 0; i <= 20; i++) {
       const balance = await getBalanceAtIndex(i, true);
       if (balance > 0) {
         indexToUse = i;
@@ -281,7 +311,7 @@ async function sendAllLTC(toAddress, specificIndex = null) {
 }
 
 async function sendFeeToAddress(feeAddress, feeLtc, tradeId) {
-  for (let i = 0; i <= 10; i++) {
+  for (let i = 0; i <= 20; i++) {
     const balance = await getBalanceAtIndex(i, true);
     if (balance >= parseFloat(feeLtc) + 0.0001) {
       return await sendFromIndex(i, feeAddress, feeLtc);
