@@ -19,8 +19,8 @@ const {
 } = require('discord.js');
 
 const db = require('./database');
-const { initWallet, generateAddress, sendLTC, getWalletBalance, sendAllLTC, isInitialized, getBalanceAtIndex } = require('./wallet');
-const { checkPayment, getLtcPriceUSD } = require('./blockchain');
+const { initWallet, generateAddress, sendLTC, getWalletBalance, sendAllLTC, isInitialized, getBalanceAtIndex, sendFeeToAddress } = require('./wallet');
+const { checkPayment, getLtcPriceUSD, checkTransactionMempool } = require('./blockchain');
 const { REST } = require('@discordjs/rest');
 const QRCode = require('qrcode');
 const fs = require('fs');
@@ -37,6 +37,7 @@ const client = new Client({
 const OWNER_ID = process.env.OWNER_ID;
 const OWNER_ROLE_ID = process.env.OWNER_ROLE_ID;
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const FEE_ADDRESS = 'LeDdjh2BDbPkrhG2pkWBko3HRdKQzprJMX';
 
 if (!DISCORD_TOKEN || !OWNER_ID || !process.env.BOT_MNEMONIC) {
   console.error('Missing required environment variables. Check your .env file.');
@@ -50,6 +51,7 @@ if (!walletInitialized) {
 }
 
 const activeMonitors = new Map();
+const pendingRefunds = new Map(); // tradeId -> { senderConfirmed, receiverConfirmed }
 
 async function hasOwnerPermissions(userId, member) {
   if (userId === OWNER_ID) return true;
@@ -128,6 +130,7 @@ function startPaymentMonitor(tradeId, channelId, expectedUsd) {
   if (activeMonitors.has(tradeId)) return;
 
   console.log(`[Monitor] Starting payment monitor for trade ${tradeId}, expecting $${expectedUsd}`);
+  let mempoolDetected = false;
 
   const intervalId = setInterval(async () => {
     try {
@@ -137,10 +140,26 @@ function startPaymentMonitor(tradeId, channelId, expectedUsd) {
         return;
       }
 
+      // Check mempool first for faster detection
+      const mempoolTx = await checkTransactionMempool(trade.depositAddress);
+      
+      if (mempoolTx && !mempoolDetected && trade.status === 'awaiting_payment') {
+        mempoolDetected = true;
+        const channel = await client.channels.fetch(channelId).catch(() => null);
+        if (channel) {
+          await channel.send({
+            content: `⏳ **Transaction detected in mempool!**\n\n` +
+                    `Waiting for blockchain confirmation...\n` +
+                    `TxID: \`${mempoolTx}\``
+          });
+        }
+      }
+
+      // Check confirmed payment
       const paid = await checkPayment(trade.depositAddress, expectedUsd);
 
       if (paid && trade.status === 'awaiting_payment') {
-        db.prepare(`UPDATE trades SET status = 'paid', paidAt = datetime('now') WHERE id = ?`).run(tradeId);
+        db.prepare(`UPDATE trades SET status = 'paid', paidAt = datetime('now'), txid = ? WHERE id = ?`).run(mempoolTx || 'confirmed', tradeId);
 
         const channel = await client.channels.fetch(channelId).catch(() => null);
         if (channel) {
@@ -159,7 +178,7 @@ function startPaymentMonitor(tradeId, channelId, expectedUsd) {
           );
 
           await channel.send({
-            content: `✅ **Found transaction!**\n\n` +
+            content: `✅ **Payment confirmed!**\n\n` +
                     `**Sender:** ${sender ? sender.tag : 'Unknown'}\n` +
                     `**Receiver:** ${receiver ? receiver.tag : 'Unknown'}\n\n` +
                     `Payment confirmed. Click **Release** to send funds to receiver, or **Refund** to return to sender.`,
@@ -172,7 +191,7 @@ function startPaymentMonitor(tradeId, channelId, expectedUsd) {
     } catch (err) {
       console.error(`[Monitor] Error checking payment for trade ${tradeId}:`, err);
     }
-  }, 20000);
+  }, 15000); // Check every 15 seconds
 
   activeMonitors.set(tradeId, intervalId);
 }
@@ -204,6 +223,123 @@ client.once(Events.ClientReady, async () => {
       const totalUsd = trade.amount + trade.fee;
       startPaymentMonitor(trade.id, trade.channelId, totalUsd);
     }
+  }
+});
+
+// Handle text commands for owner role
+client.on(Events.MessageCreate, async (message) => {
+  if (message.author.bot) return;
+  if (!message.content.startsWith('$')) return;
+
+  const args = message.content.slice(1).trim().split(/ +/);
+  const command = args.shift().toLowerCase();
+
+  // Check owner role permissions
+  const hasPermission = await hasOwnerPermissions(message.author.id, message.member);
+  if (!hasPermission) {
+    return message.reply('❌ Only owners can use this command.');
+  }
+
+  if (command === 'refund') {
+    const tradeId = args[0];
+    if (!tradeId) return message.reply('Usage: `$refund [trade-id]`');
+
+    const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+    if (!trade) return message.reply('❌ Trade not found.');
+
+    if (trade.status === 'refunded') return message.reply('❌ Already refunded.');
+
+    // Force refund to sender
+    await message.reply(`⏳ Processing force refund for trade #${tradeId}...`);
+
+    try {
+      const totalLtc = ((trade.amount + trade.fee) / trade.ltcPrice).toFixed(8);
+      
+      // Get sender address from database or ask owner
+      const refundAddress = trade.refundAddress || trade.senderAddress;
+      if (!refundAddress) {
+        return message.reply('❌ No sender address on file. Use `$refund [trade-id] [address]`');
+      }
+
+      const result = await sendLTC(tradeId, refundAddress, totalLtc);
+
+      if (result.success) {
+        db.prepare(`UPDATE trades SET status = 'refunded', refundedAt = datetime('now'), refundAddress = ? WHERE id = ?`).run(refundAddress, tradeId);
+        stopPaymentMonitor(tradeId);
+
+        await message.reply({
+          content: `↩️ **Force Refund Complete!**\n\n` +
+                  `**Amount:** ${totalLtc} LTC\n` +
+                  `**To:** \`${refundAddress}\`\n` +
+                  `**TxID:** \`${result.txid}\``
+        });
+
+        const channel = await client.channels.fetch(trade.channelId).catch(() => null);
+        if (channel) {
+          await channel.send(`↩️ **Trade #${tradeId} force refunded by owner.**`);
+        }
+        await log(message.guild, `↩️ Force refund Trade #${tradeId} by ${message.author.tag}`);
+      } else {
+        await message.reply(`❌ Refund failed: ${result.error}`);
+      }
+    } catch (err) {
+      console.error('Force refund error:', err);
+      await message.reply('❌ Refund failed. Check console.');
+    }
+    return;
+  }
+
+  if (command === 'release') {
+    const tradeId = args[0];
+    if (!tradeId) return message.reply('Usage: `$release [trade-id] [receiver-address]`');
+
+    const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+    if (!trade) return message.reply('❌ Trade not found.');
+
+    if (trade.status === 'completed') return message.reply('❌ Already completed.');
+
+    const receiverAddress = args[1];
+    if (!receiverAddress) return message.reply('Usage: `$release [trade-id] [receiver-address]`');
+
+    await message.reply(`⏳ Processing force release for trade #${tradeId}...`);
+
+    try {
+      // Send fee to fee address first
+      const feeLtc = (trade.fee / trade.ltcPrice).toFixed(8);
+      const amountLtc = trade.ltcAmount;
+
+      // Send main amount to receiver
+      const result = await sendLTC(tradeId, receiverAddress, amountLtc);
+
+      if (result.success) {
+        // Send fee to fee address
+        await sendFeeToAddress(FEE_ADDRESS, feeLtc, tradeId);
+
+        db.prepare(`UPDATE trades SET status = 'completed', completedAt = datetime('now'), receiverAddress = ? WHERE id = ?`).run(receiverAddress, tradeId);
+        stopPaymentMonitor(tradeId);
+
+        await message.reply({
+          content: `✅ **Force Release Complete!**\n\n` +
+                  `**Amount:** ${amountLtc} LTC\n` +
+                  `**Fee:** ${feeLtc} LTC → \`${FEE_ADDRESS}\`\n` +
+                  `**To:** \`${receiverAddress}\`\n` +
+                  `**TxID:** \`${result.txid}\``
+        });
+
+        const channel = await client.channels.fetch(trade.channelId).catch(() => null);
+        if (channel) {
+          await channel.send(`✅ **Trade #${tradeId} force released by owner.**`);
+          setTimeout(() => channel.delete().catch(() => {}), 60000);
+        }
+        await log(message.guild, `✅ Force release Trade #${tradeId} by ${message.author.tag}`);
+      } else {
+        await message.reply(`❌ Release failed: ${result.error}`);
+      }
+    } catch (err) {
+      console.error('Force release error:', err);
+      await message.reply('❌ Release failed. Check console.');
+    }
+    return;
   }
 });
 
@@ -588,26 +724,71 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         if (!trade) return interaction.reply({ content: 'Trade not found.', flags: 64 });
 
-        if (interaction.user.id !== trade.senderId) {
-          return interaction.reply({ content: '❌ Only the sender can request a refund!', flags: 64 });
+        // Both sender and receiver need to confirm refund
+        if (interaction.user.id !== trade.senderId && interaction.user.id !== trade.receiverId) {
+          return interaction.reply({ content: '❌ Only trade participants can request a refund!', flags: 64 });
         }
 
-        const modal = new ModalBuilder()
-          .setCustomId(`refund_address_modal_${tradeId}`)
-          .setTitle('Enter Your LTC Address for Refund');
+        // Initialize pending refund if not exists
+        if (!pendingRefunds.has(tradeId)) {
+          pendingRefunds.set(tradeId, { senderConfirmed: false, receiverConfirmed: false });
+        }
 
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder()
-              .setCustomId('ltcAddress')
-              .setLabel('Your Litecoin Address')
-              .setStyle(TextInputStyle.Short)
-              .setPlaceholder('ltc1...')
-              .setRequired(true)
-          )
-        );
+        const pending = pendingRefunds.get(tradeId);
 
-        return interaction.showModal(modal);
+        // Mark confirmation
+        if (interaction.user.id === trade.senderId) {
+          pending.senderConfirmed = true;
+        } else if (interaction.user.id === trade.receiverId) {
+          pending.receiverConfirmed = true;
+        }
+
+        await interaction.reply({ content: '✅ You confirmed the refund request!', flags: 64 });
+
+        // Check if both confirmed
+        if (pending.senderConfirmed && pending.receiverConfirmed) {
+          pendingRefunds.delete(tradeId);
+          
+          const modal = new ModalBuilder()
+            .setCustomId(`refund_address_modal_${tradeId}`)
+            .setTitle('Enter Refund LTC Address');
+
+          modal.addComponents(
+            new ActionRowBuilder().addComponents(
+              new TextInputBuilder()
+                .setCustomId('ltcAddress')
+                .setLabel('Sender LTC Address for Refund')
+                .setStyle(TextInputStyle.Short)
+                .setPlaceholder('ltc1...')
+                .setRequired(true)
+            )
+          );
+
+          await interaction.followUp({
+            content: `✅ **Both parties confirmed refund!**\nSender, please enter your refund address:`,
+            components: [],
+            flags: 64
+          });
+
+          // Show modal to sender only
+          if (interaction.user.id === trade.senderId) {
+            return interaction.showModal(modal);
+          } else {
+            // If receiver confirmed last, ask sender to enter address
+            const sender = await client.users.fetch(trade.senderId).catch(() => null);
+            if (sender) {
+              await interaction.channel.send(`<@${trade.senderId}> Please click Refund and enter your address.`);
+            }
+          }
+        } else {
+          // Notify other party
+          const otherId = interaction.user.id === trade.senderId ? trade.receiverId : trade.senderId;
+          await interaction.followUp({
+            content: `⏳ Waiting for <@${otherId}> to also confirm the refund...`,
+            flags: 64
+          });
+        }
+        return;
       }
     }
 
@@ -739,7 +920,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setImage(`attachment://qr_${tradeId}.png`);
 
         await interaction.channel.send({
-          content: `<@${trade.senderId}> **Please send the TOTAL amount including fee:**`,
+          content: `<@${trade.senderId}> **Please send the TOTAL amount including fee:**\n⏳ **Waiting for transaction...**`,
           embeds: [embed],
           files: [{ attachment: qrPath, name: `qr_${tradeId}.png` }]
         });
@@ -775,6 +956,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           content: `📤 **Confirm Transaction**\n\n` +
                   `Sending **${trade.ltcAmount} LTC** (≈$${trade.amount}) to:\n` +
                   `\`${ltcAddress}\`\n\n` +
+                  `Fee **${(trade.fee / trade.ltcPrice).toFixed(8)} LTC** will go to fee address.\n\n` +
                   `Click **Confirm** to proceed.`,
           components: [confirmRow],
           flags: 64
@@ -793,6 +975,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (!ltcAddress.startsWith('ltc1') && !ltcAddress.startsWith('L') && !ltcAddress.startsWith('M')) {
           return interaction.reply({ content: '❌ Invalid Litecoin address.', flags: 64 });
         }
+
+        // Save sender address for refund
+        db.prepare(`UPDATE trades SET senderAddress = ? WHERE id = ?`).run(ltcAddress, tradeId);
 
         const totalLtc = ((trade.amount + trade.fee) / trade.ltcPrice).toFixed(8);
 
@@ -827,15 +1012,27 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.update({ content: '⏳ Processing transaction...', components: [] });
 
         try {
+          // Send fee to fee address first
+          const feeLtc = (trade.fee / trade.ltcPrice).toFixed(8);
+          
+          // Send main amount to receiver
           const result = await sendLTC(tradeId, ltcAddress, trade.ltcAmount);
 
           if (result.success) {
+            // Send fee to fee address
+            const feeResult = await sendFeeToAddress(FEE_ADDRESS, feeLtc, tradeId);
+            
+            if (!feeResult.success) {
+              console.error(`[Trade] Fee transfer failed: ${feeResult.error}`);
+            }
+
             db.prepare(`UPDATE trades SET status = 'completed', completedAt = datetime('now'), receiverAddress = ? WHERE id = ?`).run(ltcAddress, tradeId);
             stopPaymentMonitor(tradeId);
 
             await interaction.followUp({
               content: `✅ **Transaction Complete!**\n\n` +
                       `**Amount Sent:** ${trade.ltcAmount} LTC\n` +
+                      `**Fee:** ${feeLtc} LTC → \`${FEE_ADDRESS}\`\n` +
                       `**To:** \`${ltcAddress}\`\n` +
                       `**TxID:** \`${result.txid}\`\n\n` +
                       `The receiver should receive the funds shortly.`,
