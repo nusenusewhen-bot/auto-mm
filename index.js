@@ -416,11 +416,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         let indexToUse = specificIndex;
         
-        // FIXED: Use cache first (false), not forceRefresh (true)
         if (indexToUse === null) {
           console.log(`[Send] Auto-detecting funded index (using cache)...`);
           for (let i = 0; i <= 20; i++) {
-            const balance = await getBalanceAtIndex(i, false); // CHANGED: false instead of true
+            const balance = await getBalanceAtIndex(i, false);
             if (balance > 0) {
               indexToUse = i;
               console.log(`[Send] Found funds at index ${i}: ${balance} LTC`);
@@ -429,7 +428,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
           }
         }
         
-        // If not found in cache, try with forceRefresh as fallback
         if (indexToUse === null) {
           console.log(`[Send] Retrying with force refresh...`);
           for (let i = 0; i <= 20; i++) {
@@ -446,8 +444,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return interaction.editReply({ content: '❌ No funded addresses found (checked indices 0-20). Use /balance to see all indices, or specify an index: /send address:YOUR_ADDRESS index:1' });
         }
 
-        // FIXED: Use cache for this check too
-        const balance = await getBalanceAtIndex(indexToUse, false); // CHANGED: false instead of true
+        const balance = await getBalanceAtIndex(indexToUse, false);
         console.log(`[Send] Index ${indexToUse} balance: ${balance} LTC`);
 
         if (!balance || balance <= 0) {
@@ -623,6 +620,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
+      // FIXED ROLE SELECTION - Users can switch roles by clicking the other button
       if (interaction.customId.startsWith('role_sending_')) {
         const tradeId = interaction.customId.split('_')[2];
         const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
@@ -633,13 +631,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return interaction.reply({ content: '❌ You are not part of this trade.', flags: MessageFlags.Ephemeral });
         }
 
-        if (trade.senderId && trade.senderId !== interaction.user.id) {
-          return interaction.reply({ content: '❌ Sending role already taken!', flags: MessageFlags.Ephemeral });
-        }
+        // Allow switching roles - if already receiver, switch to sender
+        db.prepare(`UPDATE trades SET senderId = ?, receiverId = CASE WHEN receiverId = ? THEN NULL ELSE receiverId END WHERE id = ?`).run(interaction.user.id, interaction.user.id, tradeId);
 
-        db.prepare(`UPDATE trades SET senderId = ? WHERE id = ?`).run(interaction.user.id, tradeId);
-
-        await interaction.reply({ content: `✅ <@${interaction.user.id}> selected **Sending** (will pay LTC)!` });
+        await interaction.reply({ content: `✅ <@${interaction.user.id}> is now the **Sender** (will pay LTC)!` });
 
         const updated = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
         if (updated.senderId && updated.receiverId) {
@@ -658,13 +653,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return interaction.reply({ content: '❌ You are not part of this trade.', flags: MessageFlags.Ephemeral });
         }
 
-        if (trade.receiverId && trade.receiverId !== interaction.user.id) {
-          return interaction.reply({ content: '❌ Receiving role already taken!', flags: MessageFlags.Ephemeral });
-        }
+        // Allow switching roles - if already sender, switch to receiver
+        db.prepare(`UPDATE trades SET receiverId = ?, senderId = CASE WHEN senderId = ? THEN NULL ELSE senderId END WHERE id = ?`).run(interaction.user.id, interaction.user.id, tradeId);
 
-        db.prepare(`UPDATE trades SET receiverId = ? WHERE id = ?`).run(interaction.user.id, tradeId);
-
-        await interaction.reply({ content: `✅ <@${interaction.user.id}> selected **Receiving** (will get LTC)!` });
+        await interaction.reply({ content: `✅ <@${interaction.user.id}> is now the **Receiver** (will get LTC)!` });
 
         const updated = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
         if (updated.senderId && updated.receiverId) {
