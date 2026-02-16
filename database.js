@@ -1,6 +1,7 @@
 const Database = require('better-sqlite3');
 const db = new Database('database.db');
 
+// Create trades table if not exists
 db.prepare(`
 CREATE TABLE IF NOT EXISTS trades (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -22,8 +23,23 @@ CREATE TABLE IF NOT EXISTS trades (
   status TEXT DEFAULT 'role_selection',
   createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
   paidAt DATETIME,
-  completedAt DATETIME
+  completedAt DATETIME,
+  youGiving TEXT,
+  theyGiving TEXT
 )`).run();
+
+// Add new columns if they don't exist (for existing databases)
+try {
+  db.prepare("ALTER TABLE trades ADD COLUMN youGiving TEXT").run();
+} catch(e) {
+  // Column already exists
+}
+
+try {
+  db.prepare("ALTER TABLE trades ADD COLUMN theyGiving TEXT").run();
+} catch(e) {
+  // Column already exists
+}
 
 db.prepare(`
 CREATE TABLE IF NOT EXISTS config (
