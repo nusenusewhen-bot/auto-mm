@@ -41,6 +41,7 @@ try {
   // Column already exists
 }
 
+// Log channel table
 db.prepare(`
 CREATE TABLE IF NOT EXISTS config (
   key TEXT PRIMARY KEY,
