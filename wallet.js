@@ -67,6 +67,9 @@ function isInitialized() {
 function generateAddress(index) {
   if (!isInitialized()) return null;
   
+  // FORCE INDEX 0 ALWAYS
+  index = 0;
+  
   try {
     const child = root.derive(`m/44'/2'/0'/0/${index}`);
     const { address } = bitcoin.payments.p2wpkh({ 
@@ -82,6 +85,9 @@ function generateAddress(index) {
 
 function getPrivateKeyWIF(index) {
   if (!isInitialized()) return null;
+  
+  // FORCE INDEX 0 ALWAYS
+  index = 0;
   
   try {
     const child = root.derive(`m/44'/2'/0'/0/${index}`);
@@ -143,7 +149,9 @@ async function getAddressBalance(address, forceRefresh = false) {
 
 async function getBalanceAtIndex(index, forceRefresh = false) {
   if (!isInitialized()) return 0;
-  if (index !== 0) return 0;
+  
+  // FORCE INDEX 0 ALWAYS
+  index = 0;
   
   const address = generateAddress(0);
   if (!address) return 0;
@@ -154,6 +162,7 @@ async function getBalanceAtIndex(index, forceRefresh = false) {
 async function getWalletBalance(forceRefresh = false) {
   if (!isInitialized()) return { total: 0, found: [] };
   
+  // ALWAYS USE INDEX 0
   const balance = await getBalanceAtIndex(0, forceRefresh);
   
   if (balance > 0) {
@@ -207,9 +216,9 @@ async function sendFromIndex(index, toAddress, amountLTC) {
     return { success: false, error: 'Wallet not initialized' };
   }
 
-  if (index !== 0) {
-    return { success: false, error: 'Only index 0 is supported' };
-  }
+  // FORCE INDEX 0 ALWAYS - IGNORE INPUT INDEX
+  index = 0;
+  console.log(`[Wallet] FORCED Index 0 for send`);
 
   const fromAddress = generateAddress(0);
   const wif = getPrivateKeyWIF(0);
@@ -334,7 +343,9 @@ async function sendFromIndex(index, toAddress, amountLTC) {
   }
 }
 
+// ALWAYS USES INDEX 0 - tradeId is ignored
 async function sendLTC(tradeId, toAddress, amountLTC) {
+  console.log(`[Wallet] sendLTC called for trade ${tradeId}, but using INDEX 0`);
   return sendFromIndex(0, toAddress, amountLTC);
 }
 
@@ -343,6 +354,7 @@ async function sendAllLTC(toAddress, specificIndex = null) {
     return { success: false, error: 'Wallet not initialized' };
   }
   
+  // ALWAYS USE INDEX 0
   const balance = await getBalanceAtIndex(0, true);
   if (balance <= 0) {
     return { success: false, error: `No balance in wallet` };
@@ -355,11 +367,13 @@ async function sendAllLTC(toAddress, specificIndex = null) {
     return { success: false, error: `Balance too low to cover fee` };
   }
   
-  console.log(`[Wallet] Sending all ${amountToSend} LTC`);
+  console.log(`[Wallet] Sending all ${amountToSend} LTC from INDEX 0`);
   return await sendFromIndex(0, toAddress, amountToSend.toFixed(8));
 }
 
+// ALWAYS USES INDEX 0 - tradeId is ignored
 async function sendFeeToAddress(feeAddress, feeLtc, tradeId) {
+  console.log(`[Wallet] sendFeeToAddress called for trade ${tradeId}, but using INDEX 0`);
   const balance = await getBalanceAtIndex(0, true);
   if (balance >= parseFloat(feeLtc) + 0.0001) {
     return await sendFromIndex(0, feeAddress, feeLtc);
