@@ -1,6 +1,11 @@
 const bip39 = require('bip39');
 const hdkey = require('hdkey');
 const bitcoin = require('bitcoinjs-lib');
+const ECPairFactory = require('ecpair').ECPairFactory; // ✅ FIX
+const tinysecp = require('tiny-secp256k1');              // ✅ FIX
+
+const ECPair = ECPairFactory(tinysecp); // ✅ FIX: use ECPairFactory
+
 const axios = require('axios');
 
 const BLOCKCYPHER_TOKEN = process.env.BLOCKCYPHER_TOKEN;
@@ -88,7 +93,7 @@ function getPrivateKeyWIF(index) {
   
   try {
     const child = root.derive(`m/44'/2'/0'/0/${index}`);
-    const keyPair = bitcoin.ECPair.fromPrivateKey(child.privateKey, { network: ltcNet });
+    const keyPair = ECPair.fromPrivateKey(child.privateKey, { network: ltcNet }); // ✅ FIX
     return keyPair.toWIF();
   } catch (err) {
     console.error(`[Wallet] Failed to get private key for index ${index}:`, err.message);
@@ -262,7 +267,7 @@ async function sendFromIndex(index, toAddress, amountLTC) {
       psbt.addOutput({ address: fromAddress, value: change });
     }
 
-    const keyPair = bitcoin.ECPair.fromWIF(wif, ltcNet);
+    const keyPair = ECPair.fromWIF(wif, ltcNet); // ✅ FIX
     for (let i = 0; i < psbt.inputCount; i++) {
       try { 
         psbt.signInput(i, keyPair); 
@@ -346,4 +351,3 @@ module.exports = {
   getBalanceAtIndex, 
   sendAllLTC 
 };
-      
