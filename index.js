@@ -16,6 +16,7 @@ const {
   Routes,
   StringSelectMenuBuilder,
   StringSelectMenuOptionBuilder,
+  MessageFlags,
 } = require('discord.js');
 
 const db = require('./database');
@@ -237,14 +238,12 @@ client.on(Events.MessageCreate, async (message) => {
   }
 
   if (command === 'refund') {
-    const tradeId = args[0];
-    if (!tradeId) return message.reply('Usage: `$refund [trade-id]`');
-
-    const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
-    if (!trade) return message.reply('❌ Trade not found.');
+    const trade = db.prepare('SELECT * FROM trades WHERE channelId = ?').get(message.channel.id);
+    
+    if (!trade) return message.reply('❌ No active trade found in this channel.');
     if (trade.status === 'refunded') return message.reply('❌ Already refunded.');
 
-    await message.reply(`⏳ Processing force refund for trade #${tradeId}...`);
+    await message.reply(`⏳ Processing force refund for trade #${trade.id}...`);
 
     try {
       const totalLtc = ((trade.amount + trade.fee) / trade.ltcPrice).toFixed(8);
@@ -253,19 +252,16 @@ client.on(Events.MessageCreate, async (message) => {
         return message.reply('❌ No sender address on file.');
       }
 
-      const result = await sendLTC(tradeId, refundAddress, totalLtc);
+      const result = await sendLTC(trade.id, refundAddress, totalLtc);
 
       if (result.success) {
-        db.prepare(`UPDATE trades SET status = 'refunded', refundedAt = datetime('now'), refundAddress = ? WHERE id = ?`).run(refundAddress, tradeId);
-        stopPaymentMonitor(tradeId);
+        db.prepare(`UPDATE trades SET status = 'refunded', refundedAt = datetime('now'), refundAddress = ? WHERE id = ?`).run(refundAddress, trade.id);
+        stopPaymentMonitor(trade.id);
 
         await message.reply('↩️ **Force Refund Complete!** Amount: ' + totalLtc + ' LTC | To: `' + refundAddress + '` | TxID: `' + result.txid + '`');
 
-        const channel = await client.channels.fetch(trade.channelId).catch(() => null);
-        if (channel) {
-          await channel.send(`↩️ **Trade #${tradeId} force refunded by owner.**`);
-        }
-        await log(message.guild, `↩️ Force refund Trade #${tradeId} by ${message.author.tag}`);
+        await message.channel.send(`↩️ **Trade #${trade.id} force refunded by owner.**`);
+        await log(message.guild, `↩️ Force refund Trade #${trade.id} by ${message.author.tag}`);
       } else {
         await message.reply(`❌ Refund failed: ${result.error}`);
       }
@@ -277,37 +273,34 @@ client.on(Events.MessageCreate, async (message) => {
   }
 
   if (command === 'release') {
-    const tradeId = args[0];
-    const receiverAddress = args[1];
+    const receiverAddress = args[0];
     
-    if (!tradeId || !receiverAddress) return message.reply('Usage: `$release [trade-id] [receiver-address]`');
+    if (!receiverAddress) return message.reply('Usage: `$release [receiver-address]`');
 
-    const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
-    if (!trade) return message.reply('❌ Trade not found.');
+    const trade = db.prepare('SELECT * FROM trades WHERE channelId = ?').get(message.channel.id);
+    
+    if (!trade) return message.reply('❌ No active trade found in this channel.');
     if (trade.status === 'completed') return message.reply('❌ Already completed.');
 
-    await message.reply(`⏳ Processing force release for trade #${tradeId}...`);
+    await message.reply(`⏳ Processing force release for trade #${trade.id}...`);
 
     try {
       const feeLtc = (trade.fee / trade.ltcPrice).toFixed(8);
       const amountLtc = trade.ltcAmount;
 
-      const result = await sendLTC(tradeId, receiverAddress, amountLtc);
+      const result = await sendLTC(trade.id, receiverAddress, amountLtc);
 
       if (result.success) {
-        await sendFeeToAddress(FEE_ADDRESS, feeLtc, tradeId);
+        await sendFeeToAddress(FEE_ADDRESS, feeLtc, trade.id);
 
-        db.prepare(`UPDATE trades SET status = 'completed', completedAt = datetime('now'), receiverAddress = ? WHERE id = ?`).run(receiverAddress, tradeId);
-        stopPaymentMonitor(tradeId);
+        db.prepare(`UPDATE trades SET status = 'completed', completedAt = datetime('now'), receiverAddress = ? WHERE id = ?`).run(receiverAddress, trade.id);
+        stopPaymentMonitor(trade.id);
 
         await message.reply('✅ **Force Release Complete!** Amount: ' + amountLtc + ' LTC | Fee: ' + feeLtc + ' LTC | To: `' + receiverAddress + '` | TxID: `' + result.txid + '`');
 
-        const channel = await client.channels.fetch(trade.channelId).catch(() => null);
-        if (channel) {
-          await channel.send(`✅ **Trade #${tradeId} force released by owner.**`);
-          setTimeout(() => channel.delete().catch(() => {}), 60000);
-        }
-        await log(message.guild, `✅ Force release Trade #${tradeId} by ${message.author.tag}`);
+        await message.channel.send(`✅ **Trade #${trade.id} force released by owner.**`);
+        setTimeout(() => message.channel.delete().catch(() => {}), 60000);
+        await log(message.guild, `✅ Force release Trade #${trade.id} by ${message.author.tag}`);
       } else {
         await message.reply(`❌ Release failed: ${result.error}`);
       }
@@ -325,7 +318,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const { commandName } = interaction;
 
       if (commandName === 'debug') {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
         const hasPermission = await hasOwnerPermissions(interaction.user.id, interaction.member);
         if (!hasPermission) {
@@ -344,19 +337,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
           
           await interaction.followUp({
             content: `**API Response:**\n\`\`\`json\n${responseText}\n\`\`\``,
-            ephemeral: true
+            flags: MessageFlags.Ephemeral
           });
         } catch (err) {
           await interaction.followUp({
             content: `**Error:** ${err.message}`,
-            ephemeral: true
+            flags: MessageFlags.Ephemeral
           });
         }
         return;
       }
 
       if (commandName === 'balance') {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
         const hasPermission = await hasOwnerPermissions(interaction.user.id, interaction.member);
         if (!hasPermission) {
@@ -400,7 +393,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if (commandName === 'send') {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
         if (!isInitialized()) {
           return interaction.editReply({ content: '❌ Wallet not initialized.' });
@@ -475,55 +468,55 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       if (commandName === 'logchannel') {
         if (interaction.user.id !== OWNER_ID) {
-          return interaction.reply({ content: '❌ Only owner can use this.', ephemeral: true });
+          return interaction.reply({ content: '❌ Only owner can use this.', flags: MessageFlags.Ephemeral });
         }
 
         const id = interaction.options.getString('channelid');
         const channel = await interaction.guild.channels.fetch(id).catch(() => null);
 
         if (!channel) {
-          return interaction.reply({ content: '❌ Invalid channel ID.', ephemeral: true });
+          return interaction.reply({ content: '❌ Invalid channel ID.', flags: MessageFlags.Ephemeral });
         }
 
         db.prepare(`INSERT OR REPLACE INTO config(key,value) VALUES('logChannel',?)`).run(id);
-        return interaction.reply({ content: `✅ Log channel set to ${channel}.`, ephemeral: true });
+        return interaction.reply({ content: `✅ Log channel set to ${channel}.`, flags: MessageFlags.Ephemeral });
       }
 
       if (commandName === 'setfee') {
         if (interaction.user.id !== OWNER_ID) {
-          return interaction.reply({ content: '❌ Only owner can use this.', ephemeral: true });
+          return interaction.reply({ content: '❌ Only owner can use this.', flags: MessageFlags.Ephemeral });
         }
 
         const percent = interaction.options.getNumber('percentage');
         if (percent < 0 || percent > 50) {
-          return interaction.reply({ content: '❌ Fee must be between 0% and 50%.', ephemeral: true });
+          return interaction.reply({ content: '❌ Fee must be between 0% and 50%.', flags: MessageFlags.Ephemeral });
         }
 
         db.prepare(`INSERT OR REPLACE INTO config(key,value) VALUES('feePercent',?)`).run(percent.toString());
-        return interaction.reply({ content: `✅ Fee set to ${percent}%.`, ephemeral: true });
+        return interaction.reply({ content: `✅ Fee set to ${percent}%.`, flags: MessageFlags.Ephemeral });
       }
 
       if (commandName === 'check') {
         if (interaction.user.id !== OWNER_ID) {
-          return interaction.reply({ content: '❌ Only owner can use this.', ephemeral: true });
+          return interaction.reply({ content: '❌ Only owner can use this.', flags: MessageFlags.Ephemeral });
         }
 
         const tradeId = interaction.options.getString('tradeid');
         const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
         if (!trade) {
-          return interaction.reply({ content: '❌ Trade not found.', ephemeral: true });
+          return interaction.reply({ content: '❌ Trade not found.', flags: MessageFlags.Ephemeral });
         }
 
-        await interaction.reply({ content: `🔍 Checking trade #${tradeId}...`, ephemeral: true });
+        await interaction.reply({ content: `🔍 Checking trade #${tradeId}...`, flags: MessageFlags.Ephemeral });
 
         const totalUsd = trade.amount + trade.fee;
         const paid = await checkPayment(trade.depositAddress, totalUsd);
 
         if (paid) {
-          await interaction.followUp({ content: `✅ Payment detected for trade #${tradeId}!`, ephemeral: true });
+          await interaction.followUp({ content: `✅ Payment detected for trade #${tradeId}!`, flags: MessageFlags.Ephemeral });
         } else {
-          await interaction.followUp({ content: `❌ No payment yet for trade #${tradeId}. Address: \`${trade.depositAddress}\` Expected: $${totalUsd.toFixed(4)}`, ephemeral: true });
+          await interaction.followUp({ content: `❌ No payment yet for trade #${tradeId}. Address: \`${trade.depositAddress}\` Expected: $${totalUsd.toFixed(4)}`, flags: MessageFlags.Ephemeral });
         }
         return;
       }
@@ -619,14 +612,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const tradeId = interaction.customId.split('_')[2];
         const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
-        if (!trade) return interaction.reply({ content: 'Trade not found.', ephemeral: true });
+        if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
 
         if (interaction.user.id !== trade.user1Id && interaction.user.id !== trade.user2Id) {
-          return interaction.reply({ content: '❌ You are not part of this trade.', ephemeral: true });
+          return interaction.reply({ content: '❌ You are not part of this trade.', flags: MessageFlags.Ephemeral });
         }
 
         if (trade.senderId && trade.senderId !== interaction.user.id) {
-          return interaction.reply({ content: '❌ Sending role already taken!', ephemeral: true });
+          return interaction.reply({ content: '❌ Sending role already taken!', flags: MessageFlags.Ephemeral });
         }
 
         db.prepare(`UPDATE trades SET senderId = ? WHERE id = ?`).run(interaction.user.id, tradeId);
@@ -644,14 +637,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const tradeId = interaction.customId.split('_')[2];
         const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
-        if (!trade) return interaction.reply({ content: 'Trade not found.', ephemeral: true });
+        if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
 
         if (interaction.user.id !== trade.user1Id && interaction.user.id !== trade.user2Id) {
-          return interaction.reply({ content: '❌ You are not part of this trade.', ephemeral: true });
+          return interaction.reply({ content: '❌ You are not part of this trade.', flags: MessageFlags.Ephemeral });
         }
 
         if (trade.receiverId && trade.receiverId !== interaction.user.id) {
-          return interaction.reply({ content: '❌ Receiving role already taken!', ephemeral: true });
+          return interaction.reply({ content: '❌ Receiving role already taken!', flags: MessageFlags.Ephemeral });
         }
 
         db.prepare(`UPDATE trades SET receiverId = ? WHERE id = ?`).run(interaction.user.id, tradeId);
@@ -669,10 +662,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const tradeId = interaction.customId.split('_')[2];
         const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
-        if (!trade) return interaction.reply({ content: 'Trade not found.', ephemeral: true });
+        if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
 
         if (interaction.user.id !== trade.user1Id && interaction.user.id !== trade.user2Id) {
-          return interaction.reply({ content: '❌ You are not part of this trade.', ephemeral: true });
+          return interaction.reply({ content: '❌ You are not part of this trade.', flags: MessageFlags.Ephemeral });
         }
 
         const confirmKey = interaction.user.id === trade.user1Id ? 'user1Confirmed' : 'user2Confirmed';
@@ -691,14 +684,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const tradeId = interaction.customId.split('_')[1];
         const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
-        if (!trade) return interaction.reply({ content: 'Trade not found.', ephemeral: true });
+        if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
 
         if (interaction.user.id !== trade.senderId) {
-          return interaction.reply({ content: '❌ Only the sender can initiate release!', ephemeral: true });
+          return interaction.reply({ content: '❌ Only the sender can initiate release!', flags: MessageFlags.Ephemeral });
         }
 
         if (trade.status !== 'paid') {
-          return interaction.reply({ content: '❌ Payment not confirmed yet.', ephemeral: true });
+          return interaction.reply({ content: '❌ Payment not confirmed yet.', flags: MessageFlags.Ephemeral });
         }
 
         const receiver = await client.users.fetch(trade.receiverId).catch(() => null);
@@ -721,10 +714,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const tradeId = interaction.customId.split('_')[3];
         const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
-        if (!trade) return interaction.reply({ content: 'Trade not found.', ephemeral: true });
+        if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
 
         if (interaction.user.id !== trade.receiverId) {
-          return interaction.reply({ content: '❌ Only the receiver can enter their address!', ephemeral: true });
+          return interaction.reply({ content: '❌ Only the receiver can enter their address!', flags: MessageFlags.Ephemeral });
         }
 
         const modal = new ModalBuilder()
@@ -749,10 +742,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const tradeId = interaction.customId.split('_')[1];
         const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
-        if (!trade) return interaction.reply({ content: 'Trade not found.', ephemeral: true });
+        if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
 
         if (interaction.user.id !== trade.senderId && interaction.user.id !== trade.receiverId) {
-          return interaction.reply({ content: '❌ Only trade participants can request a refund!', ephemeral: true });
+          return interaction.reply({ content: '❌ Only trade participants can request a refund!', flags: MessageFlags.Ephemeral });
         }
 
         if (!pendingRefunds.has(tradeId)) {
@@ -794,10 +787,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const tradeId = interaction.customId.split('_')[3];
         const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
-        if (!trade) return interaction.reply({ content: 'Trade not found.', ephemeral: true });
+        if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
 
         if (interaction.user.id !== trade.senderId) {
-          return interaction.reply({ content: '❌ Only the sender can enter the refund address!', ephemeral: true });
+          return interaction.reply({ content: '❌ Only the sender can enter the refund address!', flags: MessageFlags.Ephemeral });
         }
 
         const modal = new ModalBuilder()
@@ -827,11 +820,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         try {
           otherMember = await interaction.guild.members.fetch(otherUserId);
         } catch {
-          return interaction.reply({ content: '❌ Invalid user ID. User must be in this server.', ephemeral: true });
+          return interaction.reply({ content: '❌ Invalid user ID. User must be in this server.', flags: MessageFlags.Ephemeral });
         }
 
         if (otherUserId === interaction.user.id) {
-          return interaction.reply({ content: '❌ You cannot trade with yourself.', ephemeral: true });
+          return interaction.reply({ content: '❌ You cannot trade with yourself.', flags: MessageFlags.Ephemeral });
         }
 
         const tradeId = (db.prepare(`SELECT MAX(id) as maxId FROM trades`).get().maxId || 0) + 1;
@@ -861,7 +854,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         db.prepare(`INSERT INTO trades(id, channelId, user1Id, user2Id, status) VALUES(?,?,?,?,?)`).run(tradeId, channel.id, interaction.user.id, otherUserId, 'selecting_roles');
 
-        await interaction.reply({ content: `✅ Trade channel created: ${channel}`, ephemeral: true });
+        await interaction.reply({ content: `✅ Trade channel created: ${channel}`, flags: MessageFlags.Ephemeral });
 
         const embed = new EmbedBuilder()
           .setTitle('🪙 Litecoin Trade')
@@ -893,17 +886,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const tradeId = interaction.customId.split('_')[2];
         const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
-        if (!trade) return interaction.reply({ content: 'Trade not found.', ephemeral: true });
+        if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
 
         if (interaction.user.id !== trade.senderId) {
-          return interaction.reply({ content: '❌ Only the sender can enter the amount.', ephemeral: true });
+          return interaction.reply({ content: '❌ Only the sender can enter the amount.', flags: MessageFlags.Ephemeral });
         }
 
         const amountStr = interaction.fields.getTextInputValue('amount').trim();
         const amount = parseFloat(amountStr);
 
         if (isNaN(amount) || amount <= 0) {
-          return interaction.reply({ content: '❌ Invalid amount.', ephemeral: true });
+          return interaction.reply({ content: '❌ Invalid amount.', flags: MessageFlags.Ephemeral });
         }
 
         const feePercent = await getFeePercent();
@@ -918,7 +911,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         db.prepare(`UPDATE trades SET amount = ?, fee = ?, ltcPrice = ?, ltcAmount = ?, totalLtc = ?, depositAddress = ?, status = 'awaiting_payment' WHERE id = ?`).run(amount, fee, ltcPrice, ltcAmount, totalLtc, depositAddress, tradeId);
 
-        await interaction.reply({ content: '✅ Amount set! Generating invoice...', ephemeral: true });
+        await interaction.reply({ content: '✅ Amount set! Generating invoice...', flags: MessageFlags.Ephemeral });
 
         const qrPath = path.join(__dirname, 'temp', `qr_${tradeId}.png`);
         if (!fs.existsSync(path.join(__dirname, 'temp'))) {
@@ -960,12 +953,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const tradeId = interaction.customId.split('_')[3];
         const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
-        if (!trade) return interaction.reply({ content: 'Trade not found.', ephemeral: true });
+        if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
 
         const ltcAddress = interaction.fields.getTextInputValue('ltcAddress').trim();
 
         if (!ltcAddress.startsWith('ltc1') && !ltcAddress.startsWith('L') && !ltcAddress.startsWith('M')) {
-          return interaction.reply({ content: '❌ Invalid Litecoin address.', ephemeral: true });
+          return interaction.reply({ content: '❌ Invalid Litecoin address.', flags: MessageFlags.Ephemeral });
         }
 
         pendingReleases.set(tradeId, { 
@@ -995,12 +988,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const tradeId = interaction.customId.split('_')[3];
         const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
-        if (!trade) return interaction.reply({ content: 'Trade not found.', ephemeral: true });
+        if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
 
         const ltcAddress = interaction.fields.getTextInputValue('ltcAddress').trim();
 
         if (!ltcAddress.startsWith('ltc1') && !ltcAddress.startsWith('L') && !ltcAddress.startsWith('M')) {
-          return interaction.reply({ content: '❌ Invalid Litecoin address.', ephemeral: true });
+          return interaction.reply({ content: '❌ Invalid Litecoin address.', flags: MessageFlags.Ephemeral });
         }
 
         db.prepare(`UPDATE trades SET senderAddress = ? WHERE id = ?`).run(ltcAddress, tradeId);
@@ -1029,10 +1022,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const ltcAddress = parts[3];
         const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
-        if (!trade) return interaction.reply({ content: 'Trade not found.', ephemeral: true });
+        if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
 
         if (interaction.user.id !== trade.receiverId) {
-          return interaction.reply({ content: '❌ Only the receiver can confirm their address!', ephemeral: true });
+          return interaction.reply({ content: '❌ Only the receiver can confirm their address!', flags: MessageFlags.Ephemeral });
         }
 
         await interaction.update({ content: '⏳ Processing transaction...', components: [] });
@@ -1094,7 +1087,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const ltcAddress = parts[3];
         const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
-        if (!trade) return interaction.reply({ content: 'Trade not found.', ephemeral: true });
+        if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
 
         await interaction.update({ content: '⏳ Processing refund...', components: [] });
 
@@ -1131,9 +1124,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
     console.error('Interaction error:', err);
     try {
       if (interaction.replied || interaction.deferred) {
-        await interaction.followUp({ content: '❌ An error occurred.', ephemeral: true });
+        await interaction.followUp({ content: '❌ An error occurred.', flags: MessageFlags.Ephemeral });
       } else {
-        await interaction.reply({ content: '❌ An error occurred.', ephemeral: true });
+        await interaction.reply({ content: '❌ An error occurred.', flags: MessageFlags.Ephemeral });
       }
     } catch {}
   }
@@ -1192,10 +1185,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const tradeId = interaction.customId.split('_')[2];
     const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
-    if (!trade) return interaction.reply({ content: 'Trade not found.', ephemeral: true });
+    if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
 
     if (interaction.user.id !== trade.senderId) {
-      return interaction.reply({ content: '❌ Only the sender can enter the amount.', ephemeral: true });
+      return interaction.reply({ content: '❌ Only the sender can enter the amount.', flags: MessageFlags.Ephemeral });
     }
 
     const modal = new ModalBuilder()
