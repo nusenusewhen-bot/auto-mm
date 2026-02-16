@@ -8,7 +8,8 @@ const { getAddressUTXOs } = require('./blockchain');
 
 const ECPair = ECPairFactory(tinysecp);
 
-const BLOCKCHAIR_BASE = 'https://api.blockchair.com/litecoin';
+const BLOCKCYPHER_TOKEN = process.env.BLOCKCYPHER_TOKEN;
+const BLOCKCYPHER_BASE = 'https://api.blockcypher.com/v1/ltc/main';
 
 const ltcNet = {
   messagePrefix: '\x19Litecoin Signed Message:\n',
@@ -22,7 +23,7 @@ const ltcNet = {
 let root = null;
 let initialized = false;
 const balanceCache = new Map();
-const CACHE_DURATION = 2 * 60 * 1000;
+const CACHE_DURATION = 5 * 60 * 1000;
 
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -32,17 +33,15 @@ function initWallet(mnemonic) {
   console.log("[Wallet] Initializing wallet...");
 
   if (!mnemonic) {
-    console.error("❌ [Wallet] No BOT_MNEMONIC set in environment");
+    console.error("❌ [Wallet] No BOT_MNEMONIC set");
     return false;
   }
 
   const cleanMnemonic = mnemonic.trim().toLowerCase().replace(/\s+/g, ' ');
 
-  console.log(`[Wallet] Mnemonic length: ${cleanMnemonic.split(' ').length} words`);
-
   try {
     if (!bip39.validateMnemonic(cleanMnemonic)) {
-      console.error("❌ [Wallet] Invalid mnemonic provided");
+      console.error("❌ [Wallet] Invalid mnemonic");
       return false;
     }
 
@@ -50,15 +49,13 @@ function initWallet(mnemonic) {
     root = hdkey.fromMasterSeed(seed);
     initialized = true;
     
-    console.log(`✅ [Wallet] Wallet initialized successfully`);
+    console.log(`✅ [Wallet] Wallet initialized`);
     console.log(`✅ [Wallet] Address [0]: ${generateAddress(0)}`);
     console.log(`✅ [Wallet] Address [1]: ${generateAddress(1)}`);
 
     return true;
   } catch (err) {
-    console.error("❌ [Wallet] Failed to initialize wallet:", err.message);
-    root = null;
-    initialized = false;
+    console.error("❌ [Wallet] Failed to initialize:", err.message);
     return false;
   }
 }
@@ -68,10 +65,7 @@ function isInitialized() {
 }
 
 function generateAddress(index) {
-  if (!isInitialized()) {
-    console.error(`[Wallet] Cannot generate address ${index}: wallet not initialized`);
-    return null;
-  }
+  if (!isInitialized()) return null;
   
   try {
     const child = root.derive(`m/44'/2'/0'/0/${index}`);
@@ -81,130 +75,82 @@ function generateAddress(index) {
     });
     return address;
   } catch (err) {
-    console.error(`[Wallet] Failed to generate address for index ${index}:`, err.message);
+    console.error(`[Wallet] Failed to generate address ${index}:`, err.message);
     return null;
   }
 }
 
 function getPrivateKeyWIF(index) {
-  if (!isInitialized()) {
-    console.error(`[Wallet] Cannot get private key for index ${index}: wallet not initialized`);
-    return null;
-  }
+  if (!isInitialized()) return null;
   
   try {
     const child = root.derive(`m/44'/2'/0'/0/${index}`);
     const keyPair = ECPair.fromPrivateKey(child.privateKey, { network: ltcNet });
     return keyPair.toWIF();
   } catch (err) {
-    console.error(`[Wallet] Failed to get private key for index ${index}:`, err.message);
+    console.error(`[Wallet] Failed to get private key ${index}:`, err.message);
     return null;
   }
 }
 
 async function getAddressBalance(address, forceRefresh = false) {
-  if (!address) {
-    console.error('[Wallet] No address provided to getAddressBalance');
-    return 0;
-  }
+  if (!address) return 0;
   
   if (!forceRefresh && balanceCache.has(address)) {
     const cached = balanceCache.get(address);
     if (Date.now() - cached.timestamp < CACHE_DURATION) {
-      console.log(`[Wallet] Using cached balance for ${address}: ${cached.balance} LTC`);
       return cached.balance;
     }
   }
 
   try {
-    // Blockchair rate limit: 30 req/min, so we wait 2 seconds between calls
     await delay(2000);
     
-    console.log(`[Wallet] Fetching balance for ${address} from Blockchair...`);
-    const url = `${BLOCKCHAIR_BASE}/dashboards/address/${address}`;
-    console.log(`[Wallet] URL: ${url}`);
-    
+    const url = `${BLOCKCYPHER_BASE}/addrs/${address}/balance?token=${BLOCKCYPHER_TOKEN}`;
     const res = await axios.get(url, { timeout: 15000 });
     
-    console.log(`[Wallet] Blockchair response status: ${res.status}`);
-    console.log(`[Wallet] Blockchair response data:`, JSON.stringify(res.data).substring(0, 500));
+    const balance = (res.data.balance || 0) / 1e8;
+    const unconfirmed = (res.data.unconfirmed_balance || 0) / 1e8;
+    const total = balance + unconfirmed;
     
-    // Check if response has data
-    if (!res.data || !res.data.data || !res.data.data[address]) {
-      console.error(`[Wallet] Invalid response structure from Blockchair`);
-      return 0;
-    }
+    console.log(`[Wallet] ${address}: ${total} LTC`);
     
-    const addressData = res.data.data[address];
-    console.log(`[Wallet] Address data:`, JSON.stringify(addressData).substring(0, 500));
-    
-    // Blockchair returns balance in satoshis
-    const balanceSatoshi = addressData.address?.balance || 0;
-    const balance = balanceSatoshi / 1e8;
-    
-    console.log(`[Wallet] ${address}: ${balance} LTC (${balanceSatoshi} satoshi)`);
-    
-    if (balance > 0) {
-      balanceCache.set(address, { balance: balance, timestamp: Date.now() });
-    }
-    
-    return balance;
+    balanceCache.set(address, { balance: total, timestamp: Date.now() });
+    return total;
   } catch (err) {
-    console.error(`[Wallet] Error fetching balance for ${address}:`, err.message);
-    if (err.response) {
-      console.error(`[Wallet] Response status: ${err.response.status}`);
-      console.error(`[Wallet] Response data:`, err.response.data);
-    }
+    console.error(`[Wallet] Error fetching balance:`, err.message);
     return 0;
   }
 }
 
 async function getBalanceAtIndex(index, forceRefresh = false) {
-  if (!isInitialized()) {
-    console.error("[Wallet] Cannot get balance: not initialized");
-    return 0;
-  }
+  if (!isInitialized()) return 0;
   
   const address = generateAddress(index);
-  if (!address) {
-    console.error(`[Wallet] Could not generate address for index ${index}`);
-    return 0;
-  }
+  if (!address) return 0;
   
-  console.log(`[Wallet] Getting balance for index ${index}, address: ${address}`);
   return await getAddressBalance(address, forceRefresh);
 }
 
 async function getWalletBalance(forceRefresh = false) {
-  if (!isInitialized()) {
-    console.error("[Wallet] Not initialized");
-    return { total: 0, found: [] };
-  }
+  if (!isInitialized()) return { total: 0, found: [] };
   
-  console.log(`[Wallet] Scanning indices 0-20 for balances...`);
+  console.log(`[Wallet] Scanning indices 0-10...`);
   let total = 0;
   const found = [];
   
-  for (let i = 0; i <= 20; i++) {
-    try {
-      const balance = await getBalanceAtIndex(i, forceRefresh);
-      if (balance > 0) {
-        console.log(`[Wallet] Index ${i}: ${balance} LTC`);
-        found.push({ index: i, balance });
-        total += balance;
-      }
-    } catch (err) {
-      console.error(`[Wallet] Error checking index ${i}:`, err.message);
+  for (let i = 0; i <= 10; i++) {
+    const balance = await getBalanceAtIndex(i, forceRefresh);
+    if (balance > 0) {
+      found.push({ index: i, balance });
+      total += balance;
     }
   }
   
-  console.log(`[Wallet] Total balance across all indices: ${total} LTC`);
   return { total, found };
 }
 
 async function sendFromIndex(index, toAddress, amountLTC) {
-  console.log(`[Wallet] sendFromIndex called: index=${index}, to=${toAddress}, amount=${amountLTC}`);
-  
   if (!isInitialized()) {
     return { success: false, error: 'Wallet not initialized' };
   }
@@ -212,27 +158,19 @@ async function sendFromIndex(index, toAddress, amountLTC) {
   const fromAddress = generateAddress(index);
   const wif = getPrivateKeyWIF(index);
   
-  console.log(`[Wallet] fromAddress=${fromAddress}, wif=${wif ? 'exists' : 'null'}`);
-
-  if (!fromAddress) {
-    return { success: false, error: 'Could not generate address' };
-  }
-  
-  if (!wif) {
-    return { success: false, error: 'Could not derive private key' };
+  if (!fromAddress || !wif) {
+    return { success: false, error: 'Could not derive keys' };
   }
 
   try {
     const currentBalance = await getBalanceAtIndex(index, true);
-    console.log(`[Wallet] Current balance at index ${index}: ${currentBalance} LTC`);
     
     if (currentBalance <= 0) {
-      return { success: false, error: `No balance at index ${index}. Found: ${currentBalance} LTC` };
+      return { success: false, error: `No balance at index ${index}` };
     }
 
     const utxos = await getAddressUTXOs(fromAddress);
-    console.log(`[Wallet] Found ${utxos.length} UTXOs`);
-
+    
     if (utxos.length === 0) {
       return { success: false, error: 'No UTXOs found' };
     }
@@ -241,10 +179,8 @@ async function sendFromIndex(index, toAddress, amountLTC) {
     const fee = 10000;
     const totalInput = utxos.reduce((sum, u) => sum + u.value, 0);
 
-    console.log(`[Wallet] amountSatoshi=${amountSatoshi}, fee=${fee}, totalInput=${totalInput}`);
-
     if (totalInput < amountSatoshi + fee) {
-      return { success: false, error: `Insufficient balance. Have: ${totalInput / 1e8} LTC, Need: ${(amountSatoshi + fee) / 1e8} LTC` };
+      return { success: false, error: `Insufficient balance` };
     }
 
     const psbt = new bitcoin.Psbt({ network: ltcNet });
@@ -252,24 +188,15 @@ async function sendFromIndex(index, toAddress, amountLTC) {
 
     for (const utxo of utxos) {
       if (inputSum >= amountSatoshi + fee) break;
-      try {
-        psbt.addInput({
-          hash: utxo.txid,
-          index: utxo.vout,
-          witnessUtxo: { 
-            script: Buffer.from(utxo.script, 'hex'), 
-            value: utxo.value 
-          }
-        });
-        inputSum += utxo.value;
-      } catch (err) {
-        console.error(`[Wallet] Error adding input:`, err.message);
-        continue;
-      }
-    }
-
-    if (psbt.inputCount === 0) {
-      return { success: false, error: 'Could not add any inputs' };
+      psbt.addInput({
+        hash: utxo.txid,
+        index: utxo.vout,
+        witnessUtxo: { 
+          script: Buffer.from(utxo.script, 'hex'), 
+          value: utxo.value 
+        }
+      });
+      inputSum += utxo.value;
     }
 
     psbt.addOutput({ address: toAddress, value: amountSatoshi });
@@ -292,16 +219,15 @@ async function sendFromIndex(index, toAddress, amountLTC) {
     const txHex = psbt.extractTransaction().toHex();
 
     const broadcastRes = await axios.post(
-      `${BLOCKCHAIR_BASE}/push/transaction`,
-      { data: txHex },
+      `${BLOCKCYPHER_BASE}/txs/push?token=${BLOCKCYPHER_TOKEN}`,
+      { tx: txHex },
       { timeout: 15000 }
     );
 
-    if (broadcastRes.data.data && broadcastRes.data.data.transaction_hash) {
-      console.log(`[Wallet] Transaction broadcasted: ${broadcastRes.data.data.transaction_hash}`);
+    if (broadcastRes.data?.tx?.hash) {
       return { 
         success: true, 
-        txid: broadcastRes.data.data.transaction_hash,
+        txid: broadcastRes.data.tx.hash,
         amountSent: (amountSatoshi / 1e8).toFixed(8)
       };
     } else {
@@ -319,8 +245,6 @@ async function sendLTC(tradeId, toAddress, amountLTC) {
 }
 
 async function sendAllLTC(toAddress, specificIndex = null) {
-  console.log(`[Wallet] sendAllLTC called: to=${toAddress}, index=${specificIndex}`);
-  
   if (!isInitialized()) {
     return { success: false, error: 'Wallet not initialized' };
   }
@@ -328,48 +252,41 @@ async function sendAllLTC(toAddress, specificIndex = null) {
   let indexToUse = specificIndex;
   
   if (indexToUse === null) {
-    console.log(`[Wallet] Searching for funds...`);
-    for (let i = 0; i <= 20; i++) {
+    for (let i = 0; i <= 10; i++) {
       const balance = await getBalanceAtIndex(i, true);
       if (balance > 0) {
         indexToUse = i;
-        console.log(`[Wallet] Found funds at index ${i}: ${balance} LTC`);
         break;
       }
     }
   }
   
   if (indexToUse === null) {
-    return { success: false, error: 'No funded addresses found (checked indices 0-20)' };
+    return { success: false, error: 'No funded addresses found' };
   }
   
   const balance = await getBalanceAtIndex(indexToUse, true);
   if (balance <= 0) {
-    return { success: false, error: `No balance at index ${indexToUse}. Balance: ${balance}` };
+    return { success: false, error: `No balance at index ${indexToUse}` };
   }
   
   const fee = 0.0001;
   const amountToSend = Math.max(0, balance - fee);
   
   if (amountToSend <= 0) {
-    return { success: false, error: `Balance too low. Have: ${balance} LTC, Fee: ${fee} LTC` };
+    return { success: false, error: `Balance too low` };
   }
-  
-  console.log(`[Wallet] Sending ${amountToSend} LTC from index ${indexToUse}`);
   
   return await sendFromIndex(indexToUse, toAddress, amountToSend.toFixed(8));
 }
 
 async function sendFeeToAddress(feeAddress, feeLtc, tradeId) {
-  console.log(`[Wallet] Sending fee ${feeLtc} LTC to ${feeAddress}`);
-  
-  for (let i = 0; i <= 20; i++) {
+  for (let i = 0; i <= 10; i++) {
     const balance = await getBalanceAtIndex(i, true);
     if (balance >= parseFloat(feeLtc) + 0.0001) {
       return await sendFromIndex(i, feeAddress, feeLtc);
     }
   }
-  
   return { success: false, error: 'No index with sufficient balance for fee' };
 }
 
