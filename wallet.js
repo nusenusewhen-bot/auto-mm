@@ -8,7 +8,7 @@ const { getAddressUTXOs } = require('./blockchain');
 
 const ECPair = ECPairFactory(tinysecp);
 
-const SOCHAIN_BASE = 'https://sochain.com/api/v2';
+const BLOCKCHAIR_BASE = 'https://api.blockchair.com/litecoin';
 
 const ltcNet = {
   messagePrefix: '\x19Litecoin Signed Message:\n',
@@ -114,23 +114,23 @@ async function getAddressBalance(address, forceRefresh = false) {
   }
 
   try {
-    await delay(500);
+    await delay(1000); // Blockchair rate limit: 30 req/min
     
     console.log(`[Wallet] Fetching balance for ${address}...`);
     const res = await axios.get(
-      `${SOCHAIN_BASE}/address/LTC/${address}`,
+      `${BLOCKCHAIR_BASE}/dashboards/address/${address}`,
       { timeout: 15000 }
     );
     
-    const data = res.data.data;
-    const balance = parseFloat(data.balance) || 0;
-    const unconfirmed = parseFloat(data.unconfirmed_balance) || 0;
-    const total = balance + unconfirmed;
+    const data = res.data.data[address];
+    // Blockchair gives balance in satoshis
+    const balanceSatoshi = data.address.balance || 0;
+    const balance = balanceSatoshi / 1e8;
     
-    console.log(`[Wallet] ${address}: ${balance} LTC confirmed, ${unconfirmed} LTC unconfirmed, ${total} LTC total`);
+    console.log(`[Wallet] ${address}: ${balance} LTC`);
     
-    balanceCache.set(address, { balance: total, timestamp: Date.now() });
-    return total;
+    balanceCache.set(address, { balance: balance, timestamp: Date.now() });
+    return balance;
   } catch (err) {
     console.error(`[Wallet] Error fetching balance for ${address}:`, err.message);
     return 0;
@@ -258,17 +258,18 @@ async function sendFromIndex(index, toAddress, amountLTC) {
     psbt.finalizeAllInputs();
     const txHex = psbt.extractTransaction().toHex();
 
+    // Broadcast using Blockchair
     const broadcastRes = await axios.post(
-      `${SOCHAIN_BASE}/send/LTC`,
-      { tx_hex: txHex },
+      `${BLOCKCHAIR_BASE}/push/transaction`,
+      { data: txHex },
       { timeout: 15000 }
     );
 
-    if (broadcastRes.data.status === 'success') {
-      console.log(`[Wallet] Transaction broadcasted: ${broadcastRes.data.data.txid}`);
+    if (broadcastRes.data.data && broadcastRes.data.data.transaction_hash) {
+      console.log(`[Wallet] Transaction broadcasted: ${broadcastRes.data.data.transaction_hash}`);
       return { 
         success: true, 
-        txid: broadcastRes.data.data.txid,
+        txid: broadcastRes.data.data.transaction_hash,
         amountSent: (amountSatoshi / 1e8).toFixed(8)
       };
     } else {
