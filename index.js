@@ -20,7 +20,7 @@ const {
 } = require('discord.js');
 
 const db = require('./database');
-const { initWallet, generateAddress, sendLTC, getWalletBalance, sendAllLTC, isInitialized, getBalanceAtIndex, sendFeeToAddress } = require('./wallet');
+const { initWallet, generateAddress, sendLTC, getWalletBalance, sendAllLTC, isInitialized, getBalanceAtIndex, sendFeeToFeeWallet } = require('./wallet');
 const { checkPayment, getLtcPriceUSD, checkTransactionMempool, getAddressUTXOs } = require('./blockchain');
 const { REST } = require('@discordjs/rest');
 const axios = require('axios');
@@ -36,14 +36,15 @@ const client = new Client({
 const OWNER_ID = process.env.OWNER_ID;
 const OWNER_ROLE_ID = process.env.OWNER_ROLE_ID;
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const FEE_ADDRESS = 'LeDdjh2BDbPkrhG2pkWBko3HRdKQzprJMX';
 const BLOCKCYPHER_BASE = 'https://api.blockcypher.com/v1/ltc/main';
 
 const confirmedInteractions = new Set();
 const activeMonitors = new Map();
 
-// HARDCODED INDEX 0 - NEVER CHANGES
-const WALLET_INDEX = 0;
+// ALL TICKETS USE INDEX 0
+const TRADE_INDEX = 0;
+// FEES GO TO INDEX 1
+const FEE_INDEX = 1;
 
 if (!DISCORD_TOKEN || !OWNER_ID || !process.env.BOT_MNEMONIC) {
   console.error('Missing required environment variables. Check your .env file.');
@@ -79,11 +80,13 @@ const commands = [
     .setDescription('Show the trading panel'),
   new SlashCommandBuilder()
     .setName('balance')
-    .setDescription('Check wallet balance (Owner only)'),
+    .setDescription('Check wallet balance (Owner only)')
+    .addIntegerOption(opt => opt.setName('index').setDescription('Wallet index (0, 1, or 2)').setRequired(false)),
   new SlashCommandBuilder()
     .setName('send')
     .setDescription('Send all LTC to an address (Owner only)')
-    .addStringOption(opt => opt.setName('address').setDescription('Litecoin address').setRequired(true)),
+    .addStringOption(opt => opt.setName('address').setDescription('Litecoin address').setRequired(true))
+    .addIntegerOption(opt => opt.setName('from_index').setDescription('Index to send from (0, 1, or 2)').setRequired(false)),
   new SlashCommandBuilder()
     .setName('setfee')
     .setDescription('Set fee percentage (Owner only)')
@@ -97,7 +100,8 @@ const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
 
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
-  console.log(`✅ FORCED WALLET INDEX ${WALLET_INDEX} ONLY`);
+  console.log(`✅ ALL TICKETS USE INDEX ${TRADE_INDEX}`);
+  console.log(`✅ ALL FEES GO TO INDEX ${FEE_INDEX}`);
   
   try {
     console.log('Deploying commands...');
@@ -105,13 +109,6 @@ client.once(Events.ClientReady, async () => {
     console.log('Commands deployed.');
   } catch (err) {
     console.error('Command deploy error:', err.message);
-  }
-  
-  const activeTrades = db.prepare("SELECT * FROM trades WHERE status IN ('awaiting_payment', 'awaiting_confirmation')").all();
-  for (const trade of activeTrades) {
-    if (trade.amount && trade.amount > 0) {
-      startPaymentMonitor(trade.id, trade.channelId, trade.totalLtc);
-    }
   }
 });
 
@@ -402,12 +399,12 @@ async function handleTradeDetailsModal(interaction) {
     ],
   });
 
-  // FORCE INDEX 0 - NO PARAMETER
-  const depositAddress = generateAddress();
+  // ALL TICKETS USE INDEX 0
+  const depositAddress = generateAddress(TRADE_INDEX);
   const result = db.prepare(`
     INSERT INTO trades (channelId, user1Id, user2Id, senderId, receiverId, amount, status, createdAt, youGiving, theyGiving, depositAddress, depositIndex)
-    VALUES (?, ?, ?, NULL, NULL, 0, 'role_selection', datetime('now'), ?, ?, ?, 0)
-  `).run(channel.id, interaction.user.id, otherUserId, youGiving, theyGiving, depositAddress);
+    VALUES (?, ?, ?, NULL, NULL, 0, 'role_selection', datetime('now'), ?, ?, ?, ?)
+  `).run(channel.id, interaction.user.id, otherUserId, youGiving, theyGiving, depositAddress, TRADE_INDEX);
 
   const tradeId = result.lastInsertRowid;
 
@@ -642,17 +639,18 @@ async function handleButton(interaction) {
 
   if (customId.startsWith('confirm_sendall_')) {
     const parts = interaction.customId.split('_');
+    const fromIndex = parseInt(parts[2]);
     const address = parts[3];
     
     await interaction.update({ content: '⏳ Processing...', components: [], embeds: [] });
 
-    // FORCE INDEX 0 - NO PARAMETER
-    const result = await sendAllLTC(address);
+    const result = await sendAllLTC(fromIndex, address);
     
     if (result.success) {
       const embed = new EmbedBuilder()
         .setTitle('✅ Sent')
         .addFields(
+          { name: 'From Index', value: `${fromIndex}` },
           { name: 'Amount', value: result.amountSent || '?' },
           { name: 'To', value: address },
           { name: 'TxID', value: result.txid }
@@ -887,11 +885,11 @@ async function handleConfirmAmount(interaction) {
 async function sendPaymentInstructions(channel, tradeId) {
   const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
   
-  // FORCE INDEX 0 - NO PARAMETER
-  const depositAddress = generateAddress();
+  // ALL TICKETS USE INDEX 0
+  const depositAddress = generateAddress(TRADE_INDEX);
 
-  db.prepare("UPDATE trades SET depositAddress = ?, depositIndex = 0, status = 'awaiting_payment' WHERE id = ?")
-    .run(depositAddress, tradeId);
+  db.prepare("UPDATE trades SET depositAddress = ?, depositIndex = ?, status = 'awaiting_payment' WHERE id = ?")
+    .run(depositAddress, TRADE_INDEX, tradeId);
 
   const feePercent = await getFeePercent();
   const feeUsd = trade.fee || calculateFee(trade.amount, feePercent);
@@ -926,7 +924,7 @@ async function sendPaymentInstructions(channel, tradeId) {
 function startPaymentMonitor(tradeId, channelId, expectedLtc) {
   if (activeMonitors.has(tradeId)) return;
 
-  console.log(`[Monitor] Starting monitor for trade ${tradeId}, expecting ${expectedLtc} LTC (INDEX 0)`);
+  console.log(`[Monitor] Starting monitor for trade ${tradeId}, expecting ${expectedLtc} LTC (INDEX ${TRADE_INDEX})`);
 
   let detected = false;
   const intervalId = setInterval(async () => {
@@ -984,7 +982,6 @@ async function handleTransactionDetected(tradeId, amount, confirmed) {
 
   const txHash = await checkTransactionMempool(trade.depositAddress) || 'pending';
   
-  // Fix NaN display by ensuring we have valid numbers
   const ltcPrice = trade.ltcPrice || await getLtcPriceUSD() || 0;
   const amountNum = parseFloat(amount) || 0;
   const expectedLtc = parseFloat(trade.totalLtc) || 0;
@@ -1013,7 +1010,6 @@ async function handleTransactionConfirmed(tradeId) {
 
   const txHash = await checkTransactionMempool(trade.depositAddress) || 'confirmed';
   
-  // Fix NaN display
   const totalLtc = parseFloat(trade.totalLtc) || 0;
   const ltcPrice = parseFloat(trade.ltcPrice) || await getLtcPriceUSD() || 0;
   const totalUsd = totalLtc * ltcPrice;
@@ -1115,22 +1111,23 @@ async function handleConfirmWithdraw(interaction) {
     const feeLtc = (trade.fee / trade.ltcPrice).toFixed(8);
     const amountLtc = trade.ltcAmount;
 
-    // FORCE INDEX 0 - NO PARAMETER
+    // SEND TRADE AMOUNT TO RECEIVER (INDEX 0)
     const result = await sendLTC(address, amountLtc);
 
     if (result.success) {
-      // FORCE INDEX 0 - NO PARAMETER
-      await sendFeeToAddress(FEE_ADDRESS, feeLtc);
+      // SEND FEE TO INDEX 1 (FEE WALLET)
+      await sendFeeToFeeWallet(feeLtc);
 
       db.prepare("UPDATE trades SET status = 'completed', completedAt = datetime('now'), receiverAddress = ? WHERE id = ?")
         .run(address, tradeId);
 
       const successEmbed = new EmbedBuilder()
         .setTitle('✅ Withdrawal Successful')
-        .setDescription('Use `/setprivacy` to display your user in #🍦・completed')
+        .setDescription(`Fee sent to Index 1 (Fee Wallet)`)
         .addFields(
           { name: 'Transaction', value: `[${result.txid.substring(0, 10)}...${result.txid.substring(result.txid.length-8)}](https://live.blockcypher.com/ltc/tx/${result.txid})` },
-          { name: 'Amount Sent', value: `${amountLtc.toFixed(8)} LTC ($${(amountLtc * trade.ltcPrice).toFixed(2)})` }
+          { name: 'Amount Sent', value: `${amountLtc.toFixed(8)} LTC ($${(amountLtc * trade.ltcPrice).toFixed(2)})` },
+          { name: 'Fee', value: `${feeLtc} LTC sent to Index 1` }
         )
         .setColor(0x00FF00);
 
@@ -1210,19 +1207,20 @@ async function showBalance(interaction) {
     return interaction.editReply({ content: '❌ Only owner can use this.' });
   }
 
-  // FORCE INDEX 0 - NO PARAMETER
-  const balance = await getBalanceAtIndex(true);
-  const address = generateAddress();
-
-  if (balance <= 0) {
-    return interaction.editReply({ content: `❌ No LTC found.\nAddress: \`${address}\`` });
+  const index = interaction.options.getInteger('index') || 0;
+  
+  if (index < 0 || index > 2) {
+    return interaction.editReply({ content: '❌ Index must be 0, 1, or 2.' });
   }
+
+  const balance = await getBalanceAtIndex(index, true);
+  const address = generateAddress(index);
 
   const ltcPrice = await getLtcPriceUSD();
   const usdValue = (balance * ltcPrice).toFixed(2);
 
   const embed = new EmbedBuilder()
-    .setTitle('💰 Wallet Balance (INDEX 0)')
+    .setTitle(`💰 Wallet Balance (Index ${index})`)
     .setDescription(`**Balance:** ${balance.toFixed(8)} LTC (~$${usdValue})`)
     .addFields({ name: 'Address', value: `\`${address}\``, inline: false })
     .setColor('Green');
@@ -1238,24 +1236,29 @@ async function handleSendCommand(interaction) {
   }
 
   const address = interaction.options.getString('address').trim();
+  const fromIndex = interaction.options.getInteger('from_index') || 0;
+  
   if (!address.startsWith('ltc1') && !address.startsWith('L') && !address.startsWith('M')) {
     return interaction.editReply({ content: '❌ Invalid address.' });
   }
 
-  // FORCE INDEX 0 - NO PARAMETER
-  const balance = await getBalanceAtIndex(true);
+  if (fromIndex < 0 || fromIndex > 2) {
+    return interaction.editReply({ content: '❌ Index must be 0, 1, or 2.' });
+  }
+
+  const balance = await getBalanceAtIndex(fromIndex, true);
   if (balance <= 0) {
-    return interaction.editReply({ content: `❌ No funds. Address: \`${generateAddress()}\`` });
+    return interaction.editReply({ content: `❌ No funds in index ${fromIndex}. Address: \`${generateAddress(fromIndex)}\`` });
   }
 
   const embed = new EmbedBuilder()
     .setTitle('⚠️ Confirm Send')
-    .setDescription(`Send **${balance.toFixed(8)} LTC** to \`${address}\`?`)
+    .setDescription(`Send **${balance.toFixed(8)} LTC** from Index ${fromIndex} to \`${address}\`?`)
     .setColor('Orange');
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`confirm_sendall_0_${address}`)
+      .setCustomId(`confirm_sendall_${fromIndex}_${address}`)
       .setLabel('Confirm')
       .setStyle(ButtonStyle.Danger),
     new ButtonBuilder()
