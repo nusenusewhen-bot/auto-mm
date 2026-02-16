@@ -1278,4 +1278,7 @@ process.on('SIGINT', () => {
   process.exit(0);
 });
 
-client.login(DISCO
+client.login(DISCORD_TOKEN).catch(err => {
+  console.error('❌ Failed to login:', err);
+  process.exit(1);
+});
