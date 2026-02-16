@@ -14,6 +14,8 @@ const {
   Events,
   SlashCommandBuilder,
   Routes,
+  StringSelectMenuBuilder,
+  StringSelectMenuOptionBuilder,
   MessageFlags,
 } = require('discord.js');
 
@@ -70,11 +72,8 @@ async function getFeePercent() {
 
 const commands = [
   new SlashCommandBuilder()
-    .setName('mmz')
-    .setDescription('Start a middleman trade (Owner only)')
-    .addUserOption(opt => opt.setName('user1').setDescription('First user').setRequired(true))
-    .addUserOption(opt => opt.setName('user2').setDescription('Second user').setRequired(true))
-    .addNumberOption(opt => opt.setName('amount').setDescription('USD amount').setRequired(true)),
+    .setName('panel')
+    .setDescription('Show the trading panel'),
   new SlashCommandBuilder()
     .setName('balance')
     .setDescription('Check wallet balance (Owner only)'),
@@ -129,6 +128,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    if (interaction.isStringSelectMenu()) {
+      await handleSelectMenu(interaction);
+      return;
+    }
+
   } catch (err) {
     console.error('Interaction error:', err);
     try {
@@ -142,8 +146,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
 async function handleSlashCommand(interaction) {
   const { commandName } = interaction;
 
-  if (commandName === 'mmz') {
-    await startMiddleman(interaction);
+  if (commandName === 'panel') {
+    await showPanel(interaction);
   } else if (commandName === 'balance') {
     await showBalance(interaction);
   } else if (commandName === 'send') {
@@ -155,23 +159,93 @@ async function handleSlashCommand(interaction) {
   }
 }
 
-async function startMiddleman(interaction) {
-  if (!await hasOwnerPermissions(interaction.user.id, interaction.member)) {
-    return interaction.reply({ content: '❌ Only owners can use this.', flags: MessageFlags.Ephemeral });
+// ==================== /PANEL COMMAND ====================
+
+async function showPanel(interaction) {
+  const embed = new EmbedBuilder()
+    .setTitle('Create a Ticket')
+    .setDescription('Please select a category from the dropdown below to create a new ticket.')
+    .setColor('Blurple');
+
+  const selectMenu = new StringSelectMenuBuilder()
+    .setCustomId('create_ticket')
+    .setPlaceholder('Select a category...')
+    .addOptions(
+      new StringSelectMenuOptionBuilder()
+        .setLabel('Litecoin')
+        .setDescription('Create a Litecoin middleman trade')
+        .setValue('litecoin')
+        .setEmoji('🪙')
+    );
+
+  const row = new ActionRowBuilder().addComponents(selectMenu);
+
+  return interaction.reply({ embeds: [embed], components: [row] });
+}
+
+// ==================== SELECT MENU HANDLER ====================
+
+async function handleSelectMenu(interaction) {
+  if (interaction.customId === 'create_ticket') {
+    const selected = interaction.values[0];
+
+    if (selected === 'litecoin') {
+      const modal = new ModalBuilder()
+        .setCustomId('enter_user_modal')
+        .setTitle('Enter Other User ID');
+
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('otherUserId')
+            .setLabel('Other User Discord ID')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('123456789012345678')
+            .setRequired(true)
+        )
+      );
+
+      return interaction.showModal(modal);
+    }
+  }
+}
+
+// ==================== MODAL HANDLER ====================
+
+async function handleModal(interaction) {
+  if (interaction.customId === 'enter_user_modal') {
+    await handleUserModal(interaction);
+    return;
   }
 
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-  const user1 = interaction.options.getUser('user1');
-  const user2 = interaction.options.getUser('user2');
-  const amount = interaction.options.getNumber('amount');
-
-  if (!user1 || !user2) {
-    return interaction.editReply({ content: '❌ Please specify both users.' });
+  if (interaction.customId.startsWith('amount_modal_')) {
+    await handleAmountModal(interaction);
+    return;
   }
 
+  if (interaction.customId.startsWith('address_modal_')) {
+    await handleAddressModal(interaction);
+    return;
+  }
+}
+
+async function handleUserModal(interaction) {
+  const otherUserId = interaction.fields.getTextInputValue('otherUserId').trim();
+
+  let otherMember;
+  try {
+    otherMember = await interaction.guild.members.fetch(otherUserId);
+  } catch {
+    return interaction.reply({ content: '❌ Invalid user ID. User must be in this server.', flags: MessageFlags.Ephemeral });
+  }
+
+  if (otherUserId === interaction.user.id) {
+    return interaction.reply({ content: '❌ You cannot trade with yourself.', flags: MessageFlags.Ephemeral });
+  }
+
+  // Create the trade channel
   const channel = await interaction.guild.channels.create({
-    name: `ltc-${user1.username}-${user2.username}`.substring(0, 100),
+    name: `ltc-${interaction.user.username}-${otherMember.user.username}`.substring(0, 100),
     type: ChannelType.GuildText,
     permissionOverwrites: [
       {
@@ -179,11 +253,11 @@ async function startMiddleman(interaction) {
         deny: [PermissionsBitField.Flags.ViewChannel],
       },
       {
-        id: user1.id,
+        id: interaction.user.id,
         allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages],
       },
       {
-        id: user2.id,
+        id: otherUserId,
         allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages],
       },
       {
@@ -193,19 +267,23 @@ async function startMiddleman(interaction) {
     ],
   });
 
+  // Create trade in DB
   const result = db.prepare(`
     INSERT INTO trades (channelId, user1Id, user2Id, senderId, receiverId, amount, status, createdAt)
-    VALUES (?, ?, ?, NULL, NULL, ?, 'role_selection', datetime('now'))
-  `).run(channel.id, user1.id, user2.id, amount);
+    VALUES (?, ?, ?, NULL, NULL, 0, 'role_selection', datetime('now'))
+  `).run(channel.id, interaction.user.id, otherUserId);
 
   const tradeId = result.lastInsertRowid;
 
+  await interaction.reply({ content: `✅ Trade channel created: ${channel}`, flags: MessageFlags.Ephemeral });
+
+  // Send initial embed
   const embed = new EmbedBuilder()
     .setTitle('👋 Malieno\'s Auto Middleman Service')
     .setDescription('Make sure to follow the steps and read the instructions thoroughly.\nPlease explicitly state the trade details if the information below is inaccurate.')
     .addFields(
-      { name: `${user1.username}'s side:`, value: `$${amount}`, inline: true },
-      { name: `${user2.username}'s side:`, value: 'Waiting...', inline: true }
+      { name: `${interaction.user.username}'s side:`, value: 'Waiting...', inline: true },
+      { name: `${otherMember.user.username}'s side:`, value: 'Waiting...', inline: true }
     )
     .setColor(0x5865F2);
 
@@ -216,8 +294,9 @@ async function startMiddleman(interaction) {
       .setStyle(ButtonStyle.Danger)
   );
 
-  await channel.send({ content: `${user1} ${user2}`, embeds: [embed], components: [deleteRow] });
+  await channel.send({ content: `${interaction.user} ${otherMember}`, embeds: [embed], components: [deleteRow] });
 
+  // Send role selection
   const roleEmbed = new EmbedBuilder()
     .setDescription('**Select your role**\n• **"Sender"** if you are **Sending** LTC to the bot.\n• **"Receiver"** if you are **Receiving** LTC *later* from the bot.')
     .setColor(0x5865F2);
@@ -238,9 +317,79 @@ async function startMiddleman(interaction) {
   );
 
   await channel.send({ embeds: [roleEmbed], components: [roleRow] });
-
-  await interaction.editReply({ content: `✅ Trade channel created: ${channel}` });
 }
+
+async function handleAmountModal(interaction) {
+  const tradeId = interaction.customId.split('_')[2];
+  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+
+  const amountStr = interaction.fields.getTextInputValue('usd_amount');
+  const amount = parseFloat(amountStr);
+
+  if (isNaN(amount) || amount <= 0) {
+    return interaction.reply({ content: '❌ Invalid amount.', flags: MessageFlags.Ephemeral });
+  }
+
+  const ltcPrice = await getLtcPriceUSD();
+  const ltcAmount = amount / ltcPrice;
+  const feePercent = await getFeePercent();
+  const fee = calculateFee(amount, feePercent);
+  const totalUsd = amount + fee;
+  const totalLtc = totalUsd / ltcPrice;
+
+  db.prepare(`
+    UPDATE trades SET amount = ?, fee = ?, ltcPrice = ?, ltcAmount = ?, totalLtc = ?, status = 'amount_set'
+    WHERE id = ?
+  `).run(amount, fee, ltcPrice, ltcAmount, totalLtc, tradeId);
+
+  const embed = new EmbedBuilder()
+    .setDescription(`**USD amount set to $${amount.toFixed(2)}**\n\nPlease confirm the USD amount.`)
+    .setColor(0x5865F2);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`confirm_amount_${tradeId}`)
+      .setLabel('Correct')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`incorrect_amount_${tradeId}`)
+      .setLabel('Incorrect')
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  await interaction.reply({ embeds: [embed], components: [row] });
+}
+
+async function handleAddressModal(interaction) {
+  const tradeId = interaction.customId.split('_')[2];
+  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+
+  const address = interaction.fields.getTextInputValue('ltc_address').trim();
+
+  if (!address.startsWith('ltc1') && !address.startsWith('L') && !address.startsWith('M')) {
+    return interaction.reply({ content: '❌ Invalid LTC address.', flags: MessageFlags.Ephemeral });
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle('⚠️ Confirm Address')
+    .setDescription(`**Address:**\n\`${address}\`\n\nClick **"Confirm"** to send LTC or **"Back"** to cancel.`)
+    .setColor(0xFFD700);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`confirm_withdraw_${tradeId}_${address}`)
+      .setLabel('Confirm')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`back_${tradeId}`)
+      .setLabel('Back')
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  await interaction.reply({ embeds: [embed], components: [row] });
+}
+
+// ==================== BUTTON HANDLER ====================
 
 async function handleButton(interaction) {
   const customId = interaction.customId;
@@ -559,88 +708,6 @@ async function handleSetAmount(interaction) {
 
   modal.addComponents(new ActionRowBuilder().addComponents(amountInput));
   await interaction.showModal(modal);
-}
-
-async function handleModal(interaction) {
-  if (interaction.customId.startsWith('amount_modal_')) {
-    await handleAmountModal(interaction);
-    return;
-  }
-
-  if (interaction.customId.startsWith('address_modal_')) {
-    await handleAddressModal(interaction);
-    return;
-  }
-}
-
-async function handleAmountModal(interaction) {
-  const tradeId = interaction.customId.split('_')[2];
-  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
-
-  const amountStr = interaction.fields.getTextInputValue('usd_amount');
-  const amount = parseFloat(amountStr);
-
-  if (isNaN(amount) || amount <= 0) {
-    return interaction.reply({ content: '❌ Invalid amount.', flags: MessageFlags.Ephemeral });
-  }
-
-  const ltcPrice = await getLtcPriceUSD();
-  const ltcAmount = amount / ltcPrice;
-  const feePercent = await getFeePercent();
-  const fee = calculateFee(amount, feePercent);
-  const totalUsd = amount + fee;
-  const totalLtc = totalUsd / ltcPrice;
-
-  db.prepare(`
-    UPDATE trades SET amount = ?, fee = ?, ltcPrice = ?, ltcAmount = ?, totalLtc = ?, status = 'amount_set'
-    WHERE id = ?
-  `).run(amount, fee, ltcPrice, ltcAmount, totalLtc, tradeId);
-
-  const embed = new EmbedBuilder()
-    .setDescription(`**USD amount set to $${amount.toFixed(2)}**\n\nPlease confirm the USD amount.`)
-    .setColor(0x5865F2);
-
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`confirm_amount_${tradeId}`)
-      .setLabel('Correct')
-      .setStyle(ButtonStyle.Success),
-    new ButtonBuilder()
-      .setCustomId(`incorrect_amount_${tradeId}`)
-      .setLabel('Incorrect')
-      .setStyle(ButtonStyle.Danger)
-  );
-
-  await interaction.reply({ embeds: [embed], components: [row] });
-}
-
-async function handleAddressModal(interaction) {
-  const tradeId = interaction.customId.split('_')[2];
-  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
-
-  const address = interaction.fields.getTextInputValue('ltc_address').trim();
-
-  if (!address.startsWith('ltc1') && !address.startsWith('L') && !address.startsWith('M')) {
-    return interaction.reply({ content: '❌ Invalid LTC address.', flags: MessageFlags.Ephemeral });
-  }
-
-  const embed = new EmbedBuilder()
-    .setTitle('⚠️ Confirm Address')
-    .setDescription(`**Address:**\n\`${address}\`\n\nClick **"Confirm"** to send LTC or **"Back"** to cancel.`)
-    .setColor(0xFFD700);
-
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`confirm_withdraw_${tradeId}_${address}`)
-      .setLabel('Confirm')
-      .setStyle(ButtonStyle.Success),
-    new ButtonBuilder()
-      .setCustomId(`back_${tradeId}`)
-      .setLabel('Back')
-      .setStyle(ButtonStyle.Secondary)
-  );
-
-  await interaction.reply({ embeds: [embed], components: [row] });
 }
 
 async function handleConfirmAmount(interaction) {
