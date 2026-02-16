@@ -1,7 +1,11 @@
 const axios = require('axios');
 
-// Blockchair - No API token required for free tier!
-const BLOCKCHAIR_BASE = 'https://api.blockchair.com/litecoin';
+const BLOCKCYPHER_TOKEN = process.env.BLOCKCYPHER_TOKEN;
+const BLOCKCYPHER_BASE = 'https://api.blockcypher.com/v1/ltc/main';
+
+if (!BLOCKCYPHER_TOKEN) {
+  console.warn('⚠️ BLOCKCYPHER_TOKEN not set');
+}
 
 let priceCache = { value: 0, timestamp: 0 };
 const CACHE_DURATION = 60000;
@@ -29,23 +33,12 @@ async function checkTransactionMempool(address) {
   if (!address) return null;
   
   try {
-    const res = await axios.get(
-      `${BLOCKCHAIR_BASE}/dashboards/address/${address}`,
-      { timeout: 10000 }
-    );
+    const url = `${BLOCKCYPHER_BASE}/addrs/${address}?token=${BLOCKCYPHER_TOKEN}`;
+    const res = await axios.get(url, { timeout: 10000 });
     
-    const data = res.data.data[address];
-    if (data.transactions && data.transactions.length > 0) {
-      // Get first transaction and check if unconfirmed
-      const txRes = await axios.get(
-        `${BLOCKCHAIR_BASE}/raw/transaction/${data.transactions[0]}`,
-        { timeout: 10000 }
-      );
-      if (txRes.data.data && !txRes.data.data.block_id) {
-        return data.transactions[0];
-      }
+    if (res.data.unconfirmed_n_tx > 0 && res.data.unconfirmed_txrefs?.length > 0) {
+      return res.data.unconfirmed_txrefs[0].tx_hash;
     }
-    
     return null;
   } catch (err) {
     return null;
@@ -55,56 +48,21 @@ async function checkTransactionMempool(address) {
 async function checkPayment(address, expectedUsd) {
   try {
     const price = await getLtcPriceUSD();
-    if (price === 0) {
-      console.error('Cannot check payment: LTC price unavailable');
-      return false;
-    }
+    if (price === 0) return false;
 
-    console.log(`[Payment Check] Checking: ${address}, Expecting: $${expectedUsd}, LTC Price: $${price}`);
+    const url = `${BLOCKCYPHER_BASE}/addrs/${address}/balance?token=${BLOCKCYPHER_TOKEN}`;
+    const res = await axios.get(url, { timeout: 10000 });
 
-    const res = await axios.get(
-      `${BLOCKCHAIR_BASE}/dashboards/address/${address}`,
-      { timeout: 10000 }
-    );
+    const confirmedLtc = (res.data.balance || 0) / 1e8;
+    const unconfirmedLtc = (res.data.unconfirmed_balance || 0) / 1e8;
+    const totalLtc = confirmedLtc + unconfirmedLtc;
+    const totalUsd = totalLtc * price;
 
-    const data = res.data.data[address];
-    
-    // Blockchair gives balance in satoshis
-    const balanceSatoshi = data.address.balance || 0;
-    const receivedSatoshi = data.address.received || 0;
-    
-    const balanceLtc = balanceSatoshi / 1e8;
-    const receivedLtc = receivedSatoshi / 1e8;
-    
-    const balanceUsd = balanceLtc * price;
-    const receivedUsd = receivedLtc * price;
-
-    console.log(
-      `[Payment Check] ${address}: ${balanceLtc.toFixed(8)} LTC ($${balanceUsd.toFixed(4)}) balance, ` +
-      `${receivedLtc.toFixed(8)} LTC ($${receivedUsd.toFixed(4)}) total received`
-    );
-
-    // Use received amount for payment check (includes all time)
     const minAmount = expectedUsd * 0.90;
     const maxAmount = expectedUsd * 1.20;
-    
-    console.log(`[Payment Check] Acceptable range: $${minAmount.toFixed(4)} - $${maxAmount.toFixed(4)}, Have: $${receivedUsd.toFixed(4)}`);
 
-    if (receivedUsd >= minAmount && receivedUsd <= maxAmount && receivedLtc > 0) {
-      console.log(`[Payment Check] ✅ Payment confirmed!`);
-      return true;
-    }
-
-    if (receivedUsd > maxAmount) {
-      console.log(`[Payment Check] ⚠️ Overpayment detected: $${receivedUsd.toFixed(4)} > $${maxAmount.toFixed(4)}`);
-      return true;
-    }
-
-    if (receivedUsd < minAmount) {
-      console.log(`[Payment Check] ❌ Underpayment: $${receivedUsd.toFixed(4)} < $${minAmount.toFixed(4)}`);
-    }
-
-    console.log(`[Payment Check] ❌ Not enough funds yet`);
+    if (totalUsd >= minAmount && totalLtc > 0) return true;
+    if (totalUsd > maxAmount) return true;
     return false;
 
   } catch (err) {
@@ -115,11 +73,9 @@ async function checkPayment(address, expectedUsd) {
 
 async function getAddressInfo(address) {
   try {
-    const res = await axios.get(
-      `${BLOCKCHAIR_BASE}/dashboards/address/${address}`,
-      { timeout: 10000 }
-    );
-    return res.data.data[address];
+    const url = `${BLOCKCYPHER_BASE}/addrs/${address}/balance?token=${BLOCKCYPHER_TOKEN}`;
+    const res = await axios.get(url, { timeout: 10000 });
+    return res.data;
   } catch (err) {
     console.error('Error fetching address info:', err.message);
     return null;
@@ -128,11 +84,9 @@ async function getAddressInfo(address) {
 
 async function getTransaction(txid) {
   try {
-    const res = await axios.get(
-      `${BLOCKCHAIR_BASE}/raw/transaction/${txid}`,
-      { timeout: 10000 }
-    );
-    return res.data.data;
+    const url = `${BLOCKCYPHER_BASE}/txs/${txid}?token=${BLOCKCYPHER_TOKEN}`;
+    const res = await axios.get(url, { timeout: 10000 });
+    return res.data;
   } catch (err) {
     console.error('Error fetching transaction:', err.message);
     return null;
@@ -141,17 +95,15 @@ async function getTransaction(txid) {
 
 async function getAddressUTXOs(address) {
   try {
-    const res = await axios.get(
-      `${BLOCKCHAIR_BASE}/outputs?q=recipient(${address}),is_spent(false)`,
-      { timeout: 10000 }
-    );
+    const url = `${BLOCKCYPHER_BASE}/addrs/${address}?unspentOnly=true&token=${BLOCKCYPHER_TOKEN}`;
+    const res = await axios.get(url, { timeout: 10000 });
     
-    if (res.data.data && res.data.data.length > 0) {
-      return res.data.data.map(utxo => ({
-        txid: utxo.transaction_hash,
-        vout: utxo.index,
+    if (res.data.txrefs) {
+      return res.data.txrefs.map(utxo => ({
+        txid: utxo.tx_hash,
+        vout: utxo.tx_output_n,
         value: utxo.value,
-        script: utxo.script_hex
+        script: utxo.script
       }));
     }
     return [];
