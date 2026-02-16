@@ -156,6 +156,58 @@ async function getWalletBalance(forceRefresh = false) {
   return { total, found };
 }
 
+async function broadcastTransaction(txHex) {
+  console.log(`[Wallet] Broadcasting transaction...`);
+  
+  // Try BlockCypher first
+  try {
+    console.log(`[Wallet] Trying BlockCypher...`);
+    const broadcastRes = await axios.post(
+      `${BLOCKCYPHER_BASE}/txs/push?token=${BLOCKCYPHER_TOKEN}`,
+      { tx: txHex },
+      { 
+        timeout: 15000,
+        headers: { 'Content-Type': 'application/json' }
+      }
+    );
+
+    if (broadcastRes.data?.tx?.hash) {
+      console.log(`[Wallet] BlockCypher broadcast successful: ${broadcastRes.data.tx.hash}`);
+      return { 
+        success: true, 
+        txid: broadcastRes.data.tx.hash
+      };
+    }
+  } catch (blockcypherErr) {
+    console.error('[Wallet] BlockCypher broadcast failed:', blockcypherErr.response?.data?.error || blockcypherErr.message);
+  }
+  
+  // Fallback to Blockchair
+  try {
+    console.log('[Wallet] Trying Blockchair fallback...');
+    const blockchairRes = await axios.post(
+      'https://api.blockchair.com/litecoin/push/transaction',
+      { data: txHex },
+      { 
+        timeout: 15000,
+        headers: { 'Content-Type': 'application/json' }
+      }
+    );
+    
+    if (blockchairRes.data?.data?.transaction_hash) {
+      console.log(`[Wallet] Blockchair broadcast successful: ${blockchairRes.data.data.transaction_hash}`);
+      return {
+        success: true,
+        txid: blockchairRes.data.data.transaction_hash
+      };
+    }
+  } catch (blockchairErr) {
+    console.error('[Wallet] Blockchair broadcast failed:', blockchairErr.response?.data?.error || blockchairErr.message);
+  }
+  
+  return { success: false, error: 'Broadcast failed on both BlockCypher and Blockchair' };
+}
+
 async function sendFromIndex(index, toAddress, amountLTC) {
   if (!isInitialized()) {
     return { success: false, error: 'Wallet not initialized' };
@@ -249,52 +301,18 @@ async function sendFromIndex(index, toAddress, amountLTC) {
     psbt.finalizeAllInputs();
     const txHex = psbt.extractTransaction().toHex();
 
-    console.log(`[Wallet] Broadcasting tx...`);
+    // Broadcast using the new function
+    const broadcastResult = await broadcastTransaction(txHex);
     
-    // Try BlockCypher first
-    try {
-      const broadcastRes = await axios.post(
-        `${BLOCKCYPHER_BASE}/txs/push?token=${BLOCKCYPHER_TOKEN}`,
-        { tx: txHex },
-        { timeout: 15000 }
-      );
-
-      if (broadcastRes.data?.tx?.hash) {
-        console.log(`[Wallet] Broadcast successful: ${broadcastRes.data.tx.hash}`);
-        return { 
-          success: true, 
-          txid: broadcastRes.data.tx.hash,
-          amountSent: (amountSatoshi / 1e8).toFixed(8)
-        };
-      }
-    } catch (blockcypherErr) {
-      console.error('[Wallet] BlockCypher broadcast failed:', blockcypherErr.response?.data || blockcypherErr.message);
-      
-      // FALLBACK: Try Blockchair when BlockCypher returns 400/500
-      try {
-        console.log('[Wallet] Trying Blockchair fallback...');
-        const blockchairRes = await axios.post(
-          'https://api.blockchair.com/litecoin/push/transaction',
-          { data: txHex },
-          { timeout: 15000 }
-        );
-        
-        if (blockchairRes.data?.data?.transaction_hash) {
-          console.log(`[Wallet] Blockchair broadcast successful: ${blockchairRes.data.data.transaction_hash}`);
-          return {
-            success: true,
-            txid: blockchairRes.data.data.transaction_hash,
-            amountSent: (amountSatoshi / 1e8).toFixed(8)
-          };
-        }
-      } catch (blockchairErr) {
-        console.error('[Wallet] Blockchair broadcast failed:', blockchairErr.response?.data || blockchairErr.message);
-      }
-      
-      return { success: false, error: `Broadcast failed: ${blockcypherErr.response?.data?.error || blockcypherErr.message}` };
+    if (broadcastResult.success) {
+      return { 
+        success: true, 
+        txid: broadcastResult.txid,
+        amountSent: (amountSatoshi / 1e8).toFixed(8)
+      };
+    } else {
+      return { success: false, error: broadcastResult.error };
     }
-
-    return { success: false, error: 'Broadcast failed - no txid returned' };
 
   } catch (err) {
     console.error('[Wallet] Send error:', err);
