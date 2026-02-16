@@ -632,13 +632,20 @@ async function handleAddressModal(interaction) {
   await interaction.reply({ embeds: [embed], components: [row] });
 }
 
-// BUTTON RESTRICTION CHECK
+// BUTTON RESTRICTION CHECK - FIXED VERSION
 async function checkButtonRestriction(interaction, customId) {
   // Extract trade ID from button
   let tradeId = null;
   if (customId.includes('_')) {
     const parts = customId.split('_');
-    tradeId = parts[parts.length - 1];
+    // Handle different button formats
+    if (customId.startsWith('confirm_withdraw_')) {
+      tradeId = parts[2];
+    } else if (customId.startsWith('confirm_sendall_') || customId.startsWith('cancel_sendall')) {
+      return { restricted: false }; // Owner commands
+    } else {
+      tradeId = parts[parts.length - 1];
+    }
   }
   
   if (!tradeId) return { restricted: false };
@@ -648,38 +655,77 @@ async function checkButtonRestriction(interaction, customId) {
   
   const userId = interaction.user.id;
   
-  // Sender-only buttons
-  const senderButtons = ['role_sender_', 'set_amount_', 'confirm_amount_', 'release_', 'confirm_release_'];
+  // Owner can do everything
+  if (userId === OWNER_ID) return { restricted: false };
+  
+  // BOTH CAN CLICK: Confirm/Correct/Incorrect amount, Confirm info, Copy details
+  const bothCanClick = [
+    'confirm_amount_',
+    'incorrect_amount_',
+    'confirm_info_',
+    'incorrect_info_',
+    'copy_details_',
+    'close_ticket',
+    'delete_ticket_'
+  ];
+  for (const prefix of bothCanClick) {
+    if (customId.startsWith(prefix) || customId === prefix) {
+      return { restricted: false };
+    }
+  }
+  
+  // SENDER-ONLY buttons
+  const senderButtons = [
+    'set_amount_', 
+    'release_', 
+    'confirm_release_',
+    'back_release_',
+    'cancel_trade_'
+  ];
   for (const prefix of senderButtons) {
     if (customId.startsWith(prefix)) {
-      if (userId !== trade.senderId && userId !== OWNER_ID) {
+      if (userId !== trade.senderId) {
         return { restricted: true, message: '❌ Only the **Sender** can use this button.' };
       }
       return { restricted: false };
     }
   }
   
-  // Receiver-only buttons  
-  const receiverButtons = ['role_receiver_', 'enter_address_', 'confirm_withdraw_'];
+  // RECEIVER-ONLY buttons  
+  const receiverButtons = [
+    'enter_address_', 
+    'confirm_withdraw_',
+    'back_'
+  ];
   for (const prefix of receiverButtons) {
     if (customId.startsWith(prefix)) {
-      if (userId !== trade.receiverId && userId !== OWNER_ID) {
+      if (userId !== trade.receiverId) {
         return { restricted: true, message: '❌ Only the **Receiver** can use this button.' };
       }
       return { restricted: false };
     }
   }
   
-  // Role selection - can't select if already selected other role
+  // ROLE SELECTION - both can click before picking, but block if already have other role
   if (customId.startsWith('role_sender_')) {
+    // Block if already receiver
     if (userId === trade.receiverId) {
-      return { restricted: true, message: '❌ You are already the **Receiver**! You cannot be both.' };
+      return { restricted: true, message: '❌ You are already the **Receiver**! Click **Reset** to change roles.' };
     }
+    return { restricted: false };
   }
+  
   if (customId.startsWith('role_receiver_')) {
+    // Block if already sender
     if (userId === trade.senderId) {
-      return { restricted: true, message: '❌ You are already the **Sender**! You cannot be both.' };
+      return { restricted: true, message: '❌ You are already the **Sender**! Click **Reset** to change roles.' };
     }
+    return { restricted: false };
+  }
+  
+  // RESET button - both can click
+  if (customId.startsWith('role_reset_')) {
+    return { restricted: false };
   }
   
   return { restricted: false };
@@ -755,7 +801,7 @@ async function handleButton(interaction) {
     return;
   }
 
-  // ENTER ADDRESS BUTTON - ONLY RECEIVER CAN CLICK
+  // ENTER ADDRESS BUTTON
   if (customId.startsWith('enter_address_')) {
     const tradeId = customId.split('_')[2];
     const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
@@ -849,7 +895,7 @@ async function handleRoleSelection(interaction) {
   if (action === 'reset') {
     db.prepare('UPDATE trades SET senderId = NULL, receiverId = NULL WHERE id = ?').run(tradeId);
     await updateRoleDisplay(interaction, tradeId);
-    return interaction.reply({ content: '✅ Roles reset.', flags: MessageFlags.Ephemeral });
+    return interaction.reply({ content: '✅ Roles reset. Both users can now select again.', flags: MessageFlags.Ephemeral });
   }
 
   const isSender = action === 'sender';
@@ -859,6 +905,7 @@ async function handleRoleSelection(interaction) {
     return interaction.reply({ content: '❌ You are not part of this trade.', flags: MessageFlags.Ephemeral });
   }
 
+  // Allow re-selection if already set to same role
   if (isSender && trade.senderId === userId) {
     return interaction.reply({ content: '✅ You are already the Sender!', flags: MessageFlags.Ephemeral });
   }
@@ -866,11 +913,539 @@ async function handleRoleSelection(interaction) {
     return interaction.reply({ content: '✅ You are already the Receiver!', flags: MessageFlags.Ephemeral });
   }
 
+  // Check if trying to select role when already have other role
   if (isSender && trade.receiverId === userId) {
-    return interaction.reply({ content: '❌ You cannot be both Sender and Receiver!', flags: MessageFlags.Ephemeral });
+    return interaction.reply({ content: '❌ You are already the Receiver! Click **Reset** to change.', flags: MessageFlags.Ephemeral });
   }
   if (!isSender && trade.senderId === userId) {
-    return interaction.reply({ content: '❌ You cannot be both Sender and Receiver!', flags: MessageFlags.Ephemeral });
+    return interaction.reply({ content: '❌ You are already the Sender! Click **Reset** to change.', flags: MessageFlags.Ephemeral });
+  }
+
+  // Check if role already taken by someone else
+  if (isSender && trade.senderId && trade.senderId !== userId) {
+    return interaction.reply({ content: '❌ Someone else is already the Sender!', flags: MessageFlags.Ephemeral });
+  }
+  if (!isSender && trade.receiverId && trade.receiverId !== userId) {
+    return interaction.reply({ content: '❌ Someone else is already the Receiver!', flags: MessageFlags.Ephemeral });
+  }
+
+  if (isSender) {
+    db.prepare('UPDATE trades SET senderId = ? WHERE id = ?').run(userId, tradeId);
+  } else {
+    db.prepare('UPDATE trades SET receiverId = ? WHERE id = ?').run(userId, tradeId);
+  }
+
+  await interaction.reply({ content: `✅ You are now the ${isSender ? 'Sender' : 'Receiver'}!`, flags: MessageFlags.Ephemeral });
+
+  await updateRoleDisplay(interaction, tradeId);
+
+  const updated = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+  if (updated.senderId && updated.receiverId) {
+    await sendInfoConfirmation(interaction.channel, tradeId);
+  }
+}
+
+async function updateRoleDisplay(interaction, tradeId) {
+  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+  
+  let description = '**Select your role**\n• **"Sender"** if you are **Sending** LTC to the bot.\n• **"Receiver"** if you are **Receiving** LTC *later* from the bot.\n\n';
+
+  if (trade.senderId) {
+    const sender = await client.users.fetch(trade.senderId).catch(() => null);
+    description += `**Sender:** ${sender ? sender.toString() : 'Unknown'}\n`;
+  }
+  if (trade.receiverId) {
+    const receiver = await client.users.fetch(trade.receiverId).catch(() => null);
+    description += `**Receiver:** ${receiver ? receiver.toString() : 'Unknown'}\n`;
+  }
+
+  const embed = new EmbedBuilder().setDescription(description).setColor(0x5865F2);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`role_sender_${tradeId}`)
+      .setLabel('Sender')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`role_receiver_${tradeId}`)
+      .setLabel('Receiver')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`role_reset_${tradeId}`)
+      .setLabel('Reset')
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  const messages = await interaction.channel.messages.fetch({ limit: 10 });
+  const roleMsg = messages.find(m => m.embeds[0]?.description?.includes('Select your role'));
+  if (roleMsg) {
+    await roleMsg.edit({ embeds: [embed], components: [row] });
+  }
+}
+
+async function sendInfoConfirmation(channel, tradeId) {
+  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+  const sender = await client.users.fetch(trade.senderId).catch(() => null);
+  const receiver = await client.users.fetch(trade.receiverId).catch(() => null);
+
+  const embed = new EmbedBuilder()
+    .setTitle('• Is This Information Correct?')
+    .addFields(
+      { name: 'Sender interaction.reply({ content: '❌ Invalid user ID. User must be in this server.', flags: MessageFlags.Ephemeral });
+  }
+
+  if (otherUserId === interaction.user.id) {
+    return interaction.reply({ content: '❌ You cannot trade with yourself.', flags: MessageFlags.Ephemeral });
+  }
+
+  const channel = await interaction.guild.channels.create({
+    name: `ltc-${interaction.user.username}-${otherMember.user.username}`.substring(0, 100),
+    type: ChannelType.GuildText,
+    parent: TICKET_CATEGORY, // USE TICKET CATEGORY
+    permissionOverwrites: [
+      {
+        id: interaction.guild.id,
+        deny: [PermissionsBitField.Flags.ViewChannel],
+      },
+      {
+        id: interaction.user.id,
+        allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages],
+      },
+      {
+        id: otherUserId,
+        allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages],
+      },
+      {
+        id: client.user.id,
+        allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages],
+      },
+    ],
+  });
+
+  // ALL TICKETS USE INDEX 0
+  const depositAddress = generateAddress(TRADE_INDEX);
+  const result = db.prepare(`
+    INSERT INTO trades (channelId, user1Id, user2Id, senderId, receiverId, amount, status, createdAt, youGiving, theyGiving, depositAddress, depositIndex)
+    VALUES (?, ?, ?, NULL, NULL, 0, 'role_selection', datetime('now'), ?, ?, ?, ?)
+  `).run(channel.id, interaction.user.id, otherUserId, youGiving, theyGiving, depositAddress, TRADE_INDEX);
+
+  const tradeId = result.lastInsertRowid;
+
+  await interaction.reply({ content: `✅ Trade channel created: ${channel}`, flags: MessageFlags.Ephemeral });
+
+  const embed = new EmbedBuilder()
+    .setTitle('👋 Schior\'s Auto Middleman Service')
+    .setDescription('Make sure to follow the steps and read the instructions thoroughly.\nPlease explicitly state the trade details if the information below is inaccurate.')
+    .addFields(
+      { name: `${interaction.user.username}'s side:`, value: youGiving || 'Waiting...', inline: true },
+      { name: `${otherMember.user.username}'s side:`, value: theyGiving || 'Waiting...', inline: true }
+    )
+    .setColor(0x5865F2);
+
+  const deleteRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`delete_ticket_${tradeId}`)
+      .setLabel('Delete Ticket')
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  await channel.send({ content: `${interaction.user} ${otherMember}`, embeds: [embed], components: [deleteRow] });
+
+  const roleEmbed = new EmbedBuilder()
+    .setDescription('**Select your role**\n• **"Sender"** if you are **Sending** LTC to the bot.\n• **"Receiver"** if you are **Receiving** LTC *later* from the bot.')
+    .setColor(0x5865F2);
+
+  const roleRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`role_sender_${tradeId}`)
+      .setLabel('Sender')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`role_receiver_${tradeId}`)
+      .setLabel('Receiver')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`role_reset_${tradeId}`)
+      .setLabel('Reset')
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  await channel.send({ embeds: [roleEmbed], components: [roleRow] });
+}
+
+async function handleAmountModal(interaction) {
+  const tradeId = interaction.customId.split('_')[2];
+  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+
+  if (interaction.user.id !== trade.senderId && interaction.user.id !== OWNER_ID) {
+    return interaction.reply({ content: '❌ Only the sender can set the amount!', flags: MessageFlags.Ephemeral });
+  }
+
+  const amountStr = interaction.fields.getTextInputValue('usd_amount');
+  const amount = parseFloat(amountStr);
+
+  if (isNaN(amount) || amount <= 0) {
+    return interaction.reply({ content: '❌ Invalid amount.', flags: MessageFlags.Ephemeral });
+  }
+
+  const ltcPrice = await getLtcPriceUSD();
+  const ltcAmount = amount / ltcPrice;
+  const feePercent = await getFeePercent();
+  const fee = calculateFee(amount, feePercent);
+  const totalUsd = amount + fee;
+  const totalLtc = totalUsd / ltcPrice;
+
+  db.prepare(`
+    UPDATE trades SET amount = ?, fee = ?, ltcPrice = ?, ltcAmount = ?, totalLtc = ?, status = 'amount_set'
+    WHERE id = ?
+  `).run(amount, fee, ltcPrice, ltcAmount, totalLtc, tradeId);
+
+  const embed = new EmbedBuilder()
+    .setDescription(`**USD amount set to $${amount.toFixed(2)}**\n\nPlease confirm the USD amount.`)
+    .setColor(0x5865F2);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`confirm_amount_${tradeId}`)
+      .setLabel('Correct')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`incorrect_amount_${tradeId}`)
+      .setLabel('Incorrect')
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  await interaction.reply({ embeds: [embed], components: [row] });
+}
+
+async function handleAddressModal(interaction) {
+  const tradeId = interaction.customId.split('_')[2];
+  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+
+  if (interaction.user.id !== trade.receiverId && interaction.user.id !== OWNER_ID) {
+    return interaction.reply({ content: '❌ Only the receiver can enter their address!', flags: MessageFlags.Ephemeral });
+  }
+
+  const address = interaction.fields.getTextInputValue('ltc_address').trim();
+
+  if (!address.startsWith('ltc1') && !address.startsWith('L') && !address.startsWith('M')) {
+    return interaction.reply({ content: '❌ Invalid LTC address.', flags: MessageFlags.Ephemeral });
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle('⚠️ Confirm Address')
+    .setDescription(`**Address:**\n\`${address}\`\n\nClick **"Confirm"** to send LTC or **"Back"** to cancel.`)
+    .setColor(0xFFD700);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`confirm_withdraw_${tradeId}_${address}`)
+      .setLabel('Confirm')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`back_${tradeId}`)
+      .setLabel('Back')
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  await interaction.reply({ embeds: [embed], components: [row] });
+}
+
+// BUTTON RESTRICTION CHECK - FIXED VERSION
+async function checkButtonRestriction(interaction, customId) {
+  // Extract trade ID from button
+  let tradeId = null;
+  if (customId.includes('_')) {
+    const parts = customId.split('_');
+    // Handle different button formats
+    if (customId.startsWith('confirm_withdraw_')) {
+      tradeId = parts[2];
+    } else if (customId.startsWith('confirm_sendall_') || customId.startsWith('cancel_sendall')) {
+      return { restricted: false }; // Owner commands
+    } else {
+      tradeId = parts[parts.length - 1];
+    }
+  }
+  
+  if (!tradeId) return { restricted: false };
+  
+  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+  if (!trade) return { restricted: false };
+  
+  const userId = interaction.user.id;
+  
+  // Owner can do everything
+  if (userId === OWNER_ID) return { restricted: false };
+  
+  // BOTH CAN CLICK: Confirm/Correct/Incorrect amount, Confirm info, Copy details
+  const bothCanClick = [
+    'confirm_amount_',
+    'incorrect_amount_',
+    'confirm_info_',
+    'incorrect_info_',
+    'copy_details_',
+    'close_ticket',
+    'delete_ticket_'
+  ];
+  for (const prefix of bothCanClick) {
+    if (customId.startsWith(prefix) || customId === prefix) {
+      return { restricted: false };
+    }
+  }
+  
+  // SENDER-ONLY buttons
+  const senderButtons = [
+    'set_amount_', 
+    'release_', 
+    'confirm_release_',
+    'back_release_',
+    'cancel_trade_'
+  ];
+  for (const prefix of senderButtons) {
+    if (customId.startsWith(prefix)) {
+      if (userId !== trade.senderId) {
+        return { restricted: true, message: '❌ Only the **Sender** can use this button.' };
+      }
+      return { restricted: false };
+    }
+  }
+  
+  // RECEIVER-ONLY buttons  
+  const receiverButtons = [
+    'enter_address_', 
+    'confirm_withdraw_',
+    'back_'
+  ];
+  for (const prefix of receiverButtons) {
+    if (customId.startsWith(prefix)) {
+      if (userId !== trade.receiverId) {
+        return { restricted: true, message: '❌ Only the **Receiver** can use this button.' };
+      }
+      return { restricted: false };
+    }
+  }
+  
+  // ROLE SELECTION - both can click before picking, but block if already have other role
+  if (customId.startsWith('role_sender_')) {
+    // Block if already receiver
+    if (userId === trade.receiverId) {
+      return { restricted: true, message: '❌ You are already the **Receiver**! Click **Reset** to change roles.' };
+    }
+    return { restricted: false };
+  }
+  
+  if (customId.startsWith('role_receiver_')) {
+    // Block if already sender
+    if (userId === trade.senderId) {
+      return { restricted: true, message: '❌ You are already the **Sender**! Click **Reset** to change roles.' };
+    }
+    return { restricted: false };
+  }
+  
+  // RESET button - both can click
+  if (customId.startsWith('role_reset_')) {
+    return { restricted: false };
+  }
+  
+  return { restricted: false };
+}
+
+async function handleButton(interaction) {
+  const customId = interaction.customId;
+  
+  // CHECK BUTTON RESTRICTION FIRST
+  const restriction = await checkButtonRestriction(interaction, customId);
+  if (restriction.restricted) {
+    return interaction.reply({ content: restriction.message, flags: MessageFlags.Ephemeral });
+  }
+  
+  const interactionKey = `${interaction.user.id}_${customId}`;
+  if (confirmedInteractions.has(interactionKey)) {
+    return interaction.reply({ content: '⏳ Processing...', flags: MessageFlags.Ephemeral });
+  }
+
+  if (customId.startsWith('delete_ticket_')) {
+    await interaction.channel.delete();
+    return;
+  }
+
+  if (customId.startsWith('role_')) {
+    await handleRoleSelection(interaction);
+    return;
+  }
+
+  if (customId.startsWith('confirm_info_')) {
+    await handleConfirmInfo(interaction);
+    return;
+  }
+
+  if (customId.startsWith('incorrect_info_')) {
+    await interaction.reply({ content: '❌ Please state the correct trade details in chat.', ephemeral: false });
+    return;
+  }
+
+  if (customId.startsWith('set_amount_')) {
+    await handleSetAmount(interaction);
+    return;
+  }
+
+  if (customId.startsWith('confirm_amount_')) {
+    await handleConfirmAmount(interaction);
+    return;
+  }
+
+  if (customId.startsWith('incorrect_amount_')) {
+    await interaction.reply({ content: '❌ Please set the correct amount.', ephemeral: false });
+    return;
+  }
+
+  if (customId.startsWith('release_')) {
+    await handleRelease(interaction);
+    return;
+  }
+
+  if (customId.startsWith('confirm_release_')) {
+    const tradeId = customId.split('_')[2];
+    await promptForAddress(interaction, tradeId);
+    return;
+  }
+
+  if (customId.startsWith('back_release_')) {
+    await interaction.update({ content: '❌ Release cancelled.', components: [], embeds: [] });
+    return;
+  }
+
+  if (customId.startsWith('cancel_trade_')) {
+    await interaction.update({ content: '❌ Cancelled.', components: [], embeds: [] });
+    return;
+  }
+
+  // ENTER ADDRESS BUTTON
+  if (customId.startsWith('enter_address_')) {
+    const tradeId = customId.split('_')[2];
+    const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+    
+    if (!trade) {
+      return interaction.reply({ content: '❌ Trade not found.', flags: MessageFlags.Ephemeral });
+    }
+
+    // CHECK IF USER IS RECEIVER OR OWNER
+    if (interaction.user.id !== trade.receiverId && interaction.user.id !== OWNER_ID) {
+      return interaction.reply({ content: '❌ Only receiver can use this.', flags: MessageFlags.Ephemeral });
+    }
+    
+    const modal = new ModalBuilder()
+      .setCustomId(`address_modal_${tradeId}`)
+      .setTitle('Enter Your LTC Address');
+
+    const addressInput = new TextInputBuilder()
+      .setCustomId('ltc_address')
+      .setLabel('LTC Address')
+      .setPlaceholder('LeDdjh2BDbPkrhG2pkWBko3HRdKQzprJMX')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true);
+
+    modal.addComponents(new ActionRowBuilder().addComponents(addressInput));
+    await interaction.showModal(modal);
+    return;
+  }
+
+  if (customId.startsWith('confirm_withdraw_')) {
+    await handleConfirmWithdraw(interaction);
+    return;
+  }
+
+  if (customId.startsWith('back_')) {
+    const tradeId = customId.split('_')[1];
+    await promptForAddress(interaction, tradeId);
+    return;
+  }
+
+  if (customId === 'close_ticket') {
+    await interaction.channel.delete();
+    return;
+  }
+
+  if (customId.startsWith('copy_details_')) {
+    await interaction.reply({ content: '✅ Details copied to clipboard!', flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  if (customId.startsWith('confirm_sendall_')) {
+    const parts = interaction.customId.split('_');
+    const fromIndex = parseInt(parts[2]);
+    const address = parts[3];
+    
+    await interaction.update({ content: '⏳ Processing...', components: [], embeds: [] });
+
+    const result = await sendAllLTC(fromIndex, address);
+    
+    if (result.success) {
+      const embed = new EmbedBuilder()
+        .setTitle('✅ Sent')
+        .addFields(
+          { name: 'From Index', value: `${fromIndex}` },
+          { name: 'Amount', value: result.amountSent || '?' },
+          { name: 'To', value: address },
+          { name: 'TxID', value: result.txid }
+        )
+        .setColor('Green');
+      await interaction.editReply({ embeds: [embed] });
+    } else {
+      await interaction.editReply({ content: `❌ Failed: ${result.error}` });
+    }
+    return;
+  }
+
+  if (customId === 'cancel_sendall') {
+    await interaction.update({ content: '❌ Cancelled.', components: [], embeds: [] });
+    return;
+  }
+}
+
+async function handleRoleSelection(interaction) {
+  const parts = interaction.customId.split('_');
+  const action = parts[1];
+  const tradeId = parts[2];
+
+  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+  if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
+
+  if (action === 'reset') {
+    db.prepare('UPDATE trades SET senderId = NULL, receiverId = NULL WHERE id = ?').run(tradeId);
+    await updateRoleDisplay(interaction, tradeId);
+    return interaction.reply({ content: '✅ Roles reset. Both users can now select again.', flags: MessageFlags.Ephemeral });
+  }
+
+  const isSender = action === 'sender';
+  const userId = interaction.user.id;
+
+  if (userId !== trade.user1Id && userId !== trade.user2Id) {
+    return interaction.reply({ content: '❌ You are not part of this trade.', flags: MessageFlags.Ephemeral });
+  }
+
+  // Allow re-selection if already set to same role
+  if (isSender && trade.senderId === userId) {
+    return interaction.reply({ content: '✅ You are already the Sender!', flags: MessageFlags.Ephemeral });
+  }
+  if (!isSender && trade.receiverId === userId) {
+    return interaction.reply({ content: '✅ You are already the Receiver!', flags: MessageFlags.Ephemeral });
+  }
+
+  // Check if trying to select role when already have other role
+  if (isSender && trade.receiverId === userId) {
+    return interaction.reply({ content: '❌ You are already the Receiver! Click **Reset** to change.', flags: MessageFlags.Ephemeral });
+  }
+  if (!isSender && trade.senderId === userId) {
+    return interaction.reply({ content: '❌ You are already the Sender! Click **Reset** to change.', flags: MessageFlags.Ephemeral });
+  }
+
+  // Check if role already taken by someone else
+  if (isSender && trade.senderId && trade.senderId !== userId) {
+    return interaction.reply({ content: '❌ Someone else is already the Sender!', flags: MessageFlags.Ephemeral });
+  }
+  if (!isSender && trade.receiverId && trade.receiverId !== userId) {
+    return interaction.reply({ content: '❌ Someone else is already the Receiver!', flags: MessageFlags.Ephemeral });
   }
 
   if (isSender) {
@@ -1456,34 +2031,7 @@ async function setFeeCommand(interaction) {
   return interaction.reply({ content: `✅ Fee set to ${percent}%.`, flags: MessageFlags.Ephemeral });
 }
 
-async function closeTicket(interaction) {
-  const trade = db.prepare('SELECT * FROM trades WHERE channelId = ?').get(interaction.channel.id);
-  if (!trade) {
-    return interaction.reply({ content: '❌ No active trade here.', flags: MessageFlags.Ephemeral });
-  }
-
-  if (trade.status === 'completed' || trade.status === 'cancelled') {
-    await interaction.channel.delete();
-  } else {
-    return interaction.reply({ content: '❌ Cannot close active trade.', flags: MessageFlags.Ephemeral });
-  }
-}
-
-async function getAddressBalance(address, forceRefresh = false) {
-  try {
-    const url = `${BLOCKCYPHER_BASE}/addrs/${address}/balance?token=${process.env.BLOCKCYPHER_TOKEN}`;
-    const res = await axios.get(url, { timeout: 10000 });
-    
-    return {
-      confirmed: (res.data.balance || 0) / 1e8,
-      unconfirmed: (res.data.unconfirmed_balance || 0) / 1e8,
-      total: (res.data.balance + res.data.unconfirmed_balance) / 1e8
-    };
-  } catch (err) {
-    console.error('Balance check error:', err.message);
-    return { confirmed: 0, unconfirmed: 0, total: 0 };
-  }
-}
+async function closeTicket(interaction)
 
 client.login(DISCORD_TOKEN).catch(err => {
   console.error('❌ Failed to login:', err);
