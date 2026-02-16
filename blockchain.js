@@ -95,20 +95,47 @@ async function getTransaction(txid) {
 
 async function getAddressUTXOs(address) {
   try {
+    // Try BlockCypher first
     const url = `${BLOCKCYPHER_BASE}/addrs/${address}?unspentOnly=true&token=${BLOCKCYPHER_TOKEN}`;
     const res = await axios.get(url, { timeout: 10000 });
     
-    if (res.data.txrefs) {
+    if (res.data.txrefs && res.data.txrefs.length > 0) {
       return res.data.txrefs.map(utxo => ({
         txid: utxo.tx_hash,
         vout: utxo.tx_output_n,
         value: utxo.value,
-        script: utxo.script
+        confirmations: utxo.confirmations
       }));
     }
+    
+    // If no UTXOs from BlockCypher, try Blockchair as fallback
+    console.log(`[Blockchain] No UTXOs from BlockCypher, trying Blockchair...`);
+    return await getAddressUTXOsBlockchair(address);
+    
+  } catch (err) {
+    console.error('Error fetching UTXOs from BlockCypher:', err.message);
+    // Try Blockchair as fallback
+    return await getAddressUTXOsBlockchair(address);
+  }
+}
+
+async function getAddressUTXOsBlockchair(address) {
+  try {
+    const url = `https://api.blockchair.com/litecoin/outputs?q=recipient(${address}),is_spent(false)`;
+    const res = await axios.get(url, { timeout: 10000 });
+    
+    if (res.data.data && res.data.data.length > 0) {
+      return res.data.data.map(output => ({
+        txid: output.transaction_hash,
+        vout: output.index,
+        value: output.value,
+        confirmations: output.block_id ? 1 : 0
+      }));
+    }
+    
     return [];
   } catch (err) {
-    console.error('Error fetching UTXOs:', err.message);
+    console.error('Error fetching UTXOs from Blockchair:', err.message);
     return [];
   }
 }
