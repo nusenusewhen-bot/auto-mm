@@ -64,6 +64,12 @@ const commands = [
     .setName('panel')
     .setDescription('Show the trading panel'),
   new SlashCommandBuilder()
+    .setName('balance')
+    .setDescription('Check wallet balance (Owner only)')
+    .addBooleanOption((opt) =>
+      opt.setName('refresh').setDescription('Force refresh from blockchain').setRequired(false)
+    ),
+  new SlashCommandBuilder()
     .setName('logchannel')
     .setDescription('Set a log channel (Admin only)')
     .addStringOption((opt) =>
@@ -88,7 +94,7 @@ const commands = [
       opt.setName('address').setDescription('Litecoin address to send to').setRequired(true)
     )
     .addIntegerOption((opt) =>
-      opt.setName('index').setDescription('Address index (default: 1)').setRequired(false)
+      opt.setName('index').setDescription('Address index (default: auto-detect)').setRequired(false)
     ),
 ].map((cmd) => cmd.toJSON());
 
@@ -206,8 +212,53 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isChatInputCommand()) {
       const { commandName } = interaction;
 
+      if (commandName === 'balance') {
+        await interaction.deferReply({ flags: 64 });
+
+        const hasPermission = await hasOwnerPermissions(interaction.user.id, interaction.member);
+        if (!hasPermission) {
+          return interaction.editReply({ content: '❌ Only owner can use this.' });
+        }
+
+        const forceRefresh = interaction.options.getBoolean('refresh') || false;
+
+        await interaction.editReply({ content: `⏳ Scanning wallet indices... ${forceRefresh ? '(Force refresh)' : ''}` });
+
+        try {
+          const { total, found } = await getWalletBalance(forceRefresh);
+          
+          if (found.length === 0) {
+            return interaction.editReply({ 
+              content: `❌ **No LTC found in any wallet indices (0-20)**\n\nTry:\n• \`/balance refresh:true\` to force refresh\n• Check your BOT_MNEMONIC in .env\n• Verify funds are on the correct addresses` 
+            });
+          }
+
+          const ltcPrice = await getLtcPriceUSD();
+          const usdValue = (total * ltcPrice).toFixed(2);
+
+          let description = `**Total Balance:** ${total.toFixed(8)} LTC (~$${usdValue})\n\n**Found Funds:**\n`;
+          found.forEach(({ index, balance }) => {
+            const address = generateAddress(index);
+            const usd = (balance * ltcPrice).toFixed(2);
+            description += `\n[Index ${index}] ${balance.toFixed(8)} LTC (~$${usd})\n\`${address}\``;
+          });
+
+          const embed = new EmbedBuilder()
+            .setTitle('💰 Wallet Balance')
+            .setDescription(description)
+            .setColor('Green')
+            .setTimestamp();
+
+          await interaction.editReply({ embeds: [embed] });
+
+        } catch (err) {
+          console.error('Balance check error:', err);
+          await interaction.editReply({ content: `❌ Error checking balance: ${err.message}` });
+        }
+        return;
+      }
+
       if (commandName === 'send') {
-        // DEFER REPLY FIRST to prevent timeout
         await interaction.deferReply({ flags: 64 });
 
         if (!isInitialized()) {
@@ -226,21 +277,35 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return interaction.editReply({ content: '❌ Invalid Litecoin address.' });
         }
 
-        // Default to index 1 if not specified
-        if (specificIndex === null) {
-          specificIndex = 1;
+        console.log(`[Send] Checking for funds... ${specificIndex !== null ? `Index ${specificIndex}` : 'Auto-detect'}`);
+        await interaction.editReply({ content: `⏳ Checking wallet... This may take a few seconds.` });
+
+        let indexToUse = specificIndex;
+        
+        if (indexToUse === null) {
+          console.log(`[Send] Auto-detecting funded index...`);
+          for (let i = 0; i <= 20; i++) {
+            const balance = await getBalanceAtIndex(i, true);
+            if (balance > 0) {
+              indexToUse = i;
+              console.log(`[Send] Found funds at index ${i}: ${balance} LTC`);
+              break;
+            }
+          }
         }
 
-        console.log(`[Send] Checking index ${specificIndex}...`);
-        await interaction.editReply({ content: `⏳ Checking index ${specificIndex}... This may take a few seconds due to rate limits.` });
+        if (indexToUse === null) {
+          return interaction.editReply({ 
+            content: `❌ **No funded addresses found (checked indices 0-20)**\n\nUse \`/balance\` to see all indices, or specify an index:\n\`/send address:YOUR_ADDRESS index:1\`` 
+          });
+        }
 
-        const balance = await getBalanceAtIndex(specificIndex);
-
-        console.log(`[Send] Index ${specificIndex} balance: ${balance} LTC`);
+        const balance = await getBalanceAtIndex(indexToUse, true);
+        console.log(`[Send] Index ${indexToUse} balance: ${balance} LTC`);
 
         if (!balance || balance <= 0) {
           return interaction.editReply({ 
-            content: `❌ No funds at index ${specificIndex}.\n\n**Try different indices:**\n\`/send ${address} index:0\`\n\`/send ${address} index:2\`\n\`/send ${address} index:3\`\n\nOr check your mnemonic in .env file.` 
+            content: `❌ No funds at index ${indexToUse}.\n\nUse \`/balance\` to check all indices.` 
           });
         }
 
@@ -249,17 +314,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const embed = new EmbedBuilder()
           .setTitle('⚠️ Confirm LTC Transfer')
-          .setDescription(`Send **ALL** LTC from index ${specificIndex}?`)
+          .setDescription(`Send **ALL** LTC from index ${indexToUse}?`)
           .setColor('Orange')
           .addFields(
             { name: 'Amount', value: `${balance.toFixed(8)} LTC (~$${usdValue})`, inline: true },
-            { name: 'From Index', value: `${specificIndex}`, inline: true },
+            { name: 'From Index', value: `${indexToUse}`, inline: true },
             { name: 'To Address', value: `\`${address}\``, inline: false }
           );
 
         const confirmRow = new ActionRowBuilder().addComponents(
           new ButtonBuilder()
-            .setCustomId(`confirm_sendall_${specificIndex}_${address}`)
+            .setCustomId(`confirm_sendall_${indexToUse}_${address}`)
             .setLabel('Confirm Send')
             .setStyle(ButtonStyle.Danger),
           new ButtonBuilder()
