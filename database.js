@@ -3,7 +3,7 @@ const db = new Database('database.db');
 
 db.prepare(`
 CREATE TABLE IF NOT EXISTS trades (
-  id INTEGER PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   channelId TEXT NOT NULL,
   user1Id TEXT NOT NULL,
   user2Id TEXT NOT NULL,
@@ -13,20 +13,16 @@ CREATE TABLE IF NOT EXISTS trades (
   fee REAL DEFAULT 0,
   feePercent REAL DEFAULT 5,
   ltcPrice REAL DEFAULT 0,
-  ltcAmount TEXT,
-  totalLtc TEXT,
+  ltcAmount REAL DEFAULT 0,
+  totalLtc REAL DEFAULT 0,
   depositAddress TEXT,
+  depositIndex INTEGER DEFAULT 0,
   receiverAddress TEXT,
-  refundAddress TEXT,
-  senderAddress TEXT,
   txid TEXT,
-  user1Confirmed INTEGER DEFAULT 0,
-  user2Confirmed INTEGER DEFAULT 0,
-  status TEXT DEFAULT 'selecting_roles',
+  status TEXT DEFAULT 'role_selection',
   createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
   paidAt DATETIME,
-  completedAt DATETIME,
-  refundedAt DATETIME
+  completedAt DATETIME
 )`).run();
 
 db.prepare(`
@@ -34,10 +30,6 @@ CREATE TABLE IF NOT EXISTS config (
   key TEXT PRIMARY KEY,
   value TEXT
 )`).run();
-
-db.prepare(`CREATE INDEX IF NOT EXISTS idx_trades_channel ON trades(channelId)`).run();
-db.prepare(`CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status)`).run();
-db.prepare(`CREATE INDEX IF NOT EXISTS idx_trades_sender ON trades(senderId)`).run();
 
 console.log('✅ Database initialized');
 
