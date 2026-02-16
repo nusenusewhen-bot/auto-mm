@@ -148,8 +148,6 @@ client.on(Events.MessageCreate, async (message) => {
         const balance = await getAddressBalance(trade.depositAddress, true);
         
         if (balance.confirmed > 0 || balance.unconfirmed > 0) {
-          // Get sender's address - we need to ask or use stored address
-          // For now, we'll check if we have a return address stored, otherwise notify owner
           const sender = await client.users.fetch(trade.senderId).catch(() => null);
           
           await message.reply({
@@ -314,8 +312,8 @@ async function handleSelectMenu(interaction) {
 
     if (selected === 'litecoin') {
       const modal = new ModalBuilder()
-        .setCustomId('enter_user_modal')
-        .setTitle('Enter Other User ID');
+        .setCustomId('enter_trade_details_modal')
+        .setTitle('Trade Details');
 
       modal.addComponents(
         new ActionRowBuilder().addComponents(
@@ -324,6 +322,22 @@ async function handleSelectMenu(interaction) {
             .setLabel('Other User Discord ID')
             .setStyle(TextInputStyle.Short)
             .setPlaceholder('123456789012345678')
+            .setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('youGiving')
+            .setLabel('What are YOU giving?')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g., $50 PayPal, 1 LTC, Steam gift card')
+            .setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('theyGiving')
+            .setLabel('What is he/she giving?')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g., Fortnite account, Crypto, Item')
             .setRequired(true)
         )
       );
@@ -336,8 +350,8 @@ async function handleSelectMenu(interaction) {
 // ==================== MODAL HANDLER ====================
 
 async function handleModal(interaction) {
-  if (interaction.customId === 'enter_user_modal') {
-    await handleUserModal(interaction);
+  if (interaction.customId === 'enter_trade_details_modal') {
+    await handleTradeDetailsModal(interaction);
     return;
   }
 
@@ -352,8 +366,10 @@ async function handleModal(interaction) {
   }
 }
 
-async function handleUserModal(interaction) {
+async function handleTradeDetailsModal(interaction) {
   const otherUserId = interaction.fields.getTextInputValue('otherUserId').trim();
+  const youGiving = interaction.fields.getTextInputValue('youGiving').trim();
+  const theyGiving = interaction.fields.getTextInputValue('theyGiving').trim();
 
   let otherMember;
   try {
@@ -390,23 +406,23 @@ async function handleUserModal(interaction) {
     ],
   });
 
-  // Create trade in DB
+  // Create trade in DB with trade details
   const result = db.prepare(`
-    INSERT INTO trades (channelId, user1Id, user2Id, senderId, receiverId, amount, status, createdAt)
-    VALUES (?, ?, ?, NULL, NULL, 0, 'role_selection', datetime('now'))
-  `).run(channel.id, interaction.user.id, otherUserId);
+    INSERT INTO trades (channelId, user1Id, user2Id, senderId, receiverId, amount, status, createdAt, youGiving, theyGiving)
+    VALUES (?, ?, ?, NULL, NULL, 0, 'role_selection', datetime('now'), ?, ?)
+  `).run(channel.id, interaction.user.id, otherUserId, youGiving, theyGiving);
 
   const tradeId = result.lastInsertRowid;
 
   await interaction.reply({ content: `✅ Trade channel created: ${channel}`, flags: MessageFlags.Ephemeral });
 
-  // Send initial embed
+  // Send initial embed with trade details
   const embed = new EmbedBuilder()
     .setTitle('👋 Malieno\'s Auto Middleman Service')
     .setDescription('Make sure to follow the steps and read the instructions thoroughly.\nPlease explicitly state the trade details if the information below is inaccurate.')
     .addFields(
-      { name: `${interaction.user.username}'s side:`, value: 'Waiting...', inline: true },
-      { name: `${otherMember.user.username}'s side:`, value: 'Waiting...', inline: true }
+      { name: `${interaction.user.username}'s side:`, value: youGiving || 'Waiting...', inline: true },
+      { name: `${otherMember.user.username}'s side:`, value: theyGiving || 'Waiting...', inline: true }
     )
     .setColor(0x5865F2);
 
@@ -868,7 +884,6 @@ async function sendPaymentInstructions(channel, tradeId) {
   db.prepare("UPDATE trades SET depositAddress = ?, depositIndex = ?, status = 'awaiting_payment' WHERE id = ?")
     .run(depositAddress, depositIndex, tradeId);
 
-  // UPDATED: Added fee breakdown to match the image style
   const feePercent = await getFeePercent();
   const feeUsd = trade.fee || calculateFee(trade.amount, feePercent);
   const totalUsd = trade.amount + feeUsd;
