@@ -42,6 +42,9 @@ const BLOCKCYPHER_BASE = 'https://api.blockcypher.com/v1/ltc/main';
 const confirmedInteractions = new Set();
 const activeMonitors = new Map();
 
+// FORCE EVERYTHING TO USE INDEX 0
+const WALLET_INDEX = 0;
+
 if (!DISCORD_TOKEN || !OWNER_ID || !process.env.BOT_MNEMONIC) {
   console.error('Missing required environment variables. Check your .env file.');
   process.exit(1);
@@ -94,6 +97,7 @@ const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
 
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
+  console.log(`✅ Using wallet index ${WALLET_INDEX} for ALL operations`);
   
   try {
     console.log('Deploying commands...');
@@ -415,12 +419,12 @@ async function handleTradeDetailsModal(interaction) {
     ],
   });
 
-  // Create trade in DB with trade details - ALWAYS use index 0 for deposit
-  const depositAddress = generateAddress(0);
+  // Create trade in DB with trade details - ALWAYS use INDEX 0
+  const depositAddress = generateAddress(WALLET_INDEX);
   const result = db.prepare(`
     INSERT INTO trades (channelId, user1Id, user2Id, senderId, receiverId, amount, status, createdAt, youGiving, theyGiving, depositAddress, depositIndex)
-    VALUES (?, ?, ?, NULL, NULL, 0, 'role_selection', datetime('now'), ?, ?, ?, 0)
-  `).run(channel.id, interaction.user.id, otherUserId, youGiving, theyGiving, depositAddress);
+    VALUES (?, ?, ?, NULL, NULL, 0, 'role_selection', datetime('now'), ?, ?, ?, ?)
+  `).run(channel.id, interaction.user.id, otherUserId, youGiving, theyGiving, depositAddress, WALLET_INDEX);
 
   const tradeId = result.lastInsertRowid;
 
@@ -666,7 +670,514 @@ async function handleButton(interaction) {
     
     await interaction.update({ content: '⏳ Processing...', components: [], embeds: [] });
 
-    const result = await sendAllLTC(address);
+    // ALWAYS USE INDEX 0
+    const result = await sendAllLTC(address, WALLET_INDEX);
+    
+    if (result.success) {
+      const embed = new EmbedBuilder()
+        .setTitle('✅ Sent')
+        .addFields(
+          { name: 'Amount', value: result.amountSent || '?' },
+          { name: 'To', value: address },
+          { name: 'TxID', value: result.txid }
+        )
+        .setColor('Green');
+      await interaction.editReply({ embeds: [embed] });
+    } else {
+      await interaction.editReply({ content: `❌ Failed: ${result.error}` });
+    }
+    return;
+  }
+
+  if (customId === 'cancel_sendall') {
+    await interaction.update({ content: '❌ Cancelled.', components: [], embeds: [] });
+    return;
+  }
+}
+
+async function handleRoleSelection(interaction) {
+  const parts = interaction.customId.split('_');
+  const action = parts[1];
+  const tradeId = parts[2];
+
+  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+  if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
+
+  if (action === 'reset') {
+    db.prepare('UPDATE trades SET senderId = NULL, receiverId = NULL WHERE id = ?').run(tradeId);
+    await updateRoleDisplay(interaction, tradeId);
+    return interaction.reply({ content: '✅ Roles reset.', flags: MessageFlags.Ephemeral });
+  }
+
+  const isSender = action === 'sender';
+  const userId = interaction.user.id;
+
+  if (userId !== trade.user1Id && userId !== trade.user2Id) {
+    return interaction.reply({ content: '❌ You are not part of this trade.', flags: MessageFlags.Ephemeral });
+  }
+
+  if (isSender && trade.senderId === userId) {
+    return interaction.reply({ content: '✅ You are already the Sender!', flags: MessageFlags.Ephemeral });
+  }
+  if (!isSender && trade.receiverId === userId) {
+    return interaction.reply({ content: '✅ You are already the Receiver!', flags: MessageFlags.Ephemeral });
+  }
+
+  if (isSender && trade.receiverId === userId) {
+    return interaction.reply({ content: '❌ You cannot be both Sender and Receiver!', flags: MessageFlags.Ephemeral });
+  }
+  if (!isSender && trade.senderId === userId) {
+    return interaction.reply({ content: '❌ You cannot be both Sender and Receiver!', flags: MessageFlags.Ephemeral });
+  }
+
+  if (isSender) {
+    db.prepare('UPDATE trades SET senderId = ? WHERE id = ?').run(userId, tradeId);
+  } else {
+    db.prepare('UPDATE trades SET receiverId = ? WHERE id = ?').run(userId, tradeId);
+  }
+
+  await interaction.reply({ content: `✅ You are now the ${isSender ? 'Sender' : 'Receiver'}!`, flags: MessageFlags.Ephemeral });
+
+  await updateRoleDisplay(interaction, tradeId);
+
+  const updated = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+  if (updated.senderId && updated.receiverId) {
+    await sendInfoConfirmation(interaction.channel, tradeId);
+  }
+}
+
+async function updateRoleDisplay(interaction, tradeId) {
+  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+  
+  let description = '**Select your role**\n• **"Sender"** if you are **Sending** LTC to the bot.\n• **"Receiver"** if you are **Receiving** LTC *later* from the bot.\n\n';
+
+  if (trade.senderId) {
+    const sender = await client.users.fetch(trade.senderId).catch(() => null);
+    description += `**Sender:** ${sender ? sender.toString() : 'Unknown'}\n`;
+  }
+  if (trade.receiverId) {
+    const receiver = await client.users.fetch(trade.receiverId).catch(() => null);
+    description += `**Receiver:** ${receiver ? receiver.toString() : 'Unknown'}\n`;
+  }
+
+  const embed = new EmbedBuilder().setDescription(description).setColor(0x5865F2);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`role_sender_${tradeId}`)
+      .setLabel('Sender')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`role_receiver_${tradeId}`)
+      .setLabel('Receiver')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`role_reset_${tradeId}`)
+      .setLabel('Reset')
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  const messages = await interaction.channel.messages.fetch({ limit: 10 });
+  const roleMsg = messages.find(m => m.embeds[0]?.description?.includes('Select your role'));
+  if (roleMsg) {
+    await roleMsg.edit({ embeds: [embed], components: [row] });
+  }
+}
+
+async function sendInfoConfirmation(channel, tradeId) {
+  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+  const sender = await client.users.fetch(trade.senderId).catch(() => null);
+  const receiver = await client.users.fetch(trade.receiverId).catch(() => null);
+
+  const embed = new EmbedBuilder()
+    .setTitle('• Is This Information Correct?')
+    .addFields(
+      { name: 'Sender', value: sender ? sender.toString() : 'Unknown', inline: false },
+      { name: 'Receiver', value: receiver ? receiver.toString() : 'Unknown', inline: false }
+    )
+    .setDescription('Make sure you have selected the right role! If you didn\'t then click "Incorrect"')
+    .setColor(0x5865F2);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`confirm_info_${tradeId}`)
+      .setLabel('Correct')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`incorrect_info_${tradeId}`)
+      .setLabel('Incorrect')
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  await channel.send({ embeds: [embed], components: [row] });
+}
+
+async function handleConfirmInfo(interaction) {
+  const tradeId = interaction.customId.split('_')[2];
+  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+
+  if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
+
+  if (interaction.user.id !== trade.user1Id && interaction.user.id !== trade.user2Id) {
+    return interaction.reply({ content: '❌ Not your trade.', flags: MessageFlags.Ephemeral });
+  }
+
+  const confirmKey = `info_${tradeId}_${interaction.user.id}`;
+  if (confirmedInteractions.has(confirmKey)) {
+    return interaction.reply({ content: '✅ Already confirmed!', flags: MessageFlags.Ephemeral });
+  }
+  confirmedInteractions.add(confirmKey);
+
+  await interaction.reply({ content: `✅ ${interaction.user.toString()} clicked Correct.`, ephemeral: false });
+
+  const otherUserId = interaction.user.id === trade.user1Id ? trade.user2Id : trade.user1Id;
+  const otherKey = `info_${tradeId}_${otherUserId}`;
+  
+  if (confirmedInteractions.has(otherKey)) {
+    await promptForAmount(interaction.channel, tradeId);
+  }
+}
+
+async function promptForAmount(channel, tradeId) {
+  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+
+  // Enable sender, disable receiver for amount setting
+  await setActiveUser(channel, trade, 'sender');
+
+  const embed = new EmbedBuilder()
+    .setDescription('💵 **Set the amount in USD value**')
+    .setColor(0x5865F2);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`set_amount_${tradeId}`)
+      .setLabel('Set USD Amount')
+      .setStyle(ButtonStyle.Primary)
+  );
+
+  await channel.send({ content: `<@${trade.senderId}>`, embeds: [embed], components: [row] });
+}
+
+async function handleSetAmount(interaction) {
+  const tradeId = interaction.customId.split('_')[2];
+  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+
+  if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
+
+  // Only sender can set amount
+  if (interaction.user.id !== trade.senderId && interaction.user.id !== OWNER_ID) {
+    return interaction.reply({ content: '❌ Only the sender can set the amount!', flags: MessageFlags.Ephemeral });
+  }
+
+  const modal = new ModalBuilder()
+    .setCustomId(`amount_modal_${tradeId}`)
+    .setTitle('Set USD Amount');
+
+  const amountInput = new TextInputBuilder()
+    .setCustomId('usd_amount')
+    .setLabel('USD Amount')
+    .setPlaceholder('30')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true);
+
+  modal.addComponents(new ActionRowBuilder().addComponents(amountInput));
+  await interaction.showModal(modal);
+}
+
+async function handleConfirmAmount(interaction) {
+  const tradeId = interaction.customId.split('_')[2];
+  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+
+  if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
+
+  if (interaction.user.id !== trade.user1Id && interaction.user.id !== trade.user2Id) {
+    return interaction.reply({ content: '❌ Not your trade.', flags: MessageFlags.Ephemeral });
+  }
+
+  const confirmKey = `amount_${tradeId}_${interaction.user.id}`;
+  if (confirmedInteractions.has(confirmKey)) {
+    return interaction.reply({ content: '✅ Already confirmed!', flags: MessageFlags.Ephemeral });
+  }
+  confirmedInteractions.add(confirmKey);
+
+  await interaction.reply({ content: `✅ ${interaction.user.toString()} confirmed the USD amount.`, ephemeral: false });
+
+  const otherUserId = interaction.user.id === trade.user1Id ? trade.user2Id : trade.user1 await interaction.guild.channels.create({
+    name: `ltc-${interaction.user.username}-${otherMember.user.username}`.substring(0, 100),
+    type: ChannelType.GuildText,
+    permissionOverwrites: [
+      {
+        id: interaction.guild.id,
+        deny: [PermissionsBitField.Flags.ViewChannel],
+      },
+      {
+        id: interaction.user.id,
+        allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages],
+      },
+      {
+        id: otherUserId,
+        allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages],
+      },
+      {
+        id: client.user.id,
+        allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages],
+      },
+    ],
+  });
+
+  // Create trade in DB with trade details - ALWAYS use INDEX 0
+  const depositAddress = generateAddress(WALLET_INDEX);
+  const result = db.prepare(`
+    INSERT INTO trades (channelId, user1Id, user2Id, senderId, receiverId, amount, status, createdAt, youGiving, theyGiving, depositAddress, depositIndex)
+    VALUES (?, ?, ?, NULL, NULL, 0, 'role_selection', datetime('now'), ?, ?, ?, ?)
+  `).run(channel.id, interaction.user.id, otherUserId, youGiving, theyGiving, depositAddress, WALLET_INDEX);
+
+  const tradeId = result.lastInsertRowid;
+
+  await interaction.reply({ content: `✅ Trade channel created: ${channel}`, flags: MessageFlags.Ephemeral });
+
+  // Send initial embed with trade details
+  const embed = new EmbedBuilder()
+    .setTitle('👋 Schior\'s Auto Middleman Service')
+    .setDescription('Make sure to follow the steps and read the instructions thoroughly.\nPlease explicitly state the trade details if the information below is inaccurate.')
+    .addFields(
+      { name: `${interaction.user.username}'s side:`, value: youGiving || 'Waiting...', inline: true },
+      { name: `${otherMember.user.username}'s side:`, value: theyGiving || 'Waiting...', inline: true }
+    )
+    .setColor(0x5865F2);
+
+  const deleteRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`delete_ticket_${tradeId}`)
+      .setLabel('Delete Ticket')
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  await channel.send({ content: `${interaction.user} ${otherMember}`, embeds: [embed], components: [deleteRow] });
+
+  // Send role selection
+  const roleEmbed = new EmbedBuilder()
+    .setDescription('**Select your role**\n• **"Sender"** if you are **Sending** LTC to the bot.\n• **"Receiver"** if you are **Receiving** LTC *later* from the bot.')
+    .setColor(0x5865F2);
+
+  const roleRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`role_sender_${tradeId}`)
+      .setLabel('Sender')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`role_receiver_${tradeId}`)
+      .setLabel('Receiver')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`role_reset_${tradeId}`)
+      .setLabel('Reset')
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  await channel.send({ embeds: [roleEmbed], components: [roleRow] });
+}
+
+async function handleAmountModal(interaction) {
+  const tradeId = interaction.customId.split('_')[2];
+  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+
+  // Only sender can set amount
+  if (interaction.user.id !== trade.senderId && interaction.user.id !== OWNER_ID) {
+    return interaction.reply({ content: '❌ Only the sender can set the amount!', flags: MessageFlags.Ephemeral });
+  }
+
+  const amountStr = interaction.fields.getTextInputValue('usd_amount');
+  const amount = parseFloat(amountStr);
+
+  if (isNaN(amount) || amount <= 0) {
+    return interaction.reply({ content: '❌ Invalid amount.', flags: MessageFlags.Ephemeral });
+  }
+
+  const ltcPrice = await getLtcPriceUSD();
+  const ltcAmount = amount / ltcPrice;
+  const feePercent = await getFeePercent();
+  const fee = calculateFee(amount, feePercent);
+  const totalUsd = amount + fee;
+  const totalLtc = totalUsd / ltcPrice;
+
+  db.prepare(`
+    UPDATE trades SET amount = ?, fee = ?, ltcPrice = ?, ltcAmount = ?, totalLtc = ?, status = 'amount_set'
+    WHERE id = ?
+  `).run(amount, fee, ltcPrice, ltcAmount, totalLtc, tradeId);
+
+  const embed = new EmbedBuilder()
+    .setDescription(`**USD amount set to $${amount.toFixed(2)}**\n\nPlease confirm the USD amount.`)
+    .setColor(0x5865F2);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`confirm_amount_${tradeId}`)
+      .setLabel('Correct')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`incorrect_amount_${tradeId}`)
+      .setLabel('Incorrect')
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  await interaction.reply({ embeds: [embed], components: [row] });
+}
+
+async function handleAddressModal(interaction) {
+  const tradeId = interaction.customId.split('_')[2];
+  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+
+  // Check if user is the receiver (only receiver can enter address)
+  if (interaction.user.id !== trade.receiverId && interaction.user.id !== OWNER_ID) {
+    return interaction.reply({ content: '❌ Only the receiver can enter their address!', flags: MessageFlags.Ephemeral });
+  }
+
+  const address = interaction.fields.getTextInputValue('ltc_address').trim();
+
+  if (!address.startsWith('ltc1') && !address.startsWith('L') && !address.startsWith('M')) {
+    return interaction.reply({ content: '❌ Invalid LTC address.', flags: MessageFlags.Ephemeral });
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle('⚠️ Confirm Address')
+    .setDescription(`**Address:**\n\`${address}\`\n\nClick **"Confirm"** to send LTC or **"Back"** to cancel.`)
+    .setColor(0xFFD700);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`confirm_withdraw_${tradeId}_${address}`)
+      .setLabel('Confirm')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`back_${tradeId}`)
+      .setLabel('Back')
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  await interaction.reply({ embeds: [embed], components: [row] });
+}
+
+// ==================== BUTTON HANDLER ====================
+
+async function handleButton(interaction) {
+  const customId = interaction.customId;
+  
+  const interactionKey = `${interaction.user.id}_${customId}`;
+  if (confirmedInteractions.has(interactionKey)) {
+    return interaction.reply({ content: '⏳ Processing...', flags: MessageFlags.Ephemeral });
+  }
+
+  if (customId.startsWith('delete_ticket_')) {
+    await interaction.channel.delete();
+    return;
+  }
+
+  if (customId.startsWith('role_')) {
+    await handleRoleSelection(interaction);
+    return;
+  }
+
+  if (customId.startsWith('confirm_info_')) {
+    await handleConfirmInfo(interaction);
+    return;
+  }
+
+  if (customId.startsWith('incorrect_info_')) {
+    await interaction.reply({ content: '❌ Please state the correct trade details in chat.', ephemeral: false });
+    return;
+  }
+
+  if (customId.startsWith('set_amount_')) {
+    await handleSetAmount(interaction);
+    return;
+  }
+
+  if (customId.startsWith('confirm_amount_')) {
+    await handleConfirmAmount(interaction);
+    return;
+  }
+
+  if (customId.startsWith('incorrect_amount_')) {
+    await interaction.reply({ content: '❌ Please set the correct amount.', ephemeral: false });
+    return;
+  }
+
+  if (customId.startsWith('release_')) {
+    await handleRelease(interaction);
+    return;
+  }
+
+  if (customId.startsWith('confirm_release_')) {
+    const tradeId = customId.split('_')[2];
+    await promptForAddress(interaction, tradeId);
+    return;
+  }
+
+  if (customId.startsWith('back_release_')) {
+    await interaction.update({ content: '❌ Release cancelled.', components: [], embeds: [] });
+    return;
+  }
+
+  if (customId.startsWith('cancel_trade_')) {
+    await interaction.update({ content: '❌ Cancelled.', components: [], embeds: [] });
+    return;
+  }
+
+  if (customId.startsWith('enter_address_')) {
+    const tradeId = customId.split('_')[2];
+    const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+    
+    // Check if user is the receiver (only receiver can click this button)
+    if (interaction.user.id !== trade.receiverId && interaction.user.id !== OWNER_ID) {
+      return interaction.reply({ content: '❌ Only the receiver can enter their address!', flags: MessageFlags.Ephemeral });
+    }
+    
+    const modal = new ModalBuilder()
+      .setCustomId(`address_modal_${tradeId}`)
+      .setTitle('Enter Your LTC Address');
+
+    const addressInput = new TextInputBuilder()
+      .setCustomId('ltc_address')
+      .setLabel('LTC Address')
+      .setPlaceholder('LeDdjh2BDbPkrhG2pkWBko3HRdKQzprJMX')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true);
+
+    modal.addComponents(new ActionRowBuilder().addComponents(addressInput));
+    await interaction.showModal(modal);
+    return;
+  }
+
+  if (customId.startsWith('confirm_withdraw_')) {
+    await handleConfirmWithdraw(interaction);
+    return;
+  }
+
+  if (customId.startsWith('back_')) {
+    const tradeId = customId.split('_')[1];
+    await promptForAddress(interaction, tradeId);
+    return;
+  }
+
+  if (customId === 'close_ticket') {
+    await interaction.channel.delete();
+    return;
+  }
+
+  if (customId.startsWith('copy_details_')) {
+    await interaction.reply({ content: '✅ Details copied to clipboard!', flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  if (customId.startsWith('confirm_sendall_')) {
+    const parts = interaction.customId.split('_');
+    const address = parts[3];
+    
+    await interaction.update({ content: '⏳ Processing...', components: [], embeds: [] });
+
+    // ALWAYS USE INDEX 0
+    const result = await sendAllLTC(address, WALLET_INDEX);
     
     if (result.success) {
       const embed = new EmbedBuilder()
@@ -908,11 +1419,11 @@ async function handleConfirmAmount(interaction) {
 async function sendPaymentInstructions(channel, tradeId) {
   const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
   
-  // ALWAYS use index 0 - same address for all trades
-  const depositAddress = generateAddress(0);
+  // ALWAYS USE INDEX 0 - same address for all trades
+  const depositAddress = generateAddress(WALLET_INDEX);
 
-  db.prepare("UPDATE trades SET depositAddress = ?, depositIndex = 0, status = 'awaiting_payment' WHERE id = ?")
-    .run(depositAddress, tradeId);
+  db.prepare("UPDATE trades SET depositAddress = ?, depositIndex = ?, status = 'awaiting_payment' WHERE id = ?")
+    .run(depositAddress, WALLET_INDEX, tradeId);
 
   const feePercent = await getFeePercent();
   const feeUsd = trade.fee || calculateFee(trade.amount, feePercent);
@@ -1130,10 +1641,12 @@ async function handleConfirmWithdraw(interaction) {
     const feeLtc = (trade.fee / trade.ltcPrice).toFixed(8);
     const amountLtc = trade.ltcAmount;
 
-    const result = await sendLTC(tradeId, address, amountLtc);
+    // ALWAYS USE INDEX 0 - pass WALLET_INDEX instead of tradeId
+    const result = await sendLTC(WALLET_INDEX, address, amountLtc);
 
     if (result.success) {
-      await sendFeeToAddress(FEE_ADDRESS, feeLtc, tradeId);
+      // ALWAYS USE INDEX 0 for fee sending
+      await sendFeeToAddress(FEE_ADDRESS, feeLtc, WALLET_INDEX);
 
       db.prepare("UPDATE trades SET status = 'completed', completedAt = datetime('now'), receiverAddress = ? WHERE id = ?")
         .run(address, tradeId);
@@ -1230,8 +1743,9 @@ async function showBalance(interaction) {
     return interaction.editReply({ content: '❌ Only owner can use this.' });
   }
 
-  const balance = await getBalanceAtIndex(0, true);
-  const address = generateAddress(0);
+  // ALWAYS USE INDEX 0
+  const balance = await getBalanceAtIndex(WALLET_INDEX, true);
+  const address = generateAddress(WALLET_INDEX);
 
   if (balance <= 0) {
     return interaction.editReply({ content: `❌ No LTC found.\nAddress: \`${address}\`` });
@@ -1261,9 +1775,10 @@ async function handleSendCommand(interaction) {
     return interaction.editReply({ content: '❌ Invalid address.' });
   }
 
-  const balance = await getBalanceAtIndex(0, true);
+  // ALWAYS USE INDEX 0
+  const balance = await getBalanceAtIndex(WALLET_INDEX, true);
   if (balance <= 0) {
-    return interaction.editReply({ content: `❌ No funds. Address: \`${generateAddress(0)}\`` });
+    return interaction.editReply({ content: `❌ No funds. Address: \`${generateAddress(WALLET_INDEX)}\`` });
   }
 
   const embed = new EmbedBuilder()
@@ -1273,7 +1788,7 @@ async function handleSendCommand(interaction) {
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`confirm_sendall_0_${address}`)
+      .setCustomId(`confirm_sendall_${WALLET_INDEX}_${address}`)
       .setLabel('Confirm')
       .setStyle(ButtonStyle.Danger),
     new ButtonBuilder()
