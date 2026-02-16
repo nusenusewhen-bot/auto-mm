@@ -149,7 +149,8 @@ async function getAddressBalance(address, forceRefresh = false) {
         const total = balance + unconfirmed;
         balanceCache.set(address, { balance: total, timestamp: Date.now() });
         return total;
-      } catch {
+      } catch (retryErr) {
+        console.error(`[Wallet] Retry failed for ${address}:`, retryErr.message);
         return 0;
       }
     }
