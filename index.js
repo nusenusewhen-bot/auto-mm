@@ -97,7 +97,7 @@ const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
 
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
-  console.log(`✅ FORCED WALLET INDEX 0 ONLY`);
+  console.log(`✅ FORCED WALLET INDEX ${WALLET_INDEX} ONLY`);
   
   try {
     console.log('Deploying commands...');
@@ -402,8 +402,8 @@ async function handleTradeDetailsModal(interaction) {
     ],
   });
 
-  // FORCE INDEX 0
-  const depositAddress = generateAddress(0);
+  // FORCE INDEX 0 - NO PARAMETER
+  const depositAddress = generateAddress();
   const result = db.prepare(`
     INSERT INTO trades (channelId, user1Id, user2Id, senderId, receiverId, amount, status, createdAt, youGiving, theyGiving, depositAddress, depositIndex)
     VALUES (?, ?, ?, NULL, NULL, 0, 'role_selection', datetime('now'), ?, ?, ?, 0)
@@ -646,7 +646,7 @@ async function handleButton(interaction) {
     
     await interaction.update({ content: '⏳ Processing...', components: [], embeds: [] });
 
-    // FORCE INDEX 0
+    // FORCE INDEX 0 - NO PARAMETER
     const result = await sendAllLTC(address);
     
     if (result.success) {
@@ -887,8 +887,8 @@ async function handleConfirmAmount(interaction) {
 async function sendPaymentInstructions(channel, tradeId) {
   const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
   
-  // FORCE INDEX 0
-  const depositAddress = generateAddress(0);
+  // FORCE INDEX 0 - NO PARAMETER
+  const depositAddress = generateAddress();
 
   db.prepare("UPDATE trades SET depositAddress = ?, depositIndex = 0, status = 'awaiting_payment' WHERE id = ?")
     .run(depositAddress, tradeId);
@@ -1115,12 +1115,12 @@ async function handleConfirmWithdraw(interaction) {
     const feeLtc = (trade.fee / trade.ltcPrice).toFixed(8);
     const amountLtc = trade.ltcAmount;
 
-    // FORCE INDEX 0
-    const result = await sendLTC(0, address, amountLtc);
+    // FORCE INDEX 0 - NO PARAMETER
+    const result = await sendLTC(address, amountLtc);
 
     if (result.success) {
-      // FORCE INDEX 0
-      await sendFeeToAddress(FEE_ADDRESS, feeLtc, 0);
+      // FORCE INDEX 0 - NO PARAMETER
+      await sendFeeToAddress(FEE_ADDRESS, feeLtc);
 
       db.prepare("UPDATE trades SET status = 'completed', completedAt = datetime('now'), receiverAddress = ? WHERE id = ?")
         .run(address, tradeId);
@@ -1210,9 +1210,9 @@ async function showBalance(interaction) {
     return interaction.editReply({ content: '❌ Only owner can use this.' });
   }
 
-  // FORCE INDEX 0
-  const balance = await getBalanceAtIndex(0, true);
-  const address = generateAddress(0);
+  // FORCE INDEX 0 - NO PARAMETER
+  const balance = await getBalanceAtIndex(true);
+  const address = generateAddress();
 
   if (balance <= 0) {
     return interaction.editReply({ content: `❌ No LTC found.\nAddress: \`${address}\`` });
@@ -1242,10 +1242,10 @@ async function handleSendCommand(interaction) {
     return interaction.editReply({ content: '❌ Invalid address.' });
   }
 
-  // FORCE INDEX 0
-  const balance = await getBalanceAtIndex(0, true);
+  // FORCE INDEX 0 - NO PARAMETER
+  const balance = await getBalanceAtIndex(true);
   if (balance <= 0) {
-    return interaction.editReply({ content: `❌ No funds. Address: \`${generateAddress(0)}\`` });
+    return interaction.editReply({ content: `❌ No funds. Address: \`${generateAddress()}\`` });
   }
 
   const embed = new EmbedBuilder()
