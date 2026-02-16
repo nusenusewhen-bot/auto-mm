@@ -99,18 +99,38 @@ function getPrivateKeyWIF(index) {
   }
 }
 
+async function getAddressBalanceBlockchair(address) {
+  try {
+    const url = `https://api.blockchair.com/litecoin/dashboards/address/${address}`;
+    const res = await axios.get(url, { timeout: 15000 });
+    
+    if (res.data?.data?.[address]) {
+      const data = res.data.data[address];
+      const balance = (data.address.balance || 0) / 1e8;
+      console.log(`[Wallet] Blockchair: ${address}: ${balance} LTC`);
+      return balance;
+    }
+    return 0;
+  } catch (err) {
+    console.error(`[Wallet] Blockchair balance error:`, err.message);
+    return 0;
+  }
+}
+
 async function getAddressBalance(address, forceRefresh = false) {
   if (!address) return 0;
   
   if (!forceRefresh && balanceCache.has(address)) {
     const cached = balanceCache.get(address);
     if (Date.now() - cached.timestamp < CACHE_DURATION) {
+      console.log(`[Wallet] Using cached balance for ${address}: ${cached.balance} LTC`);
       return cached.balance;
     }
   }
 
+  // Try BlockCypher first
   try {
-    await delay(2000);
+    await delay(500); // Small delay to avoid rate limits
     
     const url = `${BLOCKCYPHER_BASE}/addrs/${address}/balance?token=${BLOCKCYPHER_TOKEN}`;
     const res = await axios.get(url, { timeout: 15000 });
@@ -119,12 +139,31 @@ async function getAddressBalance(address, forceRefresh = false) {
     const unconfirmed = (res.data.unconfirmed_balance || 0) / 1e8;
     const total = balance + unconfirmed;
     
-    console.log(`[Wallet] ${address}: ${total} LTC`);
+    console.log(`[Wallet] BlockCypher: ${address}: ${total} LTC`);
     
     balanceCache.set(address, { balance: total, timestamp: Date.now() });
     return total;
   } catch (err) {
-    console.error(`[Wallet] Error fetching balance:`, err.message);
+    if (err.response?.status === 429) {
+      console.warn(`[Wallet] BlockCypher rate limit (429) for ${address}, trying Blockchair...`);
+    } else {
+      console.error(`[Wallet] BlockCypher error:`, err.message);
+    }
+    
+    // Fallback to Blockchair
+    const blockchairBalance = await getAddressBalanceBlockchair(address);
+    if (blockchairBalance > 0) {
+      balanceCache.set(address, { balance: blockchairBalance, timestamp: Date.now() });
+      return blockchairBalance;
+    }
+    
+    // If both fail, return cached value if available (even if expired)
+    if (balanceCache.has(address)) {
+      const cached = balanceCache.get(address);
+      console.log(`[Wallet] Using expired cached balance for ${address}: ${cached.balance} LTC`);
+      return cached.balance;
+    }
+    
     return 0;
   }
 }
@@ -151,6 +190,8 @@ async function getWalletBalance(forceRefresh = false) {
       found.push({ index: i, balance });
       total += balance;
     }
+    // Small delay between requests to avoid rate limits
+    if (i < 20) await delay(100);
   }
   
   return { total, found };
@@ -301,7 +342,6 @@ async function sendFromIndex(index, toAddress, amountLTC) {
     psbt.finalizeAllInputs();
     const txHex = psbt.extractTransaction().toHex();
 
-    // Broadcast using the new function
     const broadcastResult = await broadcastTransaction(txHex);
     
     if (broadcastResult.success) {
@@ -338,6 +378,8 @@ async function sendAllLTC(toAddress, specificIndex = null) {
         indexToUse = i;
         break;
       }
+      // Small delay to avoid rate limits
+      await delay(100);
     }
   }
   
@@ -366,6 +408,7 @@ async function sendFeeToAddress(feeAddress, feeLtc, tradeId) {
     if (balance >= parseFloat(feeLtc) + 0.0001) {
       return await sendFromIndex(i, feeAddress, feeLtc);
     }
+    await delay(100);
   }
   return { success: false, error: 'No index with sufficient balance for fee' };
 }
