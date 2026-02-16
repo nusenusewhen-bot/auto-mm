@@ -28,6 +28,25 @@ async function getLtcPriceUSD() {
   }
 }
 
+async function checkTransactionMempool(address) {
+  if (!BLOCKCYPHER_TOKEN || !address) return null;
+  
+  try {
+    const res = await axios.get(
+      `https://api.blockcypher.com/v1/ltc/main/addrs/${address}?token=${BLOCKCYPHER_TOKEN}`,
+      { timeout: 10000 }
+    );
+    
+    if (res.data.unconfirmed_n_tx > 0 && res.data.unconfirmed_txrefs && res.data.unconfirmed_txrefs.length > 0) {
+      return res.data.unconfirmed_txrefs[0].tx_hash;
+    }
+    
+    return null;
+  } catch (err) {
+    return null;
+  }
+}
+
 async function checkPayment(address, expectedUsd) {
   if (!BLOCKCYPHER_TOKEN) {
     console.error('BLOCKCYPHER_TOKEN not configured');
@@ -122,4 +141,4 @@ async function getTransaction(txid) {
   }
 }
 
-module.exports = { checkPayment, getLtcPriceUSD, getAddressInfo, getTransaction };
+module.exports = { checkPayment, getLtcPriceUSD, getAddressInfo, getTransaction, checkTransactionMempool };
