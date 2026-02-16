@@ -416,13 +416,27 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         let indexToUse = specificIndex;
         
+        // FIXED: Use cache first (false), not forceRefresh (true)
         if (indexToUse === null) {
-          console.log(`[Send] Auto-detecting funded index...`);
+          console.log(`[Send] Auto-detecting funded index (using cache)...`);
+          for (let i = 0; i <= 20; i++) {
+            const balance = await getBalanceAtIndex(i, false); // CHANGED: false instead of true
+            if (balance > 0) {
+              indexToUse = i;
+              console.log(`[Send] Found funds at index ${i}: ${balance} LTC`);
+              break;
+            }
+          }
+        }
+        
+        // If not found in cache, try with forceRefresh as fallback
+        if (indexToUse === null) {
+          console.log(`[Send] Retrying with force refresh...`);
           for (let i = 0; i <= 20; i++) {
             const balance = await getBalanceAtIndex(i, true);
             if (balance > 0) {
               indexToUse = i;
-              console.log(`[Send] Found funds at index ${i}: ${balance} LTC`);
+              console.log(`[Send] Found funds at index ${i}: ${balance} LTC (force refresh)`);
               break;
             }
           }
@@ -432,7 +446,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return interaction.editReply({ content: '❌ No funded addresses found (checked indices 0-20). Use /balance to see all indices, or specify an index: /send address:YOUR_ADDRESS index:1' });
         }
 
-        const balance = await getBalanceAtIndex(indexToUse, true);
+        // FIXED: Use cache for this check too
+        const balance = await getBalanceAtIndex(indexToUse, false); // CHANGED: false instead of true
         console.log(`[Send] Index ${indexToUse} balance: ${balance} LTC`);
 
         if (!balance || balance <= 0) {
