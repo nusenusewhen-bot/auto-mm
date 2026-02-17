@@ -136,7 +136,7 @@ async function sendFromIndex(fromIndex, toAddress, amountLTC) {
   console.log(`[Wallet] Sending ${amountLTC} LTC from index ${fromIndex} (${fromAddress}) to ${toAddress}`);
 
   try {
-    // Get balance (uses node if available - INSTANT)
+    // Get balance
     const balanceData = await getAddressBalance(fromAddress, true);
     const currentBalance = balanceData.total;
     
@@ -146,12 +146,12 @@ async function sendFromIndex(fromIndex, toAddress, amountLTC) {
       return { success: false, error: `No balance in wallet index ${fromIndex}. Address: ${fromAddress}` };
     }
 
-    // Get UTXOs (uses node if available - INSTANT)
+    // Get UTXOs
     let utxos = await getAddressUTXOs(fromAddress);
     
     if (utxos.length === 0 && currentBalance > 0) {
       console.log(`[Wallet] No UTXOs found but balance is ${currentBalance}, waiting for sync...`);
-      await delay(2000);
+      await delay(3000);
       utxos = await getAddressUTXOs(fromAddress);
     }
     
@@ -185,7 +185,8 @@ async function sendFromIndex(fromIndex, toAddress, amountLTC) {
       if (inputSum >= amountSatoshi + fee) break;
       
       try {
-        await delay(100); // Small delay between fetches
+        await delay(300); // INCREASED for Blockchair (was 100)
+        console.log(`[Wallet] Fetching hex for input ${utxo.txid}:${utxo.vout}...`);
         const txHex = await getTransactionHex(utxo.txid);
         
         if (!txHex) {
@@ -193,6 +194,7 @@ async function sendFromIndex(fromIndex, toAddress, amountLTC) {
           continue;
         }
         
+        console.log(`[Wallet] Got hex (${txHex.length} chars), adding input...`);
         psbt.addInput({
           hash: utxo.txid,
           index: utxo.vout,
@@ -200,15 +202,20 @@ async function sendFromIndex(fromIndex, toAddress, amountLTC) {
         });
         inputSum += utxo.value;
         inputsAdded++;
-        console.log(`[Wallet] Added input: ${utxo.txid}:${utxo.vout}`);
+        console.log(`[Wallet] Added input: ${utxo.txid}:${utxo.vout} (${utxo.value} sat)`);
       } catch (err) {
         console.error(`[Wallet] Error adding input:`, err.message);
         continue;
       }
     }
 
+    console.log(`[Wallet] Total inputs added: ${inputsAdded}, sum: ${inputSum}`);
+
     if (inputsAdded === 0) {
-      return { success: false, error: 'Could not add any inputs' };
+      return { 
+        success: false, 
+        error: 'Could not add any inputs - API failed to fetch transaction data. Check API credits or try again.' 
+      };
     }
 
     psbt.addOutput({ address: toAddress, value: amountSatoshi });
@@ -216,6 +223,7 @@ async function sendFromIndex(fromIndex, toAddress, amountLTC) {
     const change = inputSum - amountSatoshi - fee;
     if (change > 546) {
       psbt.addOutput({ address: fromAddress, value: change });
+      console.log(`[Wallet] Change output: ${change} satoshi`);
     }
 
     const keyPair = ECPair.fromWIF(wif, ltcNet);
@@ -223,6 +231,7 @@ async function sendFromIndex(fromIndex, toAddress, amountLTC) {
     for (let i = 0; i < psbt.inputCount; i++) {
       try {
         psbt.signInput(i, keyPair);
+        console.log(`[Wallet] Signed input ${i}`);
       } catch (e) {
         return { success: false, error: `Signing failed: ${e.message}` };
       }
@@ -231,7 +240,7 @@ async function sendFromIndex(fromIndex, toAddress, amountLTC) {
     psbt.finalizeAllInputs();
     const txHex = psbt.extractTransaction().toHex();
 
-    // Broadcast (uses node if available - INSTANT)
+    console.log(`[Wallet] Broadcasting transaction...`);
     const broadcastResult = await broadcastTransaction(txHex);
     
     if (broadcastResult.success) {
