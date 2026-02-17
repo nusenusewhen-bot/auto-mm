@@ -4,7 +4,7 @@ const bitcoin = require('bitcoinjs-lib');
 const axios = require('axios');
 const { ECPairFactory } = require('ecpair');
 const tinysecp = require('tiny-secp256k1');
-const { getAddressUTXOs } = require('./blockchain');
+const { getAddressUTXOs, getTransactionHex, delay } = require('./blockchain');
 
 const ECPair = ECPairFactory(tinysecp);
 
@@ -24,10 +24,6 @@ let root = null;
 let initialized = false;
 let cachedBalances = {};
 const CACHE_DURATION = 30 * 1000;
-
-function delay(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
 
 function initWallet(mnemonic) {
   console.log("[Wallet] Initializing wallet...");
@@ -196,6 +192,7 @@ async function broadcastTransaction(txHex) {
   }
 }
 
+// IMPROVED sendFromIndex with better UTXO handling
 async function sendFromIndex(fromIndex, toAddress, amountLTC) {
   if (!isInitialized()) {
     return { success: false, error: 'Wallet not initialized' };
@@ -211,20 +208,46 @@ async function sendFromIndex(fromIndex, toAddress, amountLTC) {
   console.log(`[Wallet] Sending ${amountLTC} LTC from index ${fromIndex} (${fromAddress}) to ${toAddress}`);
 
   try {
+    // Get fresh balance
     const currentBalance = await getAddressBalance(fromAddress, true);
     
     if (currentBalance <= 0) {
       return { success: false, error: `No balance in wallet index ${fromIndex}` };
     }
 
-    const utxos = await getAddressUTXOs(fromAddress);
+    // Try up to 3 times to get UTXOs
+    let utxos = [];
+    let attempts = 0;
+    while (utxos.length === 0 && attempts < 3) {
+      utxos = await getAddressUTXOs(fromAddress);
+      if (utxos.length === 0) {
+        console.log(`[Wallet] No UTXOs found, attempt ${attempts + 1}/3, waiting...`);
+        await delay(2000);
+        attempts++;
+      }
+    }
     
     if (utxos.length === 0) {
-      return { success: false, error: 'No UTXOs found' };
+      // If still no UTXOs but we have balance, try to use the full balance endpoint
+      console.log(`[Wallet] Trying alternative UTXO method...`);
+      const info = await getAddressInfo(fromAddress);
+      if (info && info.balance > 0) {
+        // Create a single "virtual" UTXO with the full balance
+        // This is a fallback that assumes the balance is spendable
+        console.log(`[Wallet] Using balance-based fallback`);
+        utxos = [{
+          txid: 'pending',
+          vout: 0,
+          value: info.balance,
+          confirmations: info.confirmations || 1
+        }];
+      } else {
+        return { success: false, error: 'No UTXOs found and no balance detected' };
+      }
     }
 
     const amountSatoshi = Math.floor(parseFloat(amountLTC) * 1e8);
-    const fee = 10000;
+    const fee = 10000; // 0.0001 LTC fee
     const totalInput = utxos.reduce((sum, u) => sum + u.value, 0);
 
     if (totalInput < amountSatoshi + fee) {
@@ -239,47 +262,44 @@ async function sendFromIndex(fromIndex, toAddress, amountLTC) {
       if (inputSum >= amountSatoshi + fee) break;
       
       try {
-        await delay(200);
-        const txRes = await axios.get(
-          `${BLOCKCYPHER_BASE}/txs/${utxo.txid}?token=${BLOCKCYPHER_TOKEN}`,
-          { 
-            timeout: 15000,
-            headers: { 'User-Agent': 'LTC-Bot/1.0' }
-          }
-        );
+        // Skip if txid is 'pending' (fallback mode)
+        if (utxo.txid === 'pending') {
+          console.log(`[Wallet] Cannot use fallback UTXO for signing, need actual txid`);
+          continue;
+        }
         
-        const tx = txRes.data;
-        const output = tx.outputs[utxo.vout];
+        await delay(300);
+        const txHex = await getTransactionHex(utxo.txid);
         
-        if (!output || !output.script) {
+        if (!txHex) {
+          console.log(`[Wallet] Could not get hex for ${utxo.txid}, skipping`);
           continue;
         }
         
         psbt.addInput({
           hash: utxo.txid,
           index: utxo.vout,
-          witnessUtxo: {
-            script: Buffer.from(output.script, 'hex'),
-            value: utxo.value
-          }
+          nonWitnessUtxo: Buffer.from(txHex, 'hex')
         });
         inputSum += utxo.value;
         inputsAdded++;
+        console.log(`[Wallet] Added input: ${utxo.txid}:${utxo.vout} = ${utxo.value} satoshi`);
       } catch (err) {
-        console.error(`[Wallet] Error adding input:`, err.message);
+        console.error(`[Wallet] Error adding input ${utxo.txid}:`, err.message);
         continue;
       }
     }
 
     if (inputsAdded === 0) {
-      return { success: false, error: 'Could not add any inputs' };
+      return { success: false, error: 'Could not add any inputs - UTXOs may be unconfirmed or unavailable' };
     }
 
     psbt.addOutput({ address: toAddress, value: amountSatoshi });
     
     const change = inputSum - amountSatoshi - fee;
-    if (change > 546) {
+    if (change > 546) { // Dust threshold
       psbt.addOutput({ address: fromAddress, value: change });
+      console.log(`[Wallet] Change output: ${change} satoshi to ${fromAddress}`);
     }
 
     const keyPair = ECPair.fromWIF(wif, ltcNet);
@@ -287,7 +307,9 @@ async function sendFromIndex(fromIndex, toAddress, amountLTC) {
     for (let i = 0; i < psbt.inputCount; i++) {
       try {
         psbt.signInput(i, keyPair);
+        console.log(`[Wallet] Signed input ${i}`);
       } catch (e) {
+        console.error(`[Wallet] Signing failed for input ${i}:`, e.message);
         return { success: false, error: `Signing failed: ${e.message}` };
       }
     }
