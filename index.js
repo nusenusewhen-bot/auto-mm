@@ -567,6 +567,7 @@ async function handleAddressModal(interaction) {
   const tradeId = interaction.customId.split('_')[2];
   const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
+  // ONLY RECEIVER CAN ENTER ADDRESS - SENDER CANNOT
   if (interaction.user.id !== trade.receiverId && interaction.user.id !== OWNER_ID) {
     return interaction.reply({ content: '❌ Only the receiver can enter their address!', flags: MessageFlags.Ephemeral });
   }
@@ -656,7 +657,7 @@ async function handleButton(interaction) {
   }
 
   if (customId.startsWith('cancel_trade_')) {
-    await interaction.update({ content: '❌ Cancelled.', components: [], embeds: [] });
+    await handleCancelTrade(interaction);
     return;
   }
 
@@ -669,9 +670,9 @@ async function handleButton(interaction) {
       return interaction.reply({ content: '❌ Trade not found.', flags: MessageFlags.Ephemeral });
     }
 
-    // CHECK IF USER IS RECEIVER OR OWNER
+    // ONLY RECEIVER CAN ENTER ADDRESS - SENDER CANNOT
     if (interaction.user.id !== trade.receiverId && interaction.user.id !== OWNER_ID) {
-      return interaction.reply({ content: '❌ Only receiver can use this.', flags: MessageFlags.Ephemeral });
+      return interaction.reply({ content: '❌ Only the receiver can enter their address!', flags: MessageFlags.Ephemeral });
     }
     
     const modal = new ModalBuilder()
@@ -1125,6 +1126,7 @@ async function handleRelease(interaction) {
 
   if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
 
+  // ONLY SENDER CAN CLICK RELEASE - RECEIVER CANNOT
   if (interaction.user.id !== trade.senderId && interaction.user.id !== OWNER_ID) {
     return interaction.reply({ content: '❌ Only the sender can release funds!', flags: MessageFlags.Ephemeral });
   }
@@ -1174,6 +1176,11 @@ async function handleConfirmWithdraw(interaction) {
   const address = parts[3];
 
   const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+
+  // ONLY RECEIVER CAN CONFIRM WITHDRAW - SENDER CANNOT
+  if (interaction.user.id !== trade.receiverId && interaction.user.id !== OWNER_ID) {
+    return interaction.reply({ content: '❌ Only the receiver can confirm the withdrawal!', flags: MessageFlags.Ephemeral });
+  }
 
   const sendingEmbed = new EmbedBuilder()
     .setDescription('⏳ **Sending...**')
@@ -1230,6 +1237,68 @@ async function handleConfirmWithdraw(interaction) {
     console.error('Withdrawal error:', err);
     await setActiveUser(interaction.channel, trade, 'receiver');
     await interaction.editReply({ content: '❌ Withdrawal failed. Check console.', components: [] });
+  }
+}
+
+// NEW: CANCEL TRADE HANDLER - BOTH MUST CONFIRM
+async function handleCancelTrade(interaction) {
+  const tradeId = interaction.customId.split('_')[2];
+  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+
+  if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
+
+  // Check if user is part of the trade
+  if (interaction.user.id !== trade.user1Id && interaction.user.id !== trade.user2Id) {
+    return interaction.reply({ content: '❌ You are not part of this trade.', flags: MessageFlags.Ephemeral });
+  }
+
+  const confirmKey = `cancel_${tradeId}_${interaction.user.id}`;
+  if (confirmedInteractions.has(confirmKey)) {
+    return interaction.reply({ content: '✅ You already confirmed!', flags: MessageFlags.Ephemeral });
+  }
+  
+  confirmedInteractions.add(confirmKey);
+
+  // Determine who is the other user
+  const otherUserId = interaction.user.id === trade.user1Id ? trade.user2Id : trade.user1Id;
+  const otherKey = `cancel_${tradeId}_${otherUserId}`;
+
+  await interaction.reply({ content: `✅ ${interaction.user.toString()} wants to cancel the trade. Waiting for other party...`, ephemeral: false });
+
+  // If other user already confirmed, cancel the trade
+  if (confirmedInteractions.has(otherKey)) {
+    if (activeMonitors.has(trade.id)) {
+      clearInterval(activeMonitors.get(trade.id));
+      activeMonitors.delete(trade.id);
+    }
+    
+    db.prepare("UPDATE trades SET status = 'cancelled' WHERE id = ?").run(trade.id);
+    
+    await interaction.channel.send({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle('❌ Trade Cancelled')
+          .setDescription('Both parties agreed to cancel the trade.')
+          .setColor('Red')
+      ]
+    });
+
+    setTimeout(() => {
+      interaction.channel.delete().catch(() => {});
+    }, 10000);
+  } else {
+    // Update message to show waiting for other user
+    const otherRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`cancel_trade_${tradeId}`)
+        .setLabel('Confirm Cancel')
+        .setStyle(ButtonStyle.Danger)
+    );
+    
+    await interaction.message.edit({ 
+      content: `<@${otherUserId}> **Please confirm to cancel the trade**`,
+      components: [otherRow] 
+    });
   }
 }
 
