@@ -1,7 +1,11 @@
 const axios = require('axios');
 
-const API_KEY = 'e4576b8d51560b4afab6da2b83e1f562441ff640';
+const API_KEY = process.env.CRYPTOAPIS_KEY;
 const BASE_URL = 'https://rest.cryptoapis.io';
+
+if (!API_KEY) {
+  console.error('❌ CRYPTOAPIS_KEY not set in environment variables');
+}
 
 let priceCache = { value: 0, timestamp: 0 };
 const CACHE_DURATION = 60000;
@@ -54,8 +58,6 @@ async function getAddressUTXOs(address) {
 }
 
 async function getTransactionHex(txid) {
-  // CryptoApis might not have this endpoint directly
-  // Try to get raw tx or return null and use alternative
   try {
     const endpoint = `/blockchain-data/litecoin/mainnet/transactions/${txid}`;
     const data = await cryptoApisRequest(endpoint);
@@ -118,7 +120,6 @@ async function checkTransactionMempool(address) {
     const data = await cryptoApisRequest(endpoint);
     
     if (data && data.unconfirmedBalance > 0) {
-      // Get latest transaction
       const txEndpoint = `/addresses-historical/utxo/litecoin/mainnet/${address}/unspent-outputs`;
       const txData = await cryptoApisRequest(txEndpoint);
       if (txData && txData.items && txData.items.length > 0) {
