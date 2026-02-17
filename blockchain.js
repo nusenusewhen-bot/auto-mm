@@ -98,81 +98,141 @@ async function getAddressUTXOs(address) {
 }
 
 async function getTransactionHex(txid) {
+  console.log(`\n[TX] ========== Fetching hex for ${txid} ==========`);
+  
   try {
-    // CRITICAL FIX: Must include API key for raw transaction endpoint
-    let url = `${BASE_URL}/raw/transaction/${txid}`;
+    // Try 1: Blockchair Paid (if available)
     if (BLOCKCHAIR_KEY && usePaidPlan) {
-      url += `?key=${BLOCKCHAIR_KEY}`;
+      console.log(`[TX] Trying Blockchair PAID...`);
+      const url = `${BASE_URL}/raw/transaction/${txid}?key=${BLOCKCHAIR_KEY}`;
+      
+      try {
+        const res = await axios.get(url, { timeout: 30000 });
+        console.log(`[TX] Blockchair PAID status: ${res.status}`);
+        
+        if (res.data?.data?.[txid]?.raw_transaction) {
+          console.log(`[TX] ✓ Got hex from Blockchair PAID`);
+          return res.data.data[txid].raw_transaction;
+        }
+      } catch (err) {
+        if (err.response?.status === 402 || err.response?.status === 429) {
+          console.log(`[TX] Blockchair PAID credits exhausted`);
+          usePaidPlan = false;
+        } else {
+          console.log(`[TX] Blockchair PAID failed: ${err.message}`);
+        }
+      }
     }
     
-    console.log(`[Blockchair] Fetching raw tx for ${txid}...`);
-    const res = await axios.get(url, { timeout: 30000 });
-    
-    if (!res.data || !res.data.data) {
-      console.error(`[Blockchair] No data for tx ${txid}`);
-      return null;
+    // Try 2: Blockchair Free
+    console.log(`[TX] Trying Blockchair FREE...`);
+    try {
+      const url = `${BASE_URL}/raw/transaction/${txid}`;
+      const res = await axios.get(url, { timeout: 30000 });
+      
+      if (res.data?.data?.[txid]?.raw_transaction) {
+        console.log(`[TX] ✓ Got hex from Blockchair FREE`);
+        return res.data.data[txid].raw_transaction;
+      }
+    } catch (err) {
+      console.log(`[TX] Blockchair FREE failed: ${err.message}`);
+      if (err.response?.data?.context?.error) {
+        console.log(`[TX] Blockchair error: ${err.response.data.context.error}`);
+      }
     }
     
-    const txData = res.data.data[txid];
-    if (!txData) {
-      console.error(`[Blockchair] Transaction ${txid} not found in response`);
-      return null;
+    // Try 3: BlockCypher (reliable fallback)
+    console.log(`[TX] Trying BlockCypher fallback...`);
+    try {
+      const url = `https://api.blockcypher.com/v1/ltc/main/txs/${txid}?includeHex=true`;
+      const res = await axios.get(url, { timeout: 30000 });
+      
+      if (res.data?.hex) {
+        console.log(`[TX] ✓ Got hex from BlockCypher`);
+        return res.data.hex;
+      }
+    } catch (err) {
+      console.log(`[TX] BlockCypher failed: ${err.message}`);
     }
     
-    if (!txData.raw_transaction) {
-      console.error(`[Blockchair] No raw_transaction field for ${txid}`);
-      return null;
+    // Try 4: Alternative Blockchair endpoint
+    console.log(`[TX] Trying Blockchair dashboard endpoint...`);
+    try {
+      let url = `${BASE_URL}/dashboards/transaction/${txid}`;
+      if (BLOCKCHAIR_KEY) url += `?key=${BLOCKCHAIR_KEY}`;
+      
+      const res = await axios.get(url, { timeout: 30000 });
+      if (res.data?.data?.[txid]?.raw_transaction) {
+        console.log(`[TX] ✓ Got hex from Blockchair dashboard`);
+        return res.data.data[txid].raw_transaction;
+      }
+    } catch (err) {
+      console.log(`[TX] Blockchair dashboard failed: ${err.message}`);
     }
     
-    console.log(`[Blockchair] Got hex for ${txid}: ${txData.raw_transaction.substring(0, 30)}...`);
-    return txData.raw_transaction;
+    console.error(`[TX] ✗ All methods failed for ${txid}`);
+    return null;
+    
   } catch (err) {
-    console.error(`[Blockchair] getTransactionHex error for ${txid}:`, err.message);
-    if (err.response?.data?.context?.error) {
-      console.error(`[Blockchair] API Error:`, err.response.data.context.error);
-    }
-    // If paid plan fails, try free
-    if (BLOCKCHAIR_KEY && usePaidPlan && err.response && (err.response.status === 402 || err.response.status === 429)) {
-      console.log('[Blockchair] Raw tx: Switching to free plan for this request...');
-      usePaidPlan = false;
-      return await getTransactionHex(txid);
-    }
+    console.error(`[TX] Critical error: ${err.message}`);
     return null;
   }
 }
 
 async function broadcastTransaction(txHex) {
+  // Try Blockchair first
   try {
     let url = `${BASE_URL}/push/transaction`;
     if (BLOCKCHAIR_KEY && usePaidPlan) {
       url += `?key=${BLOCKCHAIR_KEY}`;
     }
     
+    console.log(`[Broadcast] Trying Blockchair...`);
     const res = await axios.post(url, { data: txHex }, {
       headers: { 'Content-Type': 'application/json' },
       timeout: 30000
     });
     
-    if (res.data && res.data.data && res.data.data.transaction_hash) {
+    if (res.data?.data?.transaction_hash) {
+      console.log(`[Broadcast] ✓ Success via Blockchair`);
       return { 
         success: true, 
         txid: res.data.data.transaction_hash 
       };
-    } else {
-      return { success: false, error: 'Unknown response from Blockchair' };
     }
   } catch (err) {
-    if (BLOCKCHAIR_KEY && usePaidPlan && err.response && (err.response.status === 402 || err.response.status === 429)) {
-      console.log('[Blockchair] Broadcast: Switching to free plan...');
-      usePaidPlan = false;
-      return await broadcastTransaction(txHex);
-    }
+    console.log(`[Broadcast] Blockchair failed: ${err.message}`);
     
+    if (err.response?.status === 402 || err.response?.status === 429) {
+      usePaidPlan = false;
+    }
+  }
+  
+  // Fallback to BlockCypher
+  try {
+    console.log(`[Broadcast] Trying BlockCypher...`);
+    const url = `https://api.blockcypher.com/v1/ltc/main/txs/push`;
+    const res = await axios.post(url, { tx: txHex }, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 30000
+    });
+    
+    if (res.data?.tx?.hash) {
+      console.log(`[Broadcast] ✓ Success via BlockCypher`);
+      return { 
+        success: true, 
+        txid: res.data.tx.hash 
+      };
+    }
+  } catch (err) {
+    console.log(`[Broadcast] BlockCypher failed: ${err.message}`);
     return { 
       success: false, 
-      error: err.response?.data?.context?.error || err.message 
+      error: err.response?.data?.error || err.message 
     };
   }
+  
+  return { success: false, error: 'All broadcast methods failed' };
 }
 
 async function getLtcPriceUSD() {
@@ -208,9 +268,9 @@ async function checkTransactionMempool(address) {
 }
 
 if (BLOCKCHAIR_KEY) {
-  console.log('✅ [Blockchair] Using PAID plan (10k requests)');
+  console.log('✅ [Blockchair] PAID plan active (will fallback to BlockCypher if needed)');
 } else {
-  console.log('✅ [Blockchair] Using FREE plan (30 req/min)');
+  console.log('✅ [Blockchair] FREE plan + BlockCypher fallback');
 }
 
 module.exports = {
