@@ -21,7 +21,7 @@ const {
 
 const db = require('./database');
 const { initWallet, generateAddress, sendLTC, getWalletBalance, sendAllLTC, isInitialized, getBalanceAtIndex, sendFeeToFeeWallet } = require('./wallet');
-const { checkPayment, getLtcPriceUSD, checkTransactionMempool, getAddressUTXOs } = require('./blockchain');
+const { checkPayment, getLtcPriceUSD, checkTransactionMempool, getAddressUTXOs, getAddressBalance } = require('./blockchain');
 const { REST } = require('@discordjs/rest');
 const axios = require('axios');
 
@@ -36,7 +36,6 @@ const client = new Client({
 const OWNER_ID = process.env.OWNER_ID;
 const OWNER_ROLE_ID = process.env.OWNER_ROLE_ID;
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const BLOCKCYPHER_BASE = 'https://api.blockcypher.com/v1/ltc/main';
 
 const confirmedInteractions = new Set();
 const activeMonitors = new Map();
@@ -120,22 +119,6 @@ async function getStaffRole() {
 async function getTranscriptChannel() {
   const row = db.prepare("SELECT value FROM config WHERE key='transcriptChannel'").get();
   return row ? row.value : null;
-}
-
-async function getAddressBalance(address, forceRefresh = false) {
-  try {
-    const url = `https://api.blockcypher.com/v1/ltc/main/addrs/${address}/balance?token=${process.env.BLOCKCYPHER_TOKEN}`;
-    const res = await axios.get(url, { timeout: 10000 });
-    
-    return {
-      confirmed: (res.data.balance || 0) / 1e8,
-      unconfirmed: (res.data.unconfirmed_balance || 0) / 1e8,
-      total: (res.data.balance + res.data.unconfirmed_balance) / 1e8
-    };
-  } catch (err) {
-    console.error('Balance check error:', err.message);
-    return { confirmed: 0, unconfirmed: 0, total: 0 };
-  }
 }
 
 const commands = [
