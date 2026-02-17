@@ -44,10 +44,13 @@ const userCooldowns = new Map();
 const COOLDOWN_MS = 3000;
 
 // Track whose turn it is for specific actions
-const activeTurns = new Map(); // tradeId -> { type: 'sender'|'receiver', userId: string }
+const activeTurns = new Map();
 
 const TRADE_INDEX = 0;
 const FEE_INDEX = 1;
+
+// Payment acceptance threshold (85% of expected amount)
+const PAYMENT_THRESHOLD = 0.85;
 
 if (!DISCORD_TOKEN || !OWNER_ID || !process.env.BOT_MNEMONIC) {
   console.error('Missing required environment variables. Check your .env file.');
@@ -182,6 +185,7 @@ client.once(Events.ClientReady, async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   console.log(`✅ ALL TICKETS USE INDEX ${TRADE_INDEX}`);
   console.log(`✅ ALL FEES GO TO INDEX ${FEE_INDEX}`);
+  console.log(`✅ PAYMENT THRESHOLD: ${PAYMENT_THRESHOLD * 100}%`);
   
   try {
     console.log('Deploying commands...');
@@ -289,7 +293,6 @@ client.on(Events.MessageCreate, async (message) => {
       return message.reply('❌ Channel not found.');
     }
     
-    // Clear any active turn restrictions
     activeTurns.delete(trade.id);
     
     const embed = new EmbedBuilder()
@@ -813,7 +816,6 @@ async function handleAmountModal(interaction) {
   const tradeId = interaction.customId.split('_')[2];
   const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
-  // Check if it's the sender's turn to set amount
   const currentTurn = activeTurns.get(tradeId);
   if (!currentTurn || currentTurn.type !== 'sender' || currentTurn.userId !== interaction.user.id) {
     return interaction.reply({ 
@@ -850,7 +852,6 @@ async function handleAmountModal(interaction) {
     WHERE id = ?
   `).run(amount, fee, ltcPrice, ltcAmount, totalLtc, tradeId);
 
-  // Clear the turn after amount is set
   activeTurns.delete(tradeId);
 
   const embed = new EmbedBuilder()
@@ -875,7 +876,6 @@ async function handleAddressModal(interaction) {
   const tradeId = interaction.customId.split('_')[2];
   const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
-  // Check if it's the receiver's turn to enter address
   const currentTurn = activeTurns.get(tradeId);
   if (!currentTurn || currentTurn.type !== 'receiver' || currentTurn.userId !== interaction.user.id) {
     return interaction.reply({ 
@@ -1080,7 +1080,6 @@ async function handleButton(interaction) {
       return interaction.reply({ content: '❌ Trade not found.', flags: MessageFlags.Ephemeral });
     }
 
-    // Check if it's receiver's turn
     const currentTurn = activeTurns.get(tradeId);
     if (!currentTurn || currentTurn.type !== 'receiver' || currentTurn.userId !== interaction.user.id) {
       return interaction.reply({ 
@@ -1410,7 +1409,6 @@ async function handleConfirmInfo(interaction) {
 async function promptForAmount(channel, tradeId) {
   const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
-  // Set turn to sender
   activeTurns.set(tradeId, { type: 'sender', userId: trade.senderId });
 
   const embed = new EmbedBuilder()
@@ -1433,7 +1431,6 @@ async function handleSetAmount(interaction) {
 
   if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
 
-  // Check if it's sender's turn
   const currentTurn = activeTurns.get(tradeId);
   if (!currentTurn || currentTurn.type !== 'sender' || currentTurn.userId !== interaction.user.id) {
     return interaction.reply({ 
@@ -1536,7 +1533,8 @@ async function sendPaymentInstructions(channel, tradeId) {
 }
 
 // Track detected transactions to prevent false positives
-const detectedTransactions = new Map(); // tradeId -> { txHash, amount, timestamp }
+const detectedTransactions = new Map();
+const detectedBalances = new Map();
 
 function startPaymentMonitor(tradeId, channelId, expectedLtc) {
   if (activeMonitors.has(tradeId)) return;
@@ -1545,6 +1543,7 @@ function startPaymentMonitor(tradeId, channelId, expectedLtc) {
 
   let checkCount = 0;
   let lastBalance = 0;
+  let detectionCount = 0;
   
   const checkBalance = async () => {
     try {
@@ -1562,36 +1561,50 @@ function startPaymentMonitor(tradeId, channelId, expectedLtc) {
       }
 
       checkCount++;
-      const balance = await getAddressBalance(trade.depositAddress, true);
+      
+      // Use cached balance if available to reduce API calls
+      let balance;
+      const cachedBalance = detectedBalances.get(tradeId);
+      if (cachedBalance && (Date.now() - cachedBalance.timestamp < 5000)) {
+        balance = cachedBalance.balance;
+      } else {
+        balance = await getAddressBalance(trade.depositAddress, true);
+        detectedBalances.set(tradeId, { balance, timestamp: Date.now() });
+      }
+      
       console.log(`[Monitor] Trade ${tradeId} Check #${checkCount} - Confirmed: ${balance.confirmed}, Unconfirmed: ${balance.unconfirmed}, Expected: ${expectedLtc}`);
       
-      // Only detect NEW unconfirmed transactions (balance increased)
+      // Calculate minimum acceptable amount (85% of expected)
+      const minAcceptableLtc = expectedLtc * PAYMENT_THRESHOLD;
       const minDetectionThreshold = 0.0001;
       
-      // Check for new unconfirmed balance
+      // Check for new unconfirmed balance (payment detected)
       if (balance.unconfirmed > lastBalance && balance.unconfirmed > minDetectionThreshold) {
         const newAmount = balance.unconfirmed - lastBalance;
         lastBalance = balance.unconfirmed;
+        detectionCount++;
         
-        // Prevent duplicate detection
-        const existingDetection = detectedTransactions.get(tradeId);
-        if (!existingDetection || (Date.now() - existingDetection.timestamp > 60000)) {
-          detectedTransactions.set(tradeId, { 
-            amount: newAmount, 
-            timestamp: Date.now(),
-            txHash: 'pending'
-          });
+        // Only notify on first detection
+        if (detectionCount === 1) {
           await handleTransactionDetected(tradeId, newAmount, false);
         }
       }
 
-      // Check for confirmed payment
-      if (balance.confirmed >= expectedLtc * 0.99 && balance.confirmed > minDetectionThreshold) {
+      // Check for confirmed payment with threshold
+      if (balance.confirmed >= minAcceptableLtc && balance.confirmed > minDetectionThreshold) {
+        console.log(`[Monitor] Payment confirmed! Received: ${balance.confirmed} LTC, Expected: ${expectedLtc}, Threshold: ${minAcceptableLtc}`);
+        
         if (activeMonitors.has(tradeId)) {
           clearInterval(activeMonitors.get(tradeId));
           activeMonitors.delete(tradeId);
         }
-        await handleTransactionConfirmed(tradeId);
+        
+        // Update trade with actual received amount if different
+        if (Math.abs(balance.confirmed - expectedLtc) > 0.00001) {
+          console.log(`[Monitor] Partial payment detected. Expected: ${expectedLtc}, Got: ${balance.confirmed}`);
+        }
+        
+        await handleTransactionConfirmed(tradeId, balance.confirmed);
       }
     } catch (err) {
       console.error('[Monitor] Error:', err.message);
@@ -1600,7 +1613,8 @@ function startPaymentMonitor(tradeId, channelId, expectedLtc) {
 
   checkBalance();
   
-  const intervalId = setInterval(checkBalance, 5000); // Check every 5 seconds
+  // Check every 4 seconds (15 checks per minute - safe for free tier)
+  const intervalId = setInterval(checkBalance, 4000);
 
   setTimeout(() => {
     if (activeMonitors.has(tradeId)) {
@@ -1622,14 +1636,7 @@ async function handleTransactionDetected(tradeId, amount, confirmed) {
   const channel = client.channels.cache.get(trade.channelId);
   if (!channel) return;
 
-  // Get actual transaction hash from mempool
   const txHash = await checkTransactionMempool(trade.depositAddress) || 'pending';
-  
-  // Update stored detection with txHash
-  const detection = detectedTransactions.get(tradeId);
-  if (detection) {
-    detection.txHash = txHash;
-  }
   
   const ltcPrice = parseFloat(trade.ltcPrice) || await getLtcPriceUSD() || 0;
   const amountNum = parseFloat(amount) || 0;
@@ -1650,31 +1657,33 @@ async function handleTransactionDetected(tradeId, amount, confirmed) {
   await channel.send({ embeds: [embed] });
 }
 
-async function handleTransactionConfirmed(tradeId) {
+async function handleTransactionConfirmed(tradeId, actualLtcReceived) {
   const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
   const channel = client.channels.cache.get(trade.channelId);
   if (!channel) return;
 
   db.prepare("UPDATE trades SET status = 'awaiting_release' WHERE id = ?").run(tradeId);
 
-  // Get the transaction hash from detection or fetch fresh
-  let txHash = 'confirmed';
-  const detection = detectedTransactions.get(tradeId);
-  if (detection && detection.txHash && detection.txHash !== 'pending') {
-    txHash = detection.txHash;
-  } else {
-    txHash = await checkTransactionMempool(trade.depositAddress) || 'confirmed';
-  }
+  const txHash = await checkTransactionMempool(trade.depositAddress) || 'confirmed';
   
-  const totalLtc = parseFloat(trade.totalLtc) || 0;
   const ltcPrice = parseFloat(trade.ltcPrice) || await getLtcPriceUSD() || 0;
-  const totalUsd = totalLtc * ltcPrice;
+  const totalUsd = actualLtcReceived * ltcPrice;
+  const expectedLtc = parseFloat(trade.totalLtc) || 0;
+
+  // Check if it was a partial payment
+  const isPartial = actualLtcReceived < (expectedLtc * 0.99);
+  
+  let description = 'The payment has been confirmed and secured in escrow.';
+  if (isPartial) {
+    description = `⚠️ **Partial payment detected!** Expected ${expectedLtc.toFixed(5)} LTC but received ${actualLtcReceived.toFixed(5)} LTC. The trade will proceed with the received amount.`;
+  }
 
   const embed = new EmbedBuilder()
     .setTitle('✅ Transaction Confirmed!')
+    .setDescription(description)
     .addFields(
       { name: 'Transaction', value: `[${txHash.substring(0, 10)}...${txHash.substring(txHash.length-8)}](https://live.blockcypher.com/ltc/tx/${txHash})` },
-      { name: 'Total Amount Received', value: `${totalLtc.toFixed(8)} LTC ($${totalUsd.toFixed(2)})` }
+      { name: 'Total Amount Received', value: `${actualLtcReceived.toFixed(8)} LTC ($${totalUsd.toFixed(2)})` }
     )
     .setColor(0x00FF00);
 
@@ -1738,7 +1747,6 @@ async function handleConfirmRelease(interaction) {
     return interaction.reply({ content: '❌ Only the sender can confirm release!', flags: MessageFlags.Ephemeral });
   }
 
-  // Set turn to receiver for address entry
   activeTurns.set(tradeId, { type: 'receiver', userId: trade.receiverId });
 
   await promptForAddress(interaction, tradeId);
@@ -1773,7 +1781,6 @@ async function handleConfirmWithdraw(interaction) {
     return interaction.reply({ content: '❌ Only the receiver can confirm the withdrawal!', flags: MessageFlags.Ephemeral });
   }
 
-  // Check if it's receiver's turn
   const currentTurn = activeTurns.get(tradeId);
   if (!currentTurn || currentTurn.type !== 'receiver' || currentTurn.userId !== interaction.user.id) {
     return interaction.reply({ 
@@ -1789,8 +1796,15 @@ async function handleConfirmWithdraw(interaction) {
   await interaction.update({ embeds: [sendingEmbed], components: [] });
 
   try {
+    // Get actual balance received instead of expected
+    const actualBalance = await getAddressBalance(trade.depositAddress, true);
     const feeLtc = (trade.fee / trade.ltcPrice).toFixed(8);
-    const amountLtc = trade.ltcAmount;
+    
+    // Calculate amount to send (actual received minus fee)
+    let amountLtc = actualBalance.confirmed - parseFloat(feeLtc);
+    if (amountLtc <= 0) {
+      amountLtc = trade.ltcAmount; // Fallback to expected amount
+    }
 
     const result = await sendLTC(address, amountLtc);
 
@@ -1800,7 +1814,6 @@ async function handleConfirmWithdraw(interaction) {
       db.prepare("UPDATE trades SET status = 'completed', completedAt = datetime('now'), receiverAddress = ?, txid = ? WHERE id = ?")
         .run(address, result.txid, tradeId);
 
-      // Clear turn after completion
       activeTurns.delete(tradeId);
 
       await logTradeCompletion(trade, result.txid);
@@ -1828,7 +1841,6 @@ async function handleConfirmWithdraw(interaction) {
         interaction.channel.delete().catch(() => {});
       }, 120000);
     } else {
-      // Keep turn active on failure so receiver can retry
       await interaction.editReply({ content: `❌ Withdrawal failed: ${result.error}`, components: [] });
     }
   } catch (err) {
@@ -1923,7 +1935,6 @@ async function handleConfirmCancel(interaction) {
       activeMonitors.delete(trade.id);
     }
     
-    // Clear any active turns
     activeTurns.delete(trade.id);
     
     db.prepare("UPDATE trades SET status = 'cancelled' WHERE id = ?").run(trade.id);
