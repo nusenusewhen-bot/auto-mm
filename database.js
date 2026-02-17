@@ -25,23 +25,27 @@ CREATE TABLE IF NOT EXISTS trades (
   paidAt DATETIME,
   completedAt DATETIME,
   youGiving TEXT,
-  theyGiving TEXT
+  theyGiving TEXT,
+  ticketType TEXT DEFAULT 'trade'
 )`).run();
 
-// Add new columns if they don't exist (for existing databases)
-try {
-  db.prepare("ALTER TABLE trades ADD COLUMN youGiving TEXT").run();
-} catch(e) {
-  // Column already exists
-}
+// Add new columns if they don't exist
+const columns = [
+  { name: 'youGiving', type: 'TEXT' },
+  { name: 'theyGiving', type: 'TEXT' },
+  { name: 'depositIndex', type: 'INTEGER' },
+  { name: 'ticketType', type: 'TEXT' }
+];
 
-try {
-  db.prepare("ALTER TABLE trades ADD COLUMN theyGiving TEXT").run();
-} catch(e) {
-  // Column already exists
-}
+columns.forEach(col => {
+  try {
+    db.prepare(`ALTER TABLE trades ADD COLUMN ${col.name} ${col.type}`).run();
+  } catch(e) {
+    // Column already exists
+  }
+});
 
-// Log channel table
+// Config table
 db.prepare(`
 CREATE TABLE IF NOT EXISTS config (
   key TEXT PRIMARY KEY,
