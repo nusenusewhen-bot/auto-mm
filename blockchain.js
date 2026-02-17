@@ -1,91 +1,69 @@
 const axios = require('axios');
-const { 
-  isNodeConfigured,
-  getAddressBalanceNode, 
-  getAddressUTXOsNode, 
-  getTransactionHexNode,
-  broadcastTransactionNode,
-  isNodeSynced,
-  getAddressMempool
-} = require('./litecoin-node');
 
 let priceCache = { value: 0, timestamp: 0 };
 const CACHE_DURATION = 60000;
 
-function delay(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-// ONLY use your own node - no more rate limits
 async function getAddressBalance(address, forceRefresh = false) {
-  console.log(`[Balance] Checking ${address}`);
-  
-  if (!isNodeConfigured()) {
-    console.error('[Balance] Node not configured!');
-    return { confirmed: 0, unconfirmed: 0, total: 0, source: 'none' };
+  try {
+    const url = `https://api.blockchair.com/litecoin/dashboards/address/${address}`;
+    const res = await axios.get(url, { timeout: 10000 });
+    
+    const data = res.data.data[address];
+    const balance = (data.address.balance || 0) / 1e8;
+    
+    return {
+      confirmed: balance,
+      unconfirmed: 0,
+      total: balance,
+      source: 'blockchair'
+    };
+  } catch (err) {
+    console.error('Balance check error:', err.message);
+    return { confirmed: 0, unconfirmed: 0, total: 0 };
   }
-  
-  const nodeSynced = await isNodeSynced();
-  if (!nodeSynced) {
-    console.log('[Balance] Node not synced yet...');
-    return { confirmed: 0, unconfirmed: 0, total: 0, source: 'syncing' };
-  }
-  
-  console.log(`[Balance] Using OWN NODE (fast)...`);
-  const nodeResult = await getAddressBalanceNode(address);
-  if (nodeResult) {
-    console.log(`[Balance] Node: ${nodeResult.total} LTC (${nodeResult.confirmed} confirmed, ${nodeResult.unconfirmed} unconfirmed)`);
-    return nodeResult;
-  }
-  
-  return { confirmed: 0, unconfirmed: 0, total: 0, source: 'none' };
 }
 
-// Get UTXOs - Node only
 async function getAddressUTXOs(address) {
-  console.log(`[UTXO] Fetching for ${address}`);
-  
-  if (!isNodeConfigured()) {
-    console.error('[UTXO] Node not configured!');
+  try {
+    const url = `https://api.blockchair.com/litecoin/dashboards/address/${address}?limit=100`;
+    const res = await axios.get(url, { timeout: 10000 });
+    
+    const data = res.data.data[address];
+    if (!data.utxo) return [];
+    
+    return data.utxo.map(u => ({
+      txid: u.transaction_hash,
+      vout: u.index,
+      value: u.value,
+      confirmations: u.block_id ? 1 : 0
+    }));
+  } catch (err) {
+    console.error('UTXO fetch error:', err.message);
     return [];
   }
-  
-  const nodeSynced = await isNodeSynced();
-  if (!nodeSynced) {
-    console.log('[UTXO] Node not synced yet...');
-    return [];
-  }
-  
-  const nodeUTXOs = await getAddressUTXOsNode(address);
-  console.log(`[UTXO] Node found ${nodeUTXOs.length} UTXOs (INSTANT)`);
-  return nodeUTXOs;
 }
 
-// Get transaction hex - Node only
 async function getTransactionHex(txid) {
-  if (!isNodeConfigured()) return null;
-  
-  const nodeHex = await getTransactionHexNode(txid);
-  if (nodeHex) return nodeHex;
-  
-  return null;
+  try {
+    const url = `https://api.blockchair.com/litecoin/raw/transaction/${txid}`;
+    const res = await axios.get(url, { timeout: 10000 });
+    return res.data.data[txid].raw_transaction;
+  } catch (err) {
+    return null;
+  }
 }
 
-// Broadcast - Node only (instant confirmation)
 async function broadcastTransaction(txHex) {
-  if (!isNodeConfigured()) {
-    return { success: false, error: 'Node not configured' };
+  try {
+    const res = await axios.post(
+      'https://api.blockcypher.com/v1/ltc/main/txs/push',
+      { tx: txHex },
+      { timeout: 30000 }
+    );
+    return { success: true, txid: res.data.tx.hash };
+  } catch (err) {
+    return { success: false, error: err.message };
   }
-  
-  console.log(`[Broadcast] Sending via OWN NODE (instant)`);
-  const nodeResult = await broadcastTransactionNode(txHex);
-  
-  if (nodeResult.success) {
-    console.log(`[Broadcast] Sent via OWN NODE: ${nodeResult.txid}`);
-    return nodeResult;
-  }
-  
-  return { success: false, error: nodeResult.error || 'Broadcast failed' };
 }
 
 async function getLtcPriceUSD() {
@@ -107,20 +85,18 @@ async function getLtcPriceUSD() {
 }
 
 async function checkTransactionMempool(address) {
-  if (!address) return null;
-  
-  if (isNodeConfigured()) {
-    try {
-      const mempool = await getAddressMempool(address);
-      if (mempool && mempool.length > 0) {
-        return mempool[0].txid;
-      }
-    } catch (e) {
-      // Ignore errors
+  try {
+    const url = `https://api.blockchair.com/litecoin/dashboards/address/${address}`;
+    const res = await axios.get(url, { timeout: 10000 });
+    const data = res.data.data[address];
+    
+    if (data.transactions && data.transactions.length > 0) {
+      return data.transactions[0];
     }
+    return null;
+  } catch (err) {
+    return null;
   }
-  
-  return null;
 }
 
 module.exports = {
@@ -129,6 +105,5 @@ module.exports = {
   getTransactionHex,
   broadcastTransaction,
   getLtcPriceUSD,
-  checkTransactionMempool,
-  delay
+  checkTransactionMempool
 };
