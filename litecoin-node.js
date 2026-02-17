@@ -1,6 +1,6 @@
 const axios = require('axios');
 
-const NODE_URL = process.env.LITECOIN_NODE_URL;
+const NODE_URL = process.env.LITECOIN_NODE_URL || 'http://localhost:9332';
 const RPC_USER = process.env.LITECOIN_RPC_USER || 'user';
 const RPC_PASS = process.env.LITECOIN_RPC_PASSWORD || 'pass';
 
@@ -39,35 +39,47 @@ async function rpcCall(method, params = []) {
   }
 }
 
-// Get balance for address using your own node
+// Get balance for address using scantxoutset (faster, no import needed)
 async function getAddressBalanceNode(address) {
   try {
-    // Import address to watch (does nothing if already imported)
-    await rpcCall('importaddress', [address, '', false]);
+    // Use scantxoutset for instant balance check (no address import needed)
+    const result = await rpcCall('scantxoutset', ['start', [{ "desc": `addr(${address})` }]]);
     
-    // Get unspent outputs for address
-    const utxos = await rpcCall('listunspent', [0, 9999999, [address]]);
-    
-    if (!utxos || !Array.isArray(utxos)) {
-      return { confirmed: 0, unconfirmed: 0, total: 0, source: 'own-node' };
-    }
-    
-    let confirmed = 0;
-    let unconfirmed = 0;
-    
-    for (const utxo of utxos) {
-      if (utxo.confirmations > 0) {
-        confirmed += utxo.amount;
-      } else {
-        unconfirmed += utxo.amount;
+    if (!result || !result.success) {
+      // Fallback to importaddress if scantxoutset fails
+      await rpcCall('importaddress', [address, '', false]);
+      const utxos = await rpcCall('listunspent', [0, 9999999, [address]]);
+      
+      if (!utxos || !Array.isArray(utxos)) {
+        return { confirmed: 0, unconfirmed: 0, total: 0, source: 'own-node' };
       }
+      
+      let confirmed = 0;
+      let unconfirmed = 0;
+      
+      for (const utxo of utxos) {
+        if (utxo.confirmations > 0) {
+          confirmed += utxo.amount;
+        } else {
+          unconfirmed += utxo.amount;
+        }
+      }
+      
+      return {
+        confirmed,
+        unconfirmed,
+        total: confirmed + unconfirmed,
+        source: 'own-node'
+      };
     }
+    
+    const totalLTC = result.total_amount || 0;
     
     return {
-      confirmed,
-      unconfirmed,
-      total: confirmed + unconfirmed,
-      source: 'own-node'
+      confirmed: totalLTC,
+      unconfirmed: 0,
+      total: totalLTC,
+      source: 'own-node-scantxoutset'
     };
   } catch (err) {
     console.error('[LTC Node] Balance check failed:', err.message);
@@ -140,6 +152,38 @@ async function getMempoolInfo() {
   }
 }
 
+// Get mempool transactions for address
+async function getMempoolForAddress(address) {
+  try {
+    // Get raw mempool
+    const mempool = await rpcCall('getrawmempool', [true]);
+    if (!mempool) return [];
+    
+    const relevant = [];
+    for (const [txid, txInfo] of Object.entries(mempool)) {
+      // Check if this tx involves our address (simplified check)
+      try {
+        const rawTx = await rpcCall('getrawtransaction', [txid, true]);
+        if (rawTx && rawTx.vout) {
+          for (const output of rawTx.vout) {
+            if (output.scriptPubKey && output.scriptPubKey.addresses) {
+              if (output.scriptPubKey.addresses.includes(address)) {
+                relevant.push({ txid, ...txInfo });
+                break;
+              }
+            }
+          }
+        }
+      } catch (e) {
+        // Skip if can't decode
+      }
+    }
+    return relevant;
+  } catch (err) {
+    return [];
+  }
+}
+
 module.exports = {
   isNodeConfigured,
   getAddressBalanceNode,
@@ -148,5 +192,6 @@ module.exports = {
   broadcastTransactionNode,
   isNodeSynced,
   getMempoolInfo,
+  getMempoolForAddress,
   rpcCall
 };
