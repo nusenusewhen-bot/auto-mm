@@ -11,26 +11,22 @@ async function blockchairRequest(endpoint) {
   try {
     let url = `${BASE_URL}${endpoint}`;
     
-    // Use API key if available (paid plan)
-    if (BLOCKCHAIR_KEY) {
+    if (BLOCKCHAIR_KEY && usePaidPlan) {
       url += `${endpoint.includes('?') ? '&' : '?'}key=${BLOCKCHAIR_KEY}`;
     }
     
     const res = await axios.get(url, { timeout: 30000 });
     
-    // Check if credits ran out
     if (res.data && res.data.context && res.data.context.error) {
       if (res.data.context.error.includes('credits') || res.data.context.error.includes('limit')) {
         console.log('[Blockchair] Paid credits exhausted, falling back to free plan');
         usePaidPlan = false;
-        // Retry without key
         return await blockchairRequestFree(endpoint);
       }
     }
     
     return res.data.data;
   } catch (err) {
-    // If 402 Payment Required or rate limit, try without key
     if (err.response && (err.response.status === 402 || err.response.status === 429)) {
       console.log('[Blockchair] Paid plan hit limit, using free tier...');
       usePaidPlan = false;
@@ -83,23 +79,64 @@ async function getAddressBalance(address) {
 async function getAddressUTXOs(address) {
   const data = await blockchairRequest(`/dashboards/address/${address}`);
   
-  if (!data || !data[address] || !data[address].utxo) return [];
+  if (!data || !data[address] || !data[address].utxo) {
+    console.log(`[Blockchair] No UTXOs found for ${address}`);
+    return [];
+  }
   
-  return data[address].utxo
+  const utxos = data[address].utxo
     .filter(u => !u.is_spent)
     .map(u => ({
       txid: u.transaction_hash,
       vout: u.index,
-      value: u.value,
+      value: parseInt(u.value),
       confirmations: u.block_id > 0 ? 1 : 0
     }));
+  
+  console.log(`[Blockchair] Found ${utxos.length} UTXOs for ${address}`);
+  return utxos;
 }
 
 async function getTransactionHex(txid) {
   try {
-    const data = await blockchairRequest(`/raw/transaction/${txid}`);
-    return data && data[txid] ? data[txid].raw_transaction : null;
+    // CRITICAL FIX: Must include API key for raw transaction endpoint
+    let url = `${BASE_URL}/raw/transaction/${txid}`;
+    if (BLOCKCHAIR_KEY && usePaidPlan) {
+      url += `?key=${BLOCKCHAIR_KEY}`;
+    }
+    
+    console.log(`[Blockchair] Fetching raw tx for ${txid}...`);
+    const res = await axios.get(url, { timeout: 30000 });
+    
+    if (!res.data || !res.data.data) {
+      console.error(`[Blockchair] No data for tx ${txid}`);
+      return null;
+    }
+    
+    const txData = res.data.data[txid];
+    if (!txData) {
+      console.error(`[Blockchair] Transaction ${txid} not found in response`);
+      return null;
+    }
+    
+    if (!txData.raw_transaction) {
+      console.error(`[Blockchair] No raw_transaction field for ${txid}`);
+      return null;
+    }
+    
+    console.log(`[Blockchair] Got hex for ${txid}: ${txData.raw_transaction.substring(0, 30)}...`);
+    return txData.raw_transaction;
   } catch (err) {
+    console.error(`[Blockchair] getTransactionHex error for ${txid}:`, err.message);
+    if (err.response?.data?.context?.error) {
+      console.error(`[Blockchair] API Error:`, err.response.data.context.error);
+    }
+    // If paid plan fails, try free
+    if (BLOCKCHAIR_KEY && usePaidPlan && err.response && (err.response.status === 402 || err.response.status === 429)) {
+      console.log('[Blockchair] Raw tx: Switching to free plan for this request...');
+      usePaidPlan = false;
+      return await getTransactionHex(txid);
+    }
     return null;
   }
 }
@@ -122,10 +159,9 @@ async function broadcastTransaction(txHex) {
         txid: res.data.data.transaction_hash 
       };
     } else {
-      return { success: false, error: 'Unknown response' };
+      return { success: false, error: 'Unknown response from Blockchair' };
     }
   } catch (err) {
-    // If paid plan fails due to credits, try free
     if (BLOCKCHAIR_KEY && usePaidPlan && err.response && (err.response.status === 402 || err.response.status === 429)) {
       console.log('[Blockchair] Broadcast: Switching to free plan...');
       usePaidPlan = false;
@@ -171,7 +207,6 @@ async function checkTransactionMempool(address) {
   }
 }
 
-// Log current mode on startup
 if (BLOCKCHAIR_KEY) {
   console.log('✅ [Blockchair] Using PAID plan (10k requests)');
 } else {
