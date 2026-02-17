@@ -79,6 +79,11 @@ async function getLogChannel() {
   return row ? row.value : null;
 }
 
+async function getTicketCategory() {
+  const row = db.prepare("SELECT value FROM config WHERE key='ticketCategory'").get();
+  return row ? row.value : null;
+}
+
 const commands = [
   new SlashCommandBuilder()
     .setName('panel')
@@ -103,6 +108,10 @@ const commands = [
     .setName('logchannel')
     .setDescription('Set channel for trade logs (Owner only)')
     .addStringOption(opt => opt.setName('channelid').setDescription('Channel ID for trade logs').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('ticketcategory')
+    .setDescription('Set category for ticket channels (Owner only)')
+    .addStringOption(opt => opt.setName('categoryid').setDescription('Category ID where tickets will be created').setRequired(true)),
 ].map(cmd => cmd.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
@@ -288,6 +297,8 @@ async function handleSlashCommand(interaction) {
     await closeTicket(interaction);
   } else if (commandName === 'logchannel') {
     await setLogChannel(interaction);
+  } else if (commandName === 'ticketcategory') {
+    await setTicketCategory(interaction);
   }
 }
 
@@ -308,6 +319,27 @@ async function setLogChannel(interaction) {
   
   return interaction.reply({ 
     content: `✅ Trade log channel set to <#${channelId}>`, 
+    flags: MessageFlags.Ephemeral 
+  });
+}
+
+async function setTicketCategory(interaction) {
+  if (interaction.user.id !== OWNER_ID) {
+    return interaction.reply({ content: '❌ Only owner can use this command.', flags: MessageFlags.Ephemeral });
+  }
+
+  const categoryId = interaction.options.getString('categoryid').trim();
+  
+  // Verify category exists
+  const category = await interaction.guild.channels.fetch(categoryId).catch(() => null);
+  if (!category || category.type !== ChannelType.GuildCategory) {
+    return interaction.reply({ content: '❌ Invalid category ID.', flags: MessageFlags.Ephemeral });
+  }
+
+  db.prepare("INSERT OR REPLACE INTO config(key, value) VALUES('ticketCategory', ?)").run(categoryId);
+  
+  return interaction.reply({ 
+    content: `✅ Ticket category set to **${category.name}**`, 
     flags: MessageFlags.Ephemeral 
   });
 }
@@ -444,7 +476,9 @@ async function handleTradeDetailsModal(interaction) {
     return interaction.reply({ content: '❌ You cannot trade with yourself.', flags: MessageFlags.Ephemeral });
   }
 
-  const channel = await interaction.guild.channels.create({
+  // Get ticket category if set
+  const ticketCategoryId = await getTicketCategory();
+  const channelOptions = {
     name: `ltc-${interaction.user.username}-${otherMember.user.username}`.substring(0, 100),
     type: ChannelType.GuildText,
     permissionOverwrites: [
@@ -465,7 +499,14 @@ async function handleTradeDetailsModal(interaction) {
         allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages],
       },
     ],
-  });
+  };
+
+  // Add parent category if set
+  if (ticketCategoryId) {
+    channelOptions.parent = ticketCategoryId;
+  }
+
+  const channel = await interaction.guild.channels.create(channelOptions);
 
   // ALL TICKETS USE INDEX 0
   const depositAddress = generateAddress(TRADE_INDEX);
