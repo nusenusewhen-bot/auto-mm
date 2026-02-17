@@ -11,9 +11,8 @@ let priceCache = { value: 0, timestamp: 0 };
 const CACHE_DURATION = 60000;
 
 // Rate limiting management
-const requestQueue = [];
 let lastRequestTime = 0;
-const MIN_REQUEST_INTERVAL = 250; // 4 requests per second max (safe for free tier)
+const MIN_REQUEST_INTERVAL = 250;
 
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -39,7 +38,7 @@ async function makeRequest(url, options = {}) {
     if (err.response?.status === 429) {
       console.log('[Blockchain] Rate limited, waiting 2s...');
       await delay(2000);
-      return makeRequest(url, options); // Retry
+      return makeRequest(url, options);
     }
     throw err;
   }
@@ -93,7 +92,6 @@ async function checkPayment(address, expectedUsd) {
     const totalLtc = confirmedLtc + unconfirmedLtc;
     const totalUsd = totalLtc * price;
 
-    // Accept if within 90% of expected (allows small underpayment)
     const minAmount = expectedUsd * 0.85;
     
     if (totalUsd >= minAmount && totalLtc > 0) return true;
@@ -107,7 +105,7 @@ async function checkPayment(address, expectedUsd) {
 
 async function getAddressInfo(address) {
   try {
-    const url = `${BLOCKCYPHER_BASE}/addrs/${address}/balance?token=${BLOCKCYPHER_TOKEN}`;
+    const url = `${BLOCKCYPHER_BASE}/addrs/${address}?token=${BLOCKCYPHER_TOKEN}`;
     const res = await makeRequest(url);
     return res.data;
   } catch (err) {
@@ -127,66 +125,25 @@ async function getTransaction(txid) {
   }
 }
 
-// IMPROVED UTXO FETCHING - Try multiple methods
+// IMPROVED UTXO FETCHING - Use full address endpoint and filter
 async function getAddressUTXOs(address) {
   const utxos = [];
   
   try {
-    // Method 1: Try unspentOnly endpoint first
-    const url1 = `${BLOCKCYPHER_BASE}/addrs/${address}?unspentOnly=true&token=${BLOCKCYPHER_TOKEN}`;
-    console.log(`[Blockchain] Fetching UTXOs for ${address} (Method 1)`);
+    // Use full address endpoint instead of unspentOnly (more reliable)
+    const url = `${BLOCKCYPHER_BASE}/addrs/${address}?token=${BLOCKCYPHER_TOKEN}`;
+    console.log(`[Blockchain] Fetching address data for ${address}`);
     
-    const res1 = await makeRequest(url1);
+    const res = await makeRequest(url);
+    const data = res.data;
     
-    if (res1.data.txrefs && res1.data.txrefs.length > 0) {
-      res1.data.txrefs.forEach(utxo => {
-        if (utxo.value > 0) {
-          utxos.push({
-            txid: utxo.tx_hash,
-            vout: utxo.tx_output_n,
-            value: utxo.value,
-            confirmations: utxo.confirmations || 0
-          });
-        }
-      });
-    }
+    console.log(`[Blockchain] Address data: balance=${data.balance}, unconfirmed=${data.unconfirmed_balance}, n_tx=${data.n_tx}`);
     
-    // Also check unconfirmed UTXOs
-    if (res1.data.unconfirmed_txrefs && res1.data.unconfirmed_txrefs.length > 0) {
-      res1.data.unconfirmed_txrefs.forEach(utxo => {
-        if (utxo.value > 0) {
-          utxos.push({
-            txid: utxo.tx_hash,
-            vout: utxo.tx_output_n,
-            value: utxo.value,
-            confirmations: 0
-          });
-        }
-      });
-    }
-    
-    if (utxos.length > 0) {
-      console.log(`[Blockchain] Found ${utxos.length} UTXOs (Method 1)`);
-      return utxos;
-    }
-    
-    // Method 2: If no UTXOs found, try full address endpoint and filter
-    console.log(`[Blockchain] Trying Method 2 for ${address}`);
-    await delay(500);
-    
-    const url2 = `${BLOCKCYPHER_BASE}/addrs/${address}?token=${BLOCKCYPHER_TOKEN}`;
-    const res2 = await makeRequest(url2);
-    
-    if (res2.data.txrefs) {
-      // Get all transactions where address received coins
-      const receivedTxs = res2.data.txrefs.filter(tx => tx.tx_output_n >= 0);
-      
-      for (const tx of receivedTxs) {
-        // Check if this output is spent by looking for it in inputs of other txs
-        // For now, assume unspent if it's a recent transaction
-        const isRecent = (Date.now() / 1000 - tx.confirmed) < 86400; // 24 hours
-        
-        if (isRecent || tx.value > 0) {
+    // Method 1: Use txrefs (all transactions)
+    if (data.txrefs && data.txrefs.length > 0) {
+      for (const tx of data.txrefs) {
+        // Only include outputs (tx_output_n >= 0) that are unspent
+        if (tx.tx_output_n >= 0) {
           utxos.push({
             txid: tx.tx_hash,
             vout: tx.tx_output_n,
@@ -197,15 +154,33 @@ async function getAddressUTXOs(address) {
       }
     }
     
+    // Method 2: Also check unconfirmed transactions
+    if (data.unconfirmed_txrefs && data.unconfirmed_txrefs.length > 0) {
+      for (const tx of data.unconfirmed_txrefs) {
+        if (tx.tx_output_n >= 0) {
+          // Check if already added
+          const exists = utxos.some(u => u.txid === tx.tx_hash && u.vout === tx.tx_output_n);
+          if (!exists) {
+            utxos.push({
+              txid: tx.tx_hash,
+              vout: tx.tx_output_n,
+              value: tx.value,
+              confirmations: 0
+            });
+          }
+        }
+      }
+    }
+    
     console.log(`[Blockchain] Found ${utxos.length} UTXOs total`);
     return utxos;
     
   } catch (err) {
     if (err.response?.status === 404) {
-      console.log(`[Blockchain] Address ${address} not found (no UTXOs)`);
+      console.log(`[Blockchain] Address ${address} not found (no transactions yet)`);
       return [];
     }
-    console.error('Error fetching UTXOs:', err.message);
+    console.error('[Blockchain] Error fetching UTXOs:', err.message);
     return [];
   }
 }
