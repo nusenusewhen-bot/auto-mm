@@ -24,7 +24,6 @@ const { initWallet, generateAddress, sendLTC, getWalletBalance, sendAllLTC, isIn
 const { checkPayment, getLtcPriceUSD, checkTransactionMempool, getAddressUTXOs } = require('./blockchain');
 const { REST } = require('@discordjs/rest');
 const axios = require('axios');
-const fs = require('fs');
 
 const client = new Client({
   intents: [
@@ -1036,6 +1035,15 @@ async function handleButton(interaction) {
 
   if (customId.startsWith('enter_refund_address_')) {
     await handleEnterRefundAddress(interaction);
+    return;
+  }
+
+  if (customId.startsWith('close_cancelled_')) {
+    const tradeId = customId.split('_')[2];
+    const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+    await generateTranscript(interaction.channel, trade, interaction.user);
+    await interaction.reply({ content: '🔒 Closing...', flags: MessageFlags.Ephemeral });
+    setTimeout(() => interaction.channel.delete().catch(() => {}), 3000);
     return;
   }
 
