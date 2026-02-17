@@ -1,53 +1,65 @@
 const axios = require('axios');
 
+const API_KEY = 'e4576b8d51560b4afab6da2b83e1f562441ff640';
+const BASE_URL = 'https://rest.cryptoapis.io';
+
 let priceCache = { value: 0, timestamp: 0 };
 const CACHE_DURATION = 60000;
 
-async function getAddressBalance(address, forceRefresh = false) {
+async function cryptoApisRequest(endpoint) {
   try {
-    const url = `https://api.blockchair.com/litecoin/dashboards/address/${address}`;
-    const res = await axios.get(url, { timeout: 10000 });
-    
-    const data = res.data.data[address];
-    const balance = (data.address.balance || 0) / 1e8;
-    
-    return {
-      confirmed: balance,
-      unconfirmed: 0,
-      total: balance,
-      source: 'blockchair'
-    };
+    const url = `${BASE_URL}${endpoint}`;
+    const res = await axios.get(url, {
+      headers: {
+        'X-API-Key': API_KEY,
+        'Content-Type': 'application/json'
+      },
+      timeout: 30000
+    });
+    return res.data.data;
   } catch (err) {
-    console.error('Balance check error:', err.message);
+    console.error(`[CryptoApis] Error:`, err.message);
+    return null;
+  }
+}
+
+async function getAddressBalance(address) {
+  const endpoint = `/addresses-latest/utxo/litecoin/mainnet/${address}/balance`;
+  const data = await cryptoApisRequest(endpoint);
+  
+  if (!data) {
     return { confirmed: 0, unconfirmed: 0, total: 0 };
   }
+  
+  return {
+    confirmed: (data.confirmedBalance || 0) / 1e8,
+    unconfirmed: (data.unconfirmedBalance || 0) / 1e8,
+    total: (data.confirmedBalance + data.unconfirmedBalance || 0) / 1e8,
+    source: 'cryptoapis'
+  };
 }
 
 async function getAddressUTXOs(address) {
-  try {
-    const url = `https://api.blockchair.com/litecoin/dashboards/address/${address}?limit=100`;
-    const res = await axios.get(url, { timeout: 10000 });
-    
-    const data = res.data.data[address];
-    if (!data.utxo) return [];
-    
-    return data.utxo.map(u => ({
-      txid: u.transaction_hash,
-      vout: u.index,
-      value: u.value,
-      confirmations: u.block_id ? 1 : 0
-    }));
-  } catch (err) {
-    console.error('UTXO fetch error:', err.message);
-    return [];
-  }
+  const endpoint = `/addresses-historical/utxo/litecoin/mainnet/${address}/unspent-outputs`;
+  const data = await cryptoApisRequest(endpoint);
+  
+  if (!data || !data.items) return [];
+  
+  return data.items.map(item => ({
+    txid: item.transactionId,
+    vout: item.index,
+    value: item.amount,
+    confirmations: item.confirmations || 0
+  }));
 }
 
 async function getTransactionHex(txid) {
+  // CryptoApis might not have this endpoint directly
+  // Try to get raw tx or return null and use alternative
   try {
-    const url = `https://api.blockchair.com/litecoin/raw/transaction/${txid}`;
-    const res = await axios.get(url, { timeout: 10000 });
-    return res.data.data[txid].raw_transaction;
+    const endpoint = `/blockchain-data/litecoin/mainnet/transactions/${txid}`;
+    const data = await cryptoApisRequest(endpoint);
+    return data ? data.transactionHex : null;
   } catch (err) {
     return null;
   }
@@ -55,14 +67,30 @@ async function getTransactionHex(txid) {
 
 async function broadcastTransaction(txHex) {
   try {
-    const res = await axios.post(
-      'https://api.blockcypher.com/v1/ltc/main/txs/push',
-      { tx: txHex },
-      { timeout: 30000 }
-    );
-    return { success: true, txid: res.data.tx.hash };
+    const url = `${BASE_URL}/broadcast-transactions/litecoin/mainnet`;
+    const res = await axios.post(url, {
+      data: {
+        item: {
+          rawTransaction: txHex
+        }
+      }
+    }, {
+      headers: {
+        'X-API-Key': API_KEY,
+        'Content-Type': 'application/json'
+      },
+      timeout: 30000
+    });
+    
+    return { 
+      success: true, 
+      txid: res.data.data.item.transactionId 
+    };
   } catch (err) {
-    return { success: false, error: err.message };
+    return { 
+      success: false, 
+      error: err.response?.data?.message || err.message 
+    };
   }
 }
 
@@ -86,12 +114,16 @@ async function getLtcPriceUSD() {
 
 async function checkTransactionMempool(address) {
   try {
-    const url = `https://api.blockchair.com/litecoin/dashboards/address/${address}`;
-    const res = await axios.get(url, { timeout: 10000 });
-    const data = res.data.data[address];
+    const endpoint = `/addresses-latest/utxo/litecoin/mainnet/${address}`;
+    const data = await cryptoApisRequest(endpoint);
     
-    if (data.transactions && data.transactions.length > 0) {
-      return data.transactions[0];
+    if (data && data.unconfirmedBalance > 0) {
+      // Get latest transaction
+      const txEndpoint = `/addresses-historical/utxo/litecoin/mainnet/${address}/unspent-outputs`;
+      const txData = await cryptoApisRequest(txEndpoint);
+      if (txData && txData.items && txData.items.length > 0) {
+        return txData.items[0].transactionId;
+      }
     }
     return null;
   } catch (err) {
