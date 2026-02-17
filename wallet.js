@@ -4,7 +4,7 @@ const bitcoin = require('bitcoinjs-lib');
 const axios = require('axios');
 const { ECPairFactory } = require('ecpair');
 const tinysecp = require('tiny-secp256k1');
-const { getAddressUTXOs, getTransactionHex, delay } = require('./blockchain');
+const { getAddressUTXOs, getTransactionHex, delay, getAddressInfo } = require('./blockchain');
 
 const ECPair = ECPairFactory(tinysecp);
 
@@ -118,6 +118,8 @@ async function getAddressBalance(address, forceRefresh = false) {
     const unconfirmed = (res.data.unconfirmed_balance || 0) / 1e8;
     const total = balance + unconfirmed;
     
+    console.log(`[Wallet] Balance for ${address}: confirmed=${balance}, unconfirmed=${unconfirmed}, total=${total}`);
+    
     cachedBalances[cacheKey] = { balance: total, timestamp: Date.now() };
     return total;
   } catch (err) {
@@ -125,6 +127,7 @@ async function getAddressBalance(address, forceRefresh = false) {
       console.error(`[Wallet] BlockCypher rate limit (429)`);
       return cachedBalances[cacheKey]?.balance || 0;
     } else if (err.response?.status === 404) {
+      console.log(`[Wallet] Address not found (no transactions): ${address}`);
       return 0;
     } else {
       console.error(`[Wallet] BlockCypher error:`, err.message);
@@ -208,50 +211,82 @@ async function sendFromIndex(fromIndex, toAddress, amountLTC) {
   console.log(`[Wallet] Sending ${amountLTC} LTC from index ${fromIndex} (${fromAddress}) to ${toAddress}`);
 
   try {
-    // Get fresh balance
+    // Get fresh balance first
     const currentBalance = await getAddressBalance(fromAddress, true);
+    console.log(`[Wallet] Current balance: ${currentBalance} LTC`);
     
     if (currentBalance <= 0) {
-      return { success: false, error: `No balance in wallet index ${fromIndex}` };
+      return { success: false, error: `No balance in wallet index ${fromIndex}. Address: ${fromAddress}` };
     }
 
-    // Try up to 3 times to get UTXOs
+    // Try to get UTXOs - wait if none found but balance exists
     let utxos = [];
     let attempts = 0;
-    while (utxos.length === 0 && attempts < 3) {
+    const maxAttempts = 5;
+    
+    while (utxos.length === 0 && attempts < maxAttempts) {
       utxos = await getAddressUTXOs(fromAddress);
+      
       if (utxos.length === 0) {
-        console.log(`[Wallet] No UTXOs found, attempt ${attempts + 1}/3, waiting...`);
-        await delay(2000);
         attempts++;
+        console.log(`[Wallet] No UTXOs found yet, attempt ${attempts}/${maxAttempts}. Balance shows ${currentBalance} LTC. Waiting...`);
+        
+        // If we have balance but no UTXOs, the transaction might be too new
+        // Wait a bit and try again
+        if (currentBalance > 0) {
+          await delay(3000);
+          // Refresh balance to see if it changed
+          const newBalance = await getAddressBalance(fromAddress, true);
+          if (newBalance !== currentBalance) {
+            console.log(`[Wallet] Balance updated: ${currentBalance} -> ${newBalance}`);
+          }
+        }
       }
     }
     
     if (utxos.length === 0) {
-      // If still no UTXOs but we have balance, try to use the full balance endpoint
-      console.log(`[Wallet] Trying alternative UTXO method...`);
-      const info = await getAddressInfo(fromAddress);
-      if (info && info.balance > 0) {
-        // Create a single "virtual" UTXO with the full balance
-        // This is a fallback that assumes the balance is spendable
-        console.log(`[Wallet] Using balance-based fallback`);
-        utxos = [{
-          txid: 'pending',
-          vout: 0,
-          value: info.balance,
-          confirmations: info.confirmations || 1
-        }];
-      } else {
-        return { success: false, error: 'No UTXOs found and no balance detected' };
+      // Last resort: try to get address info and create UTXO from recent transactions
+      console.log(`[Wallet] Trying to get UTXOs from address info...`);
+      const addrInfo = await getAddressInfo(fromAddress);
+      
+      if (addrInfo && addrInfo.txrefs && addrInfo.txrefs.length > 0) {
+        // Get the most recent received transaction
+        const recentTx = addrInfo.txrefs
+          .filter(tx => tx.tx_output_n >= 0)
+          .sort((a, b) => b.confirmations - a.confirmations)[0];
+          
+        if (recentTx) {
+          console.log(`[Wallet] Found recent tx: ${recentTx.tx_hash}, value: ${recentTx.value}`);
+          utxos = [{
+            txid: recentTx.tx_hash,
+            vout: recentTx.tx_output_n,
+            value: recentTx.value,
+            confirmations: recentTx.confirmations || 0
+          }];
+        }
+      }
+      
+      if (utxos.length === 0) {
+        return { 
+          success: false, 
+          error: `No UTXOs found after ${maxAttempts} attempts. Balance: ${currentBalance} LTC. The funds may be too new (need 1 confirmation) or there's a sync issue with BlockCypher.` 
+        };
       }
     }
 
+    console.log(`[Wallet] Using ${utxos.length} UTXOs`);
+
     const amountSatoshi = Math.floor(parseFloat(amountLTC) * 1e8);
-    const fee = 10000; // 0.0001 LTC fee
+    const fee = 10000; // 0.0001 LTC
     const totalInput = utxos.reduce((sum, u) => sum + u.value, 0);
 
+    console.log(`[Wallet] Amount: ${amountSatoshi} satoshi, Fee: ${fee}, Total Input: ${totalInput}`);
+
     if (totalInput < amountSatoshi + fee) {
-      return { success: false, error: `Insufficient balance. Have: ${(totalInput/1e8).toFixed(8)}, Need: ${((amountSatoshi+fee)/1e8).toFixed(8)}` };
+      return { 
+        success: false, 
+        error: `Insufficient balance. Have: ${(totalInput/1e8).toFixed(8)} LTC, Need: ${((amountSatoshi+fee)/1e8).toFixed(8)} LTC (including fee)` 
+      };
     }
 
     const psbt = new bitcoin.Psbt({ network: ltcNet });
@@ -262,12 +297,6 @@ async function sendFromIndex(fromIndex, toAddress, amountLTC) {
       if (inputSum >= amountSatoshi + fee) break;
       
       try {
-        // Skip if txid is 'pending' (fallback mode)
-        if (utxo.txid === 'pending') {
-          console.log(`[Wallet] Cannot use fallback UTXO for signing, need actual txid`);
-          continue;
-        }
-        
         await delay(300);
         const txHex = await getTransactionHex(utxo.txid);
         
@@ -291,7 +320,7 @@ async function sendFromIndex(fromIndex, toAddress, amountLTC) {
     }
 
     if (inputsAdded === 0) {
-      return { success: false, error: 'Could not add any inputs - UTXOs may be unconfirmed or unavailable' };
+      return { success: false, error: 'Could not add any inputs - transaction data unavailable' };
     }
 
     psbt.addOutput({ address: toAddress, value: amountSatoshi });
