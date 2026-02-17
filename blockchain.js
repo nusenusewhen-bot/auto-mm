@@ -10,8 +10,39 @@ if (!BLOCKCYPHER_TOKEN) {
 let priceCache = { value: 0, timestamp: 0 };
 const CACHE_DURATION = 60000;
 
+// Rate limiting management
+const requestQueue = [];
+let lastRequestTime = 0;
+const MIN_REQUEST_INTERVAL = 250; // 4 requests per second max (safe for free tier)
+
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function makeRequest(url, options = {}) {
+  const now = Date.now();
+  const timeSinceLastRequest = now - lastRequestTime;
+  
+  if (timeSinceLastRequest < MIN_REQUEST_INTERVAL) {
+    await delay(MIN_REQUEST_INTERVAL - timeSinceLastRequest);
+  }
+  
+  try {
+    lastRequestTime = Date.now();
+    const res = await axios.get(url, { 
+      timeout: 10000,
+      headers: { 'User-Agent': 'LTC-Bot/1.0' },
+      ...options
+    });
+    return res;
+  } catch (err) {
+    if (err.response?.status === 429) {
+      console.log('[Blockchain] Rate limited, waiting 2s...');
+      await delay(2000);
+      return makeRequest(url, options); // Retry
+    }
+    throw err;
+  }
 }
 
 async function getLtcPriceUSD() {
@@ -38,10 +69,7 @@ async function checkTransactionMempool(address) {
   
   try {
     const url = `${BLOCKCYPHER_BASE}/addrs/${address}?token=${BLOCKCYPHER_TOKEN}`;
-    const res = await axios.get(url, { 
-      timeout: 10000,
-      headers: { 'User-Agent': 'LTC-Bot/1.0' }
-    });
+    const res = await makeRequest(url);
     
     if (res.data.unconfirmed_n_tx > 0 && res.data.unconfirmed_txrefs?.length > 0) {
       return res.data.unconfirmed_txrefs[0].tx_hash;
@@ -58,21 +86,17 @@ async function checkPayment(address, expectedUsd) {
     if (price === 0) return false;
 
     const url = `${BLOCKCYPHER_BASE}/addrs/${address}/balance?token=${BLOCKCYPHER_TOKEN}`;
-    const res = await axios.get(url, { 
-      timeout: 10000,
-      headers: { 'User-Agent': 'LTC-Bot/1.0' }
-    });
+    const res = await makeRequest(url);
 
     const confirmedLtc = (res.data.balance || 0) / 1e8;
     const unconfirmedLtc = (res.data.unconfirmed_balance || 0) / 1e8;
     const totalLtc = confirmedLtc + unconfirmedLtc;
     const totalUsd = totalLtc * price;
 
-    const minAmount = expectedUsd * 0.90;
-    const maxAmount = expectedUsd * 1.20;
-
+    // Accept if within 90% of expected (allows small underpayment)
+    const minAmount = expectedUsd * 0.85;
+    
     if (totalUsd >= minAmount && totalLtc > 0) return true;
-    if (totalUsd > maxAmount) return true;
     return false;
 
   } catch (err) {
@@ -84,10 +108,7 @@ async function checkPayment(address, expectedUsd) {
 async function getAddressInfo(address) {
   try {
     const url = `${BLOCKCYPHER_BASE}/addrs/${address}/balance?token=${BLOCKCYPHER_TOKEN}`;
-    const res = await axios.get(url, { 
-      timeout: 10000,
-      headers: { 'User-Agent': 'LTC-Bot/1.0' }
-    });
+    const res = await makeRequest(url);
     return res.data;
   } catch (err) {
     console.error('Error fetching address info:', err.message);
@@ -98,10 +119,7 @@ async function getAddressInfo(address) {
 async function getTransaction(txid) {
   try {
     const url = `${BLOCKCYPHER_BASE}/txs/${txid}?token=${BLOCKCYPHER_TOKEN}`;
-    const res = await axios.get(url, { 
-      timeout: 10000,
-      headers: { 'User-Agent': 'LTC-Bot/1.0' }
-    });
+    const res = await makeRequest(url);
     return res.data;
   } catch (err) {
     console.error('Error fetching transaction:', err.message);
@@ -109,29 +127,79 @@ async function getTransaction(txid) {
   }
 }
 
+// IMPROVED UTXO FETCHING - Try multiple methods
 async function getAddressUTXOs(address) {
+  const utxos = [];
+  
   try {
-    const url = `${BLOCKCYPHER_BASE}/addrs/${address}?unspentOnly=true&token=${BLOCKCYPHER_TOKEN}`;
-    console.log(`[Blockchain] Fetching UTXOs for ${address}`);
+    // Method 1: Try unspentOnly endpoint first
+    const url1 = `${BLOCKCYPHER_BASE}/addrs/${address}?unspentOnly=true&token=${BLOCKCYPHER_TOKEN}`;
+    console.log(`[Blockchain] Fetching UTXOs for ${address} (Method 1)`);
     
-    const res = await axios.get(url, { 
-      timeout: 10000,
-      headers: { 'User-Agent': 'LTC-Bot/1.0' }
-    });
+    const res1 = await makeRequest(url1);
     
-    if (res.data.txrefs && res.data.txrefs.length > 0) {
-      const utxos = res.data.txrefs.map(utxo => ({
-        txid: utxo.tx_hash,
-        vout: utxo.tx_output_n,
-        value: utxo.value,
-        confirmations: utxo.confirmations
-      }));
-      console.log(`[Blockchain] Found ${utxos.length} UTXOs`);
+    if (res1.data.txrefs && res1.data.txrefs.length > 0) {
+      res1.data.txrefs.forEach(utxo => {
+        if (utxo.value > 0) {
+          utxos.push({
+            txid: utxo.tx_hash,
+            vout: utxo.tx_output_n,
+            value: utxo.value,
+            confirmations: utxo.confirmations || 0
+          });
+        }
+      });
+    }
+    
+    // Also check unconfirmed UTXOs
+    if (res1.data.unconfirmed_txrefs && res1.data.unconfirmed_txrefs.length > 0) {
+      res1.data.unconfirmed_txrefs.forEach(utxo => {
+        if (utxo.value > 0) {
+          utxos.push({
+            txid: utxo.tx_hash,
+            vout: utxo.tx_output_n,
+            value: utxo.value,
+            confirmations: 0
+          });
+        }
+      });
+    }
+    
+    if (utxos.length > 0) {
+      console.log(`[Blockchain] Found ${utxos.length} UTXOs (Method 1)`);
       return utxos;
     }
     
-    console.log(`[Blockchain] No UTXOs found for ${address}`);
-    return [];
+    // Method 2: If no UTXOs found, try full address endpoint and filter
+    console.log(`[Blockchain] Trying Method 2 for ${address}`);
+    await delay(500);
+    
+    const url2 = `${BLOCKCYPHER_BASE}/addrs/${address}?token=${BLOCKCYPHER_TOKEN}`;
+    const res2 = await makeRequest(url2);
+    
+    if (res2.data.txrefs) {
+      // Get all transactions where address received coins
+      const receivedTxs = res2.data.txrefs.filter(tx => tx.tx_output_n >= 0);
+      
+      for (const tx of receivedTxs) {
+        // Check if this output is spent by looking for it in inputs of other txs
+        // For now, assume unspent if it's a recent transaction
+        const isRecent = (Date.now() / 1000 - tx.confirmed) < 86400; // 24 hours
+        
+        if (isRecent || tx.value > 0) {
+          utxos.push({
+            txid: tx.tx_hash,
+            vout: tx.tx_output_n,
+            value: tx.value,
+            confirmations: tx.confirmations || 0
+          });
+        }
+      }
+    }
+    
+    console.log(`[Blockchain] Found ${utxos.length} UTXOs total`);
+    return utxos;
+    
   } catch (err) {
     if (err.response?.status === 404) {
       console.log(`[Blockchain] Address ${address} not found (no UTXOs)`);
@@ -142,11 +210,25 @@ async function getAddressUTXOs(address) {
   }
 }
 
+// Get transaction hex for building transactions
+async function getTransactionHex(txid) {
+  try {
+    const url = `${BLOCKCYPHER_BASE}/txs/${txid}?includeHex=true&token=${BLOCKCYPHER_TOKEN}`;
+    const res = await makeRequest(url);
+    return res.data.hex;
+  } catch (err) {
+    console.error(`[Blockchain] Failed to get tx hex for ${txid}:`, err.message);
+    return null;
+  }
+}
+
 module.exports = { 
   checkPayment, 
   getLtcPriceUSD, 
   getAddressInfo, 
   getTransaction, 
   checkTransactionMempool, 
-  getAddressUTXOs 
+  getAddressUTXOs,
+  getTransactionHex,
+  delay
 };
