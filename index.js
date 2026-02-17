@@ -41,7 +41,7 @@ const BLOCKCYPHER_BASE = 'https://api.blockcypher.com/v1/ltc/main';
 
 const confirmedInteractions = new Set();
 const activeMonitors = new Map();
-const userCooldowns = new Map(); // Anti-flood
+const userCooldowns = new Map();
 const COOLDOWN_MS = 3000;
 
 const TRADE_INDEX = 0;
@@ -58,7 +58,6 @@ if (!walletInitialized) {
   process.exit(1);
 }
 
-// Anti-flood check
 function checkCooldown(userId, action) {
   const key = `${userId}_${action}`;
   const now = Date.now();
@@ -861,7 +860,6 @@ async function handleAddressModal(interaction) {
   const tradeId = interaction.customId.split('_')[2];
   const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
-  // STRICT CHECK: Only receiver can enter address
   if (interaction.user.id !== trade.receiverId) {
     return interaction.reply({ content: '❌ Only the receiver can enter their address!', flags: MessageFlags.Ephemeral });
   }
@@ -895,7 +893,6 @@ async function handleRefundAddressModal(interaction) {
   const tradeId = interaction.customId.split('_')[3];
   const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
-  // STRICT CHECK: Only original sender can get refund
   if (interaction.user.id !== trade.senderId) {
     return interaction.reply({ content: '❌ Only the original sender can receive the refund!', flags: MessageFlags.Ephemeral });
   }
@@ -906,7 +903,6 @@ async function handleRefundAddressModal(interaction) {
     return interaction.reply({ content: '❌ Invalid LTC address.', flags: MessageFlags.Ephemeral });
   }
 
-  // Process refund
   const balance = await getAddressBalance(trade.depositAddress, true);
   
   if (balance.total <= 0) {
@@ -949,7 +945,6 @@ async function handleRefundAddressModal(interaction) {
 async function handleButton(interaction) {
   const customId = interaction.customId;
   
-  // Anti-flood check
   if (!checkCooldown(interaction.user.id, customId)) {
     return interaction.reply({ content: '⏳ Please wait before clicking again.', flags: MessageFlags.Ephemeral });
   }
@@ -1039,6 +1034,11 @@ async function handleButton(interaction) {
     return;
   }
 
+  if (customId.startsWith('enter_refund_address_')) {
+    await handleEnterRefundAddress(interaction);
+    return;
+  }
+
   if (customId.startsWith('enter_address_')) {
     const tradeId = customId.split('_')[2];
     const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
@@ -1047,7 +1047,6 @@ async function handleButton(interaction) {
       return interaction.reply({ content: '❌ Trade not found.', flags: MessageFlags.Ephemeral });
     }
 
-    // STRICT CHECK: Only receiver can enter address
     if (interaction.user.id !== trade.receiverId) {
       return interaction.reply({ content: '❌ Only the receiver can enter their address!', flags: MessageFlags.Ephemeral });
     }
@@ -1121,13 +1120,39 @@ async function handleButton(interaction) {
   }
 }
 
+async function handleEnterRefundAddress(interaction) {
+  const tradeId = interaction.customId.split('_')[3];
+  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+  
+  if (!trade) {
+    return interaction.reply({ content: '❌ Trade not found.', flags: MessageFlags.Ephemeral });
+  }
+
+  if (interaction.user.id !== trade.senderId) {
+    return interaction.reply({ content: '❌ Only the sender can enter the refund address!', flags: MessageFlags.Ephemeral });
+  }
+  
+  const modal = new ModalBuilder()
+    .setCustomId(`refund_address_modal_${tradeId}`)
+    .setTitle('Enter Refund LTC Address');
+
+  const addressInput = new TextInputBuilder()
+    .setCustomId('ltc_address')
+    .setLabel('Your LTC Address')
+    .setPlaceholder('LeDdjh2BDbPkrhG2pkWBko3HRdKQzprJMX')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true);
+
+  modal.addComponents(new ActionRowBuilder().addComponents(addressInput));
+  await interaction.showModal(modal);
+}
+
 async function handleCloseSupport(interaction) {
   const tradeId = interaction.customId.split('_')[2];
   const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
   
   if (!trade) return interaction.reply({ content: 'Ticket not found.', flags: MessageFlags.Ephemeral });
   
-  // Check permissions
   const isStaff = await hasStaffPermissions(interaction.user.id, interaction.member);
   const isCreator = interaction.user.id === trade.user1Id;
   
@@ -1135,8 +1160,7 @@ async function handleCloseSupport(interaction) {
     return interaction.reply({ content: '❌ You cannot close this ticket.', flags: MessageFlags.Ephemeral });
   }
 
-  // Generate transcript
-  await generateTranscript(interaction.channel, trade);
+  await generateTranscript(interaction.channel, trade, interaction.user);
 
   await interaction.reply({ content: '🔒 Closing ticket...', flags: MessageFlags.Ephemeral });
   
@@ -1145,7 +1169,7 @@ async function handleCloseSupport(interaction) {
   }, 3000);
 }
 
-async function generateTranscript(channel, trade) {
+async function generateTranscript(channel, trade, closer) {
   const transcriptChannelId = await getTranscriptChannel();
   if (!transcriptChannelId) return;
 
@@ -1177,7 +1201,7 @@ async function generateTranscript(channel, trade) {
       .addFields(
         { name: 'Ticket ID', value: trade.id.toString(), inline: true },
         { name: 'Type', value: trade.ticketType || 'trade', inline: true },
-        { name: 'Closed By', value: interaction?.user?.tag || 'Unknown', inline: true }
+        { name: 'Closed By', value: closer?.tag || 'Unknown', inline: true }
       )
       .setColor('Blue')
       .setTimestamp();
@@ -1212,7 +1236,6 @@ async function handleRoleSelection(interaction) {
     return interaction.reply({ content: '❌ You are not part of this trade.', flags: MessageFlags.Ephemeral });
   }
 
-  // Check if role already taken
   if (isSender && trade.senderId && trade.senderId !== userId) {
     return interaction.reply({ content: '❌ Sender role already chosen by another user!', flags: MessageFlags.Ephemeral });
   }
@@ -1508,7 +1531,6 @@ function startPaymentMonitor(tradeId, channelId, expectedLtc) {
 
   checkBalance();
   
-  // CHANGED FROM 8000 TO 3000 MS
   const intervalId = setInterval(checkBalance, 3000);
 
   setTimeout(() => {
@@ -1602,7 +1624,6 @@ async function handleRelease(interaction) {
 
   if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
 
-  // STRICT CHECK: Only sender can release
   if (interaction.user.id !== trade.senderId) {
     return interaction.reply({ content: '❌ Only the sender can release funds!', flags: MessageFlags.Ephemeral });
   }
@@ -1632,7 +1653,6 @@ async function handleConfirmRelease(interaction) {
 
   if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
 
-  // STRICT CHECK: Only sender can confirm release
   if (interaction.user.id !== trade.senderId && interaction.user.id !== OWNER_ID) {
     return interaction.reply({ content: '❌ Only the sender can confirm release!', flags: MessageFlags.Ephemeral });
   }
@@ -1667,7 +1687,6 @@ async function handleConfirmWithdraw(interaction) {
 
   const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
-  // STRICT CHECK: Only receiver can confirm withdrawal
   if (interaction.user.id !== trade.receiverId && interaction.user.id !== OWNER_ID) {
     return interaction.reply({ content: '❌ Only the receiver can confirm the withdrawal!', flags: MessageFlags.Ephemeral });
   }
@@ -1737,14 +1756,12 @@ async function handleCancelTrade(interaction) {
     return interaction.reply({ content: '❌ You are not part of this trade.', flags: MessageFlags.Ephemeral });
   }
 
-  const confirmKey = `cancel_${tradeId}_${interaction.user.id}`;
-  
-  // Check if already cancelled
   if (trade.status === 'cancelled') {
     return interaction.reply({ content: '❌ This trade is already cancelled.', flags: MessageFlags.Ephemeral });
   }
+
+  const confirmKey = `cancel_${tradeId}_${interaction.user.id}`;
   
-  // Check if already requested
   if (confirmedInteractions.has(confirmKey)) {
     return interaction.reply({ content: '⏳ You already requested to cancel. Waiting for other party...', flags: MessageFlags.Ephemeral });
   }
@@ -1757,7 +1774,6 @@ async function handleCancelTrade(interaction) {
   await interaction.reply({ content: `✅ ${interaction.user.toString()} wants to cancel the trade. Waiting for other party...`, ephemeral: false });
 
   if (confirmedInteractions.has(otherKey)) {
-    // Both agreed - show refund option
     const refundEmbed = new EmbedBuilder()
       .setTitle('❌ Trade Cancelled')
       .setDescription('Both parties agreed to cancel. What would you like to do?')
@@ -1818,7 +1834,6 @@ async function handleConfirmCancel(interaction) {
     
     db.prepare("UPDATE trades SET status = 'cancelled' WHERE id = ?").run(trade.id);
     
-    // Show refund options
     const refundEmbed = new EmbedBuilder()
       .setTitle('❌ Trade Cancelled')
       .setDescription('Both parties agreed to cancel. What would you like to do?')
@@ -1851,11 +1866,9 @@ async function handleCancelRefund(interaction) {
     return interaction.reply({ content: '❌ You are not part of this trade.', flags: MessageFlags.Ephemeral });
   }
 
-  // Remove the cancel request
   const confirmKey = `cancel_${tradeId}_${interaction.user.id}`;
   confirmedInteractions.delete(confirmKey);
 
-  // Reset to original buttons
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`release_${tradeId}`)
@@ -1881,7 +1894,6 @@ async function handleRequestRefund(interaction) {
 
   if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
 
-  // Both must confirm refund
   const confirmKey = `refund_${tradeId}_${interaction.user.id}`;
   
   if (confirmedInteractions.has(confirmKey)) {
@@ -1896,7 +1908,6 @@ async function handleRequestRefund(interaction) {
   await interaction.reply({ content: `✅ ${interaction.user.toString()} requests refund to sender. Waiting for confirmation...`, ephemeral: false });
 
   if (confirmedInteractions.has(otherKey)) {
-    // Both confirmed - ask sender for address
     const embed = new EmbedBuilder()
       .setTitle('🔄 Refund Confirmed')
       .setDescription(`<@${trade.senderId}> Both parties confirmed the refund. Please enter your LTC address to receive the funds.`)
@@ -1940,7 +1951,6 @@ async function handleConfirmRefundRequest(interaction) {
   if (confirmedInteractions.has(otherKey)) {
     await interaction.update({ components: [] });
     
-    // Both confirmed - ask sender for address
     const embed = new EmbedBuilder()
       .setTitle('🔄 Refund Confirmed')
       .setDescription(`<@${trade.senderId}> Both parties confirmed the refund. Please enter your LTC address to receive the funds.`)
@@ -1957,36 +1967,6 @@ async function handleConfirmRefundRequest(interaction) {
   } else {
     await interaction.reply({ content: `✅ You confirmed the refund. Waiting for other party...`, ephemeral: false });
   }
-}
-
-// Handle refund address button
-if (interaction.customId.startsWith('enter_refund_address_')) {
-  const tradeId = interaction.customId.split('_')[3];
-  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
-  
-  if (!trade) {
-    return interaction.reply({ content: '❌ Trade not found.', flags: MessageFlags.Ephemeral });
-  }
-
-  // STRICT: Only sender can enter refund address
-  if (interaction.user.id !== trade.senderId) {
-    return interaction.reply({ content: '❌ Only the sender can enter the refund address!', flags: MessageFlags.Ephemeral });
-  }
-  
-  const modal = new ModalBuilder()
-    .setCustomId(`refund_address_modal_${tradeId}`)
-    .setTitle('Enter Refund LTC Address');
-
-  const addressInput = new TextInputBuilder()
-    .setCustomId('ltc_address')
-    .setLabel('Your LTC Address')
-    .setPlaceholder('LeDdjh2BDbPkrhG2pkWBko3HRdKQzprJMX')
-    .setStyle(TextInputStyle.Short)
-    .setRequired(true);
-
-  modal.addComponents(new ActionRowBuilder().addComponents(addressInput));
-  await interaction.showModal(modal);
-  return;
 }
 
 async function setActiveUser(channel, trade, activeRole) {
@@ -2123,7 +2103,6 @@ async function closeTicket(interaction) {
     return interaction.reply({ content: '❌ No active trade here.', flags: MessageFlags.Ephemeral });
   }
 
-  // Check permissions
   const isStaff = await hasStaffPermissions(interaction.user.id, interaction.member);
   const isParticipant = interaction.user.id === trade.user1Id || interaction.user.id === trade.user2Id;
   
@@ -2132,7 +2111,7 @@ async function closeTicket(interaction) {
   }
 
   if (trade.status === 'completed' || trade.status === 'cancelled' || trade.status === 'refunded') {
-    await generateTranscript(interaction.channel, trade);
+    await generateTranscript(interaction.channel, trade, interaction.user);
     await interaction.reply({ content: '🔒 Closing ticket...', flags: MessageFlags.Ephemeral });
     setTimeout(() => {
       interaction.channel.delete().catch(() => {});
