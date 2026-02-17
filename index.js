@@ -354,9 +354,6 @@ async function logTradeCompletion(trade, txid) {
     return;
   }
 
-  const sender = await client.users.fetch(trade.senderId).catch(() => null);
-  const receiver = await client.users.fetch(trade.receiverId).catch(() => null);
-
   const totalLtc = parseFloat(trade.totalLtc) || 0;
   const ltcPrice = parseFloat(trade.ltcPrice) || await getLtcPriceUSD() || 0;
   const totalUsd = totalLtc * ltcPrice;
@@ -365,8 +362,8 @@ async function logTradeCompletion(trade, txid) {
     .setTitle('• Trade Completed')
     .setDescription(`**${totalLtc.toFixed(8)} LTC** ($${totalUsd.toFixed(2)} USD)`)
     .addFields(
-      { name: 'Sender', value: sender ? sender.username : 'Anonymous', inline: false },
-      { name: 'Receiver', value: receiver ? receiver.username : 'Anonymous', inline: false },
+      { name: 'Sender', value: 'Anonymous', inline: false },
+      { name: 'Receiver', value: 'Anonymous', inline: false },
       { name: 'Transaction ID', value: `[${txid.substring(0, 10)}...${txid.substring(txid.length-8)}](https://live.blockcypher.com/ltc/tx/${txid})`, inline: false }
     )
     .setColor(0x5865F2)
