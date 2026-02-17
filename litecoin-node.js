@@ -39,47 +39,53 @@ async function rpcCall(method, params = []) {
   }
 }
 
-// Get balance for address using scantxoutset (faster, no import needed)
+// Get balance for address using scantxoutset (faster than importaddress)
 async function getAddressBalanceNode(address) {
   try {
-    // Use scantxoutset for instant balance check (no address import needed)
-    const result = await rpcCall('scantxoutset', ['start', [{ "desc": `addr(${address})` }]]);
+    // Use scantxoutset for instant balance check without importing
+    const scanResult = await rpcCall('scantxoutset', ['start', [{ "desc": `addr(${address})` }]]);
     
-    if (!result || !result.success) {
-      // Fallback to importaddress if scantxoutset fails
-      await rpcCall('importaddress', [address, '', false]);
-      const utxos = await rpcCall('listunspent', [0, 9999999, [address]]);
-      
-      if (!utxos || !Array.isArray(utxos)) {
-        return { confirmed: 0, unconfirmed: 0, total: 0, source: 'own-node' };
-      }
-      
-      let confirmed = 0;
+    if (scanResult && scanResult.success) {
+      const totalLTC = (scanResult.total_amount || 0);
+      // Check if unconfirmed in mempool
+      const mempool = await rpcCall('getaddressmempool', [{ addresses: [address] }]);
       let unconfirmed = 0;
-      
-      for (const utxo of utxos) {
-        if (utxo.confirmations > 0) {
-          confirmed += utxo.amount;
-        } else {
-          unconfirmed += utxo.amount;
-        }
+      if (mempool && Array.isArray(mempool)) {
+        unconfirmed = mempool.reduce((sum, tx) => sum + (tx.satoshis / 1e8), 0);
       }
       
       return {
-        confirmed,
-        unconfirmed,
-        total: confirmed + unconfirmed,
+        confirmed: totalLTC - unconfirmed,
+        unconfirmed: unconfirmed,
+        total: totalLTC,
         source: 'own-node'
       };
     }
     
-    const totalLTC = result.total_amount || 0;
+    // Fallback to importaddress if scantxoutset fails
+    await rpcCall('importaddress', [address, '', false]);
+    const utxos = await rpcCall('listunspent', [0, 9999999, [address]]);
+    
+    if (!utxos || !Array.isArray(utxos)) {
+      return { confirmed: 0, unconfirmed: 0, total: 0, source: 'own-node' };
+    }
+    
+    let confirmed = 0;
+    let unconfirmed = 0;
+    
+    for (const utxo of utxos) {
+      if (utxo.confirmations > 0) {
+        confirmed += utxo.amount;
+      } else {
+        unconfirmed += utxo.amount;
+      }
+    }
     
     return {
-      confirmed: totalLTC,
-      unconfirmed: 0,
-      total: totalLTC,
-      source: 'own-node-scantxoutset'
+      confirmed,
+      unconfirmed,
+      total: confirmed + unconfirmed,
+      source: 'own-node'
     };
   } catch (err) {
     console.error('[LTC Node] Balance check failed:', err.message);
@@ -153,32 +159,9 @@ async function getMempoolInfo() {
 }
 
 // Get mempool transactions for address
-async function getMempoolForAddress(address) {
+async function getAddressMempool(address) {
   try {
-    // Get raw mempool
-    const mempool = await rpcCall('getrawmempool', [true]);
-    if (!mempool) return [];
-    
-    const relevant = [];
-    for (const [txid, txInfo] of Object.entries(mempool)) {
-      // Check if this tx involves our address (simplified check)
-      try {
-        const rawTx = await rpcCall('getrawtransaction', [txid, true]);
-        if (rawTx && rawTx.vout) {
-          for (const output of rawTx.vout) {
-            if (output.scriptPubKey && output.scriptPubKey.addresses) {
-              if (output.scriptPubKey.addresses.includes(address)) {
-                relevant.push({ txid, ...txInfo });
-                break;
-              }
-            }
-          }
-        }
-      } catch (e) {
-        // Skip if can't decode
-      }
-    }
-    return relevant;
+    return await rpcCall('getaddressmempool', [{ addresses: [address] }]);
   } catch (err) {
     return [];
   }
@@ -192,6 +175,6 @@ module.exports = {
   broadcastTransactionNode,
   isNodeSynced,
   getMempoolInfo,
-  getMempoolForAddress,
+  getAddressMempool,
   rpcCall
 };
