@@ -799,15 +799,27 @@ async function handleAmountModal(interaction) {
   const tradeId = interaction.customId.split('_')[2];
   const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
+  if (!trade) {
+    return interaction.reply({ content: '❌ Trade not found.', flags: MessageFlags.Ephemeral });
+  }
+
+  // Strict turn check - must be sender's turn
   const currentTurn = activeTurns.get(tradeId);
-  if (!currentTurn || currentTurn.type !== 'sender' || currentTurn.userId !== interaction.user.id) {
+  if (!currentTurn || currentTurn.type !== 'sender') {
     return interaction.reply({ 
-      content: '❌ It is not your turn! Only the sender can set the amount at this step.', 
+      content: '❌ It is not the sender\'s turn to set the amount!', 
+      flags: MessageFlags.Ephemeral 
+    });
+  }
+  
+  if (currentTurn.userId !== interaction.user.id) {
+    return interaction.reply({ 
+      content: '❌ Only the designated sender can set the amount at this step!', 
       flags: MessageFlags.Ephemeral 
     });
   }
 
-  if (interaction.user.id !== trade.senderId && interaction.user.id !== OWNER_ID) {
+  if (interaction.user.id !== trade.senderId) {
     return interaction.reply({ content: '❌ Only the sender can set the amount!', flags: MessageFlags.Ephemeral });
   }
 
@@ -835,6 +847,7 @@ async function handleAmountModal(interaction) {
     WHERE id = ?
   `).run(amount, fee, ltcPrice, ltcAmount, totalLtc, tradeId);
 
+  // Clear turn after successful action
   activeTurns.delete(tradeId);
 
   const embed = new EmbedBuilder()
@@ -859,10 +872,22 @@ async function handleAddressModal(interaction) {
   const tradeId = interaction.customId.split('_')[2];
   const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
+  if (!trade) {
+    return interaction.reply({ content: '❌ Trade not found.', flags: MessageFlags.Ephemeral });
+  }
+
+  // Strict turn check - must be receiver's turn
   const currentTurn = activeTurns.get(tradeId);
-  if (!currentTurn || currentTurn.type !== 'receiver' || currentTurn.userId !== interaction.user.id) {
+  if (!currentTurn || currentTurn.type !== 'receiver') {
     return interaction.reply({ 
-      content: '❌ It is not your turn! Only the receiver can enter the address at this step.', 
+      content: '❌ It is not the receiver\'s turn to enter the address!', 
+      flags: MessageFlags.Ephemeral 
+    });
+  }
+  
+  if (currentTurn.userId !== interaction.user.id) {
+    return interaction.reply({ 
+      content: '❌ Only the designated receiver can enter the address at this step!', 
       flags: MessageFlags.Ephemeral 
     });
   }
@@ -1063,10 +1088,18 @@ async function handleButton(interaction) {
       return interaction.reply({ content: '❌ Trade not found.', flags: MessageFlags.Ephemeral });
     }
 
+    // Strict turn check
     const currentTurn = activeTurns.get(tradeId);
-    if (!currentTurn || currentTurn.type !== 'receiver' || currentTurn.userId !== interaction.user.id) {
+    if (!currentTurn || currentTurn.type !== 'receiver') {
       return interaction.reply({ 
-        content: '❌ It is not your turn! Only the receiver can enter the address at this step.', 
+        content: '❌ It is not the receiver\'s turn to enter the address!', 
+        flags: MessageFlags.Ephemeral 
+      });
+    }
+
+    if (currentTurn.userId !== interaction.user.id) {
+      return interaction.reply({ 
+        content: '❌ Only the designated receiver can enter the address at this step!', 
         flags: MessageFlags.Ephemeral 
       });
     }
@@ -1249,6 +1282,8 @@ async function handleRoleSelection(interaction) {
 
   if (action === 'reset') {
     db.prepare('UPDATE trades SET senderId = NULL, receiverId = NULL WHERE id = ?').run(tradeId);
+    // Clear any active turns when resetting
+    activeTurns.delete(tradeId);
     await updateRoleDisplay(interaction, tradeId);
     return interaction.reply({ content: '✅ Roles reset.', flags: MessageFlags.Ephemeral });
   }
@@ -1392,6 +1427,12 @@ async function handleConfirmInfo(interaction) {
 async function promptForAmount(channel, tradeId) {
   const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
 
+  if (!trade || !trade.senderId) {
+    console.error(`[Turn] Cannot prompt for amount - no sender set for trade ${tradeId}`);
+    return;
+  }
+
+  // Strictly set turn to sender only
   activeTurns.set(tradeId, { type: 'sender', userId: trade.senderId });
 
   const embed = new EmbedBuilder()
@@ -1414,6 +1455,7 @@ async function handleSetAmount(interaction) {
 
   if (!trade) return interaction.reply({ content: 'Trade not found.', flags: MessageFlags.Ephemeral });
 
+  // Check if it's sender's turn
   const currentTurn = activeTurns.get(tradeId);
   if (!currentTurn || currentTurn.type !== 'sender' || currentTurn.userId !== interaction.user.id) {
     return interaction.reply({ 
@@ -1730,6 +1772,7 @@ async function handleConfirmRelease(interaction) {
     return interaction.reply({ content: '❌ Only the sender can confirm release!', flags: MessageFlags.Ephemeral });
   }
 
+  // Set turn to receiver for address entry
   activeTurns.set(tradeId, { type: 'receiver', userId: trade.receiverId });
 
   await promptForAddress(interaction, tradeId);
@@ -1737,7 +1780,16 @@ async function handleConfirmRelease(interaction) {
 
 async function promptForAddress(interaction, tradeId) {
   const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+  
+  if (!trade || !trade.receiverId) {
+    console.error(`[Turn] Cannot prompt for address - no receiver set for trade ${tradeId}`);
+    return;
+  }
+
   const channel = interaction.channel;
+
+  // Strictly set turn to receiver
+  activeTurns.set(tradeId, { type: 'receiver', userId: trade.receiverId });
 
   const embed = new EmbedBuilder()
     .setDescription('💰 **What\'s Your LTC Address?**\n\nOnly the receiver can click this button to enter their address.')
@@ -1764,6 +1816,7 @@ async function handleConfirmWithdraw(interaction) {
     return interaction.reply({ content: '❌ Only the receiver can confirm the withdrawal!', flags: MessageFlags.Ephemeral });
   }
 
+  // Verify it's receiver's turn
   const currentTurn = activeTurns.get(tradeId);
   if (!currentTurn || currentTurn.type !== 'receiver' || currentTurn.userId !== interaction.user.id) {
     return interaction.reply({ 
@@ -1797,6 +1850,7 @@ async function handleConfirmWithdraw(interaction) {
       db.prepare("UPDATE trades SET status = 'completed', completedAt = datetime('now'), receiverAddress = ?, txid = ? WHERE id = ?")
         .run(address, result.txid, tradeId);
 
+      // Clear turn after completion
       activeTurns.delete(tradeId);
 
       await logTradeCompletion(trade, result.txid);
