@@ -4,12 +4,14 @@ const bitcoin = require('bitcoinjs-lib');
 const axios = require('axios');
 const { ECPairFactory } = require('ecpair');
 const tinysecp = require('tiny-secp256k1');
-const { getAddressUTXOs, getTransactionHex, broadcastTransaction, getAddressBalance, delay } = require('./blockchain');
+const { getAddressUTXOs, getTransactionHex, broadcastTransaction, getAddressBalance } = require('./blockchain');
 
 const ECPair = ECPairFactory(tinysecp);
 
-const BLOCKCYPHER_TOKEN = process.env.BLOCKCYPHER_TOKEN;
-const BLOCKCYPHER_BASE = 'https://api.blockcypher.com/v1/ltc/main';
+// Local delay function (don't depend on blockchain.js for this)
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 const ltcNet = {
   messagePrefix: '\x19Litecoin Signed Message:\n',
@@ -185,7 +187,7 @@ async function sendFromIndex(fromIndex, toAddress, amountLTC) {
       if (inputSum >= amountSatoshi + fee) break;
       
       try {
-        await delay(300); // INCREASED for Blockchair (was 100)
+        await delay(300); // Wait between API calls
         console.log(`[Wallet] Fetching hex for input ${utxo.txid}:${utxo.vout}...`);
         const txHex = await getTransactionHex(utxo.txid);
         
