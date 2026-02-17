@@ -35,13 +35,11 @@ async function getAddressBalance(address) {
     return { confirmed: 0, unconfirmed: 0, total: 0 };
   }
   
-  // Fix: Handle both direct and nested item structure
+  // CRITICAL FIX: CryptoAPIs returns balance in data.item.confirmedBalance.amount
   const item = data.item || data;
   
-  // Fix: Parse balance - CryptoAPIs returns objects with .amount or strings
+  // Parse confirmed balance
   let confirmed = 0;
-  let unconfirmed = 0;
-  
   if (item.confirmedBalance) {
     if (typeof item.confirmedBalance === 'object' && item.confirmedBalance.amount) {
       confirmed = parseInt(item.confirmedBalance.amount);
@@ -52,6 +50,8 @@ async function getAddressBalance(address) {
     }
   }
   
+  // Parse unconfirmed balance  
+  let unconfirmed = 0;
   if (item.unconfirmedBalance) {
     if (typeof item.unconfirmedBalance === 'object' && item.unconfirmedBalance.amount) {
       unconfirmed = parseInt(item.unconfirmedBalance.amount);
@@ -62,10 +62,7 @@ async function getAddressBalance(address) {
     }
   }
   
-  // Ensure we have valid numbers
-  confirmed = isNaN(confirmed) ? 0 : confirmed;
-  unconfirmed = isNaN(unconfirmed) ? 0 : unconfirmed;
-  
+  // Convert from satoshis to LTC
   return {
     confirmed: confirmed / 1e8,
     unconfirmed: unconfirmed / 1e8,
@@ -152,7 +149,6 @@ async function checkTransactionMempool(address) {
     
     if (!data) return null;
     
-    // Fix: Check nested structure
     const item = data.item || data;
     
     let unconfirmedBal = 0;
