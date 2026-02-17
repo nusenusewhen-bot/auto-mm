@@ -1,95 +1,104 @@
 const axios = require('axios');
 
-const API_KEY = process.env.CRYPTOAPIS_KEY;
-const BASE_URL = 'https://rest.cryptoapis.io';
-
-if (!API_KEY) {
-  console.error('❌ CRYPTOAPIS_KEY not set in environment variables');
-}
+const BLOCKCHAIR_KEY = process.env.BLOCKCHAIR_KEY;
+const BASE_URL = 'https://api.blockchair.com/litecoin';
 
 let priceCache = { value: 0, timestamp: 0 };
 const CACHE_DURATION = 60000;
+let usePaidPlan = !!BLOCKCHAIR_KEY;
 
-async function cryptoApisRequest(endpoint) {
+async function blockchairRequest(endpoint) {
   try {
-    const url = `${BASE_URL}${endpoint}`;
-    const res = await axios.get(url, {
-      headers: {
-        'X-API-Key': API_KEY,
-        'Content-Type': 'application/json'
-      },
-      timeout: 30000
-    });
+    let url = `${BASE_URL}${endpoint}`;
+    
+    // Use API key if available (paid plan)
+    if (BLOCKCHAIR_KEY) {
+      url += `${endpoint.includes('?') ? '&' : '?'}key=${BLOCKCHAIR_KEY}`;
+    }
+    
+    const res = await axios.get(url, { timeout: 30000 });
+    
+    // Check if credits ran out
+    if (res.data && res.data.context && res.data.context.error) {
+      if (res.data.context.error.includes('credits') || res.data.context.error.includes('limit')) {
+        console.log('[Blockchair] Paid credits exhausted, falling back to free plan');
+        usePaidPlan = false;
+        // Retry without key
+        return await blockchairRequestFree(endpoint);
+      }
+    }
+    
     return res.data.data;
   } catch (err) {
-    console.error(`[CryptoApis] Error:`, err.message);
+    // If 402 Payment Required or rate limit, try without key
+    if (err.response && (err.response.status === 402 || err.response.status === 429)) {
+      console.log('[Blockchair] Paid plan hit limit, using free tier...');
+      usePaidPlan = false;
+      return await blockchairRequestFree(endpoint);
+    }
+    
+    console.error(`[Blockchair] Error:`, err.message);
+    return null;
+  }
+}
+
+async function blockchairRequestFree(endpoint) {
+  try {
+    const url = `${BASE_URL}${endpoint}`;
+    const res = await axios.get(url, { timeout: 30000 });
+    return res.data.data;
+  } catch (err) {
+    console.error(`[Blockchair Free] Error:`, err.message);
     return null;
   }
 }
 
 async function getAddressBalance(address) {
-  const endpoint = `/addresses-latest/utxo/litecoin/mainnet/${address}/balance`;
-  const data = await cryptoApisRequest(endpoint);
+  const data = await blockchairRequest(`/dashboards/address/${address}`);
   
-  if (!data) {
+  if (!data || !data[address]) {
     return { confirmed: 0, unconfirmed: 0, total: 0 };
   }
   
-  // CRITICAL FIX: CryptoAPIs returns balance in data.item.confirmedBalance.amount
-  const item = data.item || data;
+  const addressData = data[address];
+  const balance = addressData.address.balance || 0;
   
-  // Parse confirmed balance
-  let confirmed = 0;
-  if (item.confirmedBalance) {
-    if (typeof item.confirmedBalance === 'object' && item.confirmedBalance.amount) {
-      confirmed = parseInt(item.confirmedBalance.amount);
-    } else if (typeof item.confirmedBalance === 'string') {
-      confirmed = parseInt(item.confirmedBalance);
-    } else if (typeof item.confirmedBalance === 'number') {
-      confirmed = item.confirmedBalance;
-    }
-  }
-  
-  // Parse unconfirmed balance  
   let unconfirmed = 0;
-  if (item.unconfirmedBalance) {
-    if (typeof item.unconfirmedBalance === 'object' && item.unconfirmedBalance.amount) {
-      unconfirmed = parseInt(item.unconfirmedBalance.amount);
-    } else if (typeof item.unconfirmedBalance === 'string') {
-      unconfirmed = parseInt(item.unconfirmedBalance);
-    } else if (typeof item.unconfirmedBalance === 'number') {
-      unconfirmed = item.unconfirmedBalance;
-    }
+  if (addressData.utxo) {
+    unconfirmed = addressData.utxo
+      .filter(u => u.block_id === -1 && !u.is_spent)
+      .reduce((sum, u) => sum + u.value, 0);
   }
   
-  // Convert from satoshis to LTC
+  const confirmed = balance - unconfirmed;
+  
   return {
     confirmed: confirmed / 1e8,
     unconfirmed: unconfirmed / 1e8,
-    total: (confirmed + unconfirmed) / 1e8,
-    source: 'cryptoapis'
+    total: balance / 1e8,
+    source: usePaidPlan ? 'blockchair-paid' : 'blockchair-free'
   };
 }
 
 async function getAddressUTXOs(address) {
-  const endpoint = `/addresses-historical/utxo/litecoin/mainnet/${address}/unspent-outputs`;
-  const data = await cryptoApisRequest(endpoint);
+  const data = await blockchairRequest(`/dashboards/address/${address}`);
   
-  if (!data || !data.items) return [];
+  if (!data || !data[address] || !data[address].utxo) return [];
   
-  return data.items.map(item => ({
-    txid: item.transactionId,
-    vout: item.index,
-    value: parseInt(item.amount) || 0,
-    confirmations: item.confirmations || 0
-  }));
+  return data[address].utxo
+    .filter(u => !u.is_spent)
+    .map(u => ({
+      txid: u.transaction_hash,
+      vout: u.index,
+      value: u.value,
+      confirmations: u.block_id > 0 ? 1 : 0
+    }));
 }
 
 async function getTransactionHex(txid) {
   try {
-    const endpoint = `/blockchain-data/litecoin/mainnet/transactions/${txid}`;
-    const data = await cryptoApisRequest(endpoint);
-    return data ? data.transactionHex : null;
+    const data = await blockchairRequest(`/raw/transaction/${txid}`);
+    return data && data[txid] ? data[txid].raw_transaction : null;
   } catch (err) {
     return null;
   }
@@ -97,29 +106,35 @@ async function getTransactionHex(txid) {
 
 async function broadcastTransaction(txHex) {
   try {
-    const url = `${BASE_URL}/broadcast-transactions/litecoin/mainnet`;
-    const res = await axios.post(url, {
-      data: {
-        item: {
-          rawTransaction: txHex
-        }
-      }
-    }, {
-      headers: {
-        'X-API-Key': API_KEY,
-        'Content-Type': 'application/json'
-      },
+    let url = `${BASE_URL}/push/transaction`;
+    if (BLOCKCHAIR_KEY && usePaidPlan) {
+      url += `?key=${BLOCKCHAIR_KEY}`;
+    }
+    
+    const res = await axios.post(url, { data: txHex }, {
+      headers: { 'Content-Type': 'application/json' },
       timeout: 30000
     });
     
-    return { 
-      success: true, 
-      txid: res.data.data.item.transactionId 
-    };
+    if (res.data && res.data.data && res.data.data.transaction_hash) {
+      return { 
+        success: true, 
+        txid: res.data.data.transaction_hash 
+      };
+    } else {
+      return { success: false, error: 'Unknown response' };
+    }
   } catch (err) {
+    // If paid plan fails due to credits, try free
+    if (BLOCKCHAIR_KEY && usePaidPlan && err.response && (err.response.status === 402 || err.response.status === 429)) {
+      console.log('[Blockchair] Broadcast: Switching to free plan...');
+      usePaidPlan = false;
+      return await broadcastTransaction(txHex);
+    }
+    
     return { 
       success: false, 
-      error: err.response?.data?.message || err.message 
+      error: err.response?.data?.context?.error || err.message 
     };
   }
 }
@@ -144,35 +159,23 @@ async function getLtcPriceUSD() {
 
 async function checkTransactionMempool(address) {
   try {
-    const endpoint = `/addresses-latest/utxo/litecoin/mainnet/${address}`;
-    const data = await cryptoApisRequest(endpoint);
+    const data = await blockchairRequest(`/dashboards/address/${address}`);
+    if (!data || !data[address]) return null;
     
-    if (!data) return null;
+    const utxos = data[address].utxo || [];
+    const unconfirmedUtxo = utxos.find(u => u.block_id === -1 && !u.is_spent);
     
-    const item = data.item || data;
-    
-    let unconfirmedBal = 0;
-    if (item.unconfirmedBalance) {
-      if (typeof item.unconfirmedBalance === 'object' && item.unconfirmedBalance.amount) {
-        unconfirmedBal = parseInt(item.unconfirmedBalance.amount);
-      } else if (typeof item.unconfirmedBalance === 'string') {
-        unconfirmedBal = parseInt(item.unconfirmedBalance);
-      } else if (typeof item.unconfirmedBalance === 'number') {
-        unconfirmedBal = item.unconfirmedBalance;
-      }
-    }
-    
-    if (unconfirmedBal > 0) {
-      const txEndpoint = `/addresses-historical/utxo/litecoin/mainnet/${address}/unspent-outputs`;
-      const txData = await cryptoApisRequest(txEndpoint);
-      if (txData && txData.items && txData.items.length > 0) {
-        return txData.items[0].transactionId;
-      }
-    }
-    return null;
+    return unconfirmedUtxo ? unconfirmedUtxo.transaction_hash : null;
   } catch (err) {
     return null;
   }
+}
+
+// Log current mode on startup
+if (BLOCKCHAIR_KEY) {
+  console.log('✅ [Blockchair] Using PAID plan (10k requests)');
+} else {
+  console.log('✅ [Blockchair] Using FREE plan (30 req/min)');
 }
 
 module.exports = {
