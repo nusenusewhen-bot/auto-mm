@@ -6,7 +6,7 @@ const {
   getTransactionHexNode,
   broadcastTransactionNode,
   isNodeSynced,
-  getMempoolForAddress
+  getAddressMempool
 } = require('./litecoin-node');
 
 let priceCache = { value: 0, timestamp: 0 };
@@ -16,24 +16,28 @@ function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// PRIMARY: Your own node (super fast, no limits)
+// ONLY use your own node - no more rate limits
 async function getAddressBalance(address, forceRefresh = false) {
   console.log(`[Balance] Checking ${address}`);
   
-  // Try your own node first (instant, no rate limit)
-  if (isNodeConfigured()) {
-    const nodeSynced = await isNodeSynced();
-    if (nodeSynced) {
-      console.log(`[Balance] Using OWN NODE (fast)...`);
-      const nodeResult = await getAddressBalanceNode(address);
-      if (nodeResult) {
-        console.log(`[Balance] Node: ${nodeResult.total} LTC (${nodeResult.confirmed} confirmed, ${nodeResult.unconfirmed} unconfirmed)`);
-        return nodeResult;
-      }
-    }
+  if (!isNodeConfigured()) {
+    console.error('[Balance] Node not configured!');
+    return { confirmed: 0, unconfirmed: 0, total: 0, source: 'none' };
   }
   
-  console.error(`[Balance] Node not available or not synced!`);
+  const nodeSynced = await isNodeSynced();
+  if (!nodeSynced) {
+    console.log('[Balance] Node not synced yet...');
+    return { confirmed: 0, unconfirmed: 0, total: 0, source: 'syncing' };
+  }
+  
+  console.log(`[Balance] Using OWN NODE (fast)...`);
+  const nodeResult = await getAddressBalanceNode(address);
+  if (nodeResult) {
+    console.log(`[Balance] Node: ${nodeResult.total} LTC (${nodeResult.confirmed} confirmed, ${nodeResult.unconfirmed} unconfirmed)`);
+    return nodeResult;
+  }
+  
   return { confirmed: 0, unconfirmed: 0, total: 0, source: 'none' };
 }
 
@@ -41,45 +45,47 @@ async function getAddressBalance(address, forceRefresh = false) {
 async function getAddressUTXOs(address) {
   console.log(`[UTXO] Fetching for ${address}`);
   
-  // Try own node first (instant)
-  if (isNodeConfigured()) {
-    const nodeSynced = await isNodeSynced();
-    if (nodeSynced) {
-      const nodeUTXOs = await getAddressUTXOsNode(address);
-      console.log(`[UTXO] Node found ${nodeUTXOs.length} UTXOs (INSTANT)`);
-      return nodeUTXOs;
-    }
+  if (!isNodeConfigured()) {
+    console.error('[UTXO] Node not configured!');
+    return [];
   }
   
-  console.error(`[UTXO] Node not available!`);
-  return [];
+  const nodeSynced = await isNodeSynced();
+  if (!nodeSynced) {
+    console.log('[UTXO] Node not synced yet...');
+    return [];
+  }
+  
+  const nodeUTXOs = await getAddressUTXOsNode(address);
+  console.log(`[UTXO] Node found ${nodeUTXOs.length} UTXOs (INSTANT)`);
+  return nodeUTXOs;
 }
 
 // Get transaction hex - Node only
 async function getTransactionHex(txid) {
-  // Try node first (instant)
-  if (isNodeConfigured()) {
-    const nodeHex = await getTransactionHexNode(txid);
-    if (nodeHex) return nodeHex;
-  }
+  if (!isNodeConfigured()) return null;
   
-  console.error(`[GetTx] Node not available for tx ${txid}`);
+  const nodeHex = await getTransactionHexNode(txid);
+  if (nodeHex) return nodeHex;
+  
   return null;
 }
 
-// Broadcast - Node only
+// Broadcast - Node only (instant confirmation)
 async function broadcastTransaction(txHex) {
-  // Try node first (instant confirmation)
-  if (isNodeConfigured()) {
-    const nodeResult = await broadcastTransactionNode(txHex);
-    if (nodeResult.success) {
-      console.log(`[Broadcast] Sent via OWN NODE (instant)`);
-      return nodeResult;
-    }
+  if (!isNodeConfigured()) {
+    return { success: false, error: 'Node not configured' };
   }
   
-  console.error(`[Broadcast] Node not available!`);
-  return { success: false, error: 'Node not available' };
+  console.log(`[Broadcast] Sending via OWN NODE (instant)`);
+  const nodeResult = await broadcastTransactionNode(txHex);
+  
+  if (nodeResult.success) {
+    console.log(`[Broadcast] Sent via OWN NODE: ${nodeResult.txid}`);
+    return nodeResult;
+  }
+  
+  return { success: false, error: nodeResult.error || 'Broadcast failed' };
 }
 
 async function getLtcPriceUSD() {
@@ -103,24 +109,14 @@ async function getLtcPriceUSD() {
 async function checkTransactionMempool(address) {
   if (!address) return null;
   
-  // Try node first
   if (isNodeConfigured()) {
     try {
-      const mempool = await getMempoolForAddress(address);
+      const mempool = await getAddressMempool(address);
       if (mempool && mempool.length > 0) {
         return mempool[0].txid;
       }
-      
-      // Also check unconfirmed balance
-      const balance = await getAddressBalanceNode(address);
-      if (balance.unconfirmed > 0) {
-        // Has unconfirmed balance, try to find the tx
-        const utxos = await getAddressUTXOsNode(address);
-        const unconfirmedUtxo = utxos.find(u => u.confirmations === 0);
-        if (unconfirmedUtxo) return unconfirmedUtxo.txid;
-      }
     } catch (e) {
-      console.error('[Mempool] Node check failed:', e.message);
+      // Ignore errors
     }
   }
   
