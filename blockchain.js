@@ -35,10 +35,41 @@ async function getAddressBalance(address) {
     return { confirmed: 0, unconfirmed: 0, total: 0 };
   }
   
+  // Fix: Handle both direct and nested item structure
+  const item = data.item || data;
+  
+  // Fix: Parse balance - CryptoAPIs returns objects with .amount or strings
+  let confirmed = 0;
+  let unconfirmed = 0;
+  
+  if (item.confirmedBalance) {
+    if (typeof item.confirmedBalance === 'object' && item.confirmedBalance.amount) {
+      confirmed = parseInt(item.confirmedBalance.amount);
+    } else if (typeof item.confirmedBalance === 'string') {
+      confirmed = parseInt(item.confirmedBalance);
+    } else if (typeof item.confirmedBalance === 'number') {
+      confirmed = item.confirmedBalance;
+    }
+  }
+  
+  if (item.unconfirmedBalance) {
+    if (typeof item.unconfirmedBalance === 'object' && item.unconfirmedBalance.amount) {
+      unconfirmed = parseInt(item.unconfirmedBalance.amount);
+    } else if (typeof item.unconfirmedBalance === 'string') {
+      unconfirmed = parseInt(item.unconfirmedBalance);
+    } else if (typeof item.unconfirmedBalance === 'number') {
+      unconfirmed = item.unconfirmedBalance;
+    }
+  }
+  
+  // Ensure we have valid numbers
+  confirmed = isNaN(confirmed) ? 0 : confirmed;
+  unconfirmed = isNaN(unconfirmed) ? 0 : unconfirmed;
+  
   return {
-    confirmed: (data.confirmedBalance || 0) / 1e8,
-    unconfirmed: (data.unconfirmedBalance || 0) / 1e8,
-    total: (data.confirmedBalance + data.unconfirmedBalance || 0) / 1e8,
+    confirmed: confirmed / 1e8,
+    unconfirmed: unconfirmed / 1e8,
+    total: (confirmed + unconfirmed) / 1e8,
     source: 'cryptoapis'
   };
 }
@@ -52,7 +83,7 @@ async function getAddressUTXOs(address) {
   return data.items.map(item => ({
     txid: item.transactionId,
     vout: item.index,
-    value: item.amount,
+    value: parseInt(item.amount) || 0,
     confirmations: item.confirmations || 0
   }));
 }
@@ -119,7 +150,23 @@ async function checkTransactionMempool(address) {
     const endpoint = `/addresses-latest/utxo/litecoin/mainnet/${address}`;
     const data = await cryptoApisRequest(endpoint);
     
-    if (data && data.unconfirmedBalance > 0) {
+    if (!data) return null;
+    
+    // Fix: Check nested structure
+    const item = data.item || data;
+    
+    let unconfirmedBal = 0;
+    if (item.unconfirmedBalance) {
+      if (typeof item.unconfirmedBalance === 'object' && item.unconfirmedBalance.amount) {
+        unconfirmedBal = parseInt(item.unconfirmedBalance.amount);
+      } else if (typeof item.unconfirmedBalance === 'string') {
+        unconfirmedBal = parseInt(item.unconfirmedBalance);
+      } else if (typeof item.unconfirmedBalance === 'number') {
+        unconfirmedBal = item.unconfirmedBalance;
+      }
+    }
+    
+    if (unconfirmedBal > 0) {
       const txEndpoint = `/addresses-historical/utxo/litecoin/mainnet/${address}/unspent-outputs`;
       const txData = await cryptoApisRequest(txEndpoint);
       if (txData && txData.items && txData.items.length > 0) {
