@@ -1978,32 +1978,22 @@ async function handleConfirmRefundRequest(interaction) {
 }
 
 async function setActiveUser(channel, trade, activeRole) {
+  // Both users can always type - only visual indication changes
   try {
-    if (activeRole === 'sender') {
-      await channel.permissionOverwrites.edit(trade.senderId, {
-        ViewChannel: true,
-        SendMessages: true
-      });
-      await channel.permissionOverwrites.edit(trade.receiverId, {
-        ViewChannel: true,
-        SendMessages: false
-      });
-      console.log(`[Trade ${trade.id}] Set active: SENDER, disabled: RECEIVER`);
-    } else {
-      await channel.permissionOverwrites.edit(trade.receiverId, {
-        ViewChannel: true,
-        SendMessages: true
-      });
-      await channel.permissionOverwrites.edit(trade.senderId, {
-        ViewChannel: true,
-        SendMessages: false
-      });
-      console.log(`[Trade ${trade.id}] Set active: RECEIVER, disabled: SENDER`);
-    }
+    await channel.permissionOverwrites.edit(trade.senderId, {
+      ViewChannel: true,
+      SendMessages: true
+    });
+    await channel.permissionOverwrites.edit(trade.receiverId, {
+      ViewChannel: true,
+      SendMessages: true
+    });
+    console.log(`[Trade ${trade.id}] Set active: ${activeRole.toUpperCase()} (visual only, both can type)`);
   } catch (err) {
     console.error(`[Trade ${trade.id}] Failed to set active user:`, err.message);
   }
 }
+
 
 async function setBothActive(channel, trade) {
   try {
