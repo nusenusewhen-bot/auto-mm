@@ -121,6 +121,26 @@ async function getTranscriptChannel() {
   return row ? row.value : null;
 }
 
+// ANTI-MIXING PROTECTION FUNCTION
+async function checkSimilarActiveTrade(amount, excludeTradeId) {
+  const minAmount = amount - 0.10;
+  const maxAmount = amount + 0.10;
+  
+  const activeStatuses = ['role_selection', 'amount_set', 'awaiting_payment', 'awaiting_release', 'payment_confirmed'];
+  
+  const placeholders = activeStatuses.map(() => '?').join(',');
+  
+  const existing = db.prepare(`
+    SELECT * FROM trades 
+    WHERE status IN (${placeholders})
+    AND amount BETWEEN ? AND ?
+    AND id != ?
+    LIMIT 1
+  `).get(...activeStatuses, minAmount, maxAmount, excludeTradeId || 0);
+  
+  return existing || null;
+}
+
 const commands = [
   new SlashCommandBuilder()
     .setName('panel')
@@ -169,6 +189,7 @@ client.once(Events.ClientReady, async () => {
   console.log(`✅ ALL TICKETS USE INDEX ${TRADE_INDEX}`);
   console.log(`✅ ALL FEES GO TO INDEX ${FEE_INDEX}`);
   console.log(`✅ PAYMENT THRESHOLD: ${PAYMENT_THRESHOLD * 100}%`);
+  console.log(`✅ ANTI-MIXING PROTECTION: ±$0.10 tolerance`);
   
   try {
     console.log('Deploying commands...');
@@ -803,7 +824,27 @@ async function handleAmountModal(interaction) {
     return interaction.reply({ content: '❌ Trade not found.', flags: MessageFlags.Ephemeral });
   }
 
-  // Strict turn check - must be sender's turn
+  const amountStr = interaction.fields.getTextInputValue('usd_amount');
+  const amount = parseFloat(amountStr);
+
+  if (isNaN(amount) || amount <= 0) {
+    return interaction.reply({ content: '❌ Invalid amount.', flags: MessageFlags.Ephemeral });
+  }
+
+  // ANTI-MIXING PROTECTION
+  const similarTrade = await checkSimilarActiveTrade(amount, tradeId);
+  if (similarTrade) {
+    const otherChannel = similarTrade.channelId ? `<#${similarTrade.channelId}>` : `Trade #${similarTrade.id}`;
+    const tolerance = 0.10;
+    
+    return interaction.reply({ 
+      content: `⏳ **Amount Conflict Detected!**\n\nAnother active trade with **$${similarTrade.amount}** (within ±$${tolerance}) is in progress: ${otherChannel}\n\nTo prevent mixing up funds, please wait for that trade to complete, or use a different amount like:\n• $${(amount + 0.25).toFixed(2)}\n• $${(amount - 0.25).toFixed(2)}\n\nYour current input: **$${amount.toFixed(2)}**`, 
+      flags: MessageFlags.Ephemeral 
+    });
+  }
+  // END ANTI-MIXING
+
+  // Strict turn check
   const currentTurn = activeTurns.get(tradeId);
   if (!currentTurn || currentTurn.type !== 'sender') {
     return interaction.reply({ 
@@ -823,11 +864,694 @@ async function handleAmountModal(interaction) {
     return interaction.reply({ content: '❌ Only the sender can set the amount!', flags: MessageFlags.Ephemeral });
   }
 
+  const ltcPrice = await getLtcPriceUSD();
+  
+  if (!ltcPrice || ltcPrice <= 0) {
+    return interaction.reply({ content: '❌ Failed to fetch LTC price. Please try again.', flags: MessageFlags.Ephemeral });
+  }
+  
+  const ltcAmount = amount / ltcPrice;
+  const feePercent = await getFeePercent();
+  const fee = calculateFee(amount, feePercent);
+  const totalUsd = amount + fee;
+  const totalLtc = totalUsd / ltcPrice;
+
+  db.prepare(`
+    UPDATE trades SET amount = ?, fee = ?, ltcPrice = ?, ltcAmount = ?, totalLtc = ?, status = 'amount_set'
+    WHERE id = ?
+  `).run(amount, fee, ltcPrice, ltcAmount, totalLtc, tradeId);
+
+  // Clear turn after successful action
+  activeTurns.delete(tradeId);
+
+  const embed = new EmbedBuilder()
+    .setDescription(`**USD amount set to $${amount.toFixed(2)}**\n\nPlease confirm the USD amount.`)
+    .setColor(0x5865F2);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`confirm_amount_${tradeId}`)
+      .setLabel('Correct')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`incorrect_amount_${tradeId}`)
+      .setLabel('Incorrect')
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  await interaction.reply({ embeds: [embed], components: [row] });
+}
+
+async function handleAddressModal(interaction) {
+  const tradeId = interaction.customId.split('_')[2];
+  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+
+  if (!trade) {
+    return interaction.reply({ content: '❌ Trade not found.', flags: MessageFlags.Ephemeral });
+.status === 'completed' || trade.status === 'cancelled') {
+      return message.reply('❌ Trade is already completed or cancelled.');
+    }
+    
+    if (activeMonitors.has(trade.id)) {
+      clearInterval(activeMonitors.get(trade.id));
+      activeMonitors.delete(trade.id);
+    }
+    
+    if (trade.depositAddress && trade.senderId) {
+      try {
+        const balance = await getAddressBalance(trade.depositAddress, true);
+        
+        if (balance.confirmed > 0 || balance.unconfirmed > 0) {
+          const sender = await client.users.fetch(trade.senderId).catch(() => null);
+          
+          await message.reply({
+            embeds: [
+              new EmbedBuilder()
+                .setTitle('🔄 Refund Initiated')
+                .setDescription(`Trade #${trade.id} marked for refund.\n**Amount:** ${balance.total.toFixed(8)} LTC\n**Sender:** ${sender ? sender.tag : 'Unknown'}\n\n⚠️ Manual refund required - send back to sender's address.`)
+                .setColor('Orange')
+            ]
+          });
+        } else {
+          await message.reply('ℹ️ No balance to refund.');
+        }
+      } catch (err) {
+        console.error('Refund check error:', err);
+      }
+    }
+    
+    db.prepare("UPDATE trades SET status = 'cancelled' WHERE id = ?").run(trade.id);
+    
+    const channel = client.channels.cache.get(targetChannelId);
+    if (channel) {
+      try {
+        await channel.permissionOverwrites.delete(trade.senderId);
+        await channel.permissionOverwrites.delete(trade.receiverId);
+      } catch(e) {}
+      
+      await channel.send({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('❌ Trade Cancelled & Refunded')
+            .setDescription('This trade has been cancelled by the owner. If funds were sent, they will be refunded.')
+            .setColor('Red')
+        ]
+      });
+    }
+    
+    return;
+  }
+  
+  if (command === '$release') {
+    if (!await hasOwnerPermissions(message.author.id, message.member)) {
+      return message.reply('❌ Only owner can use this command.');
+    }
+    
+    const targetChannelId = args[1] || message.channel.id;
+    const trade = db.prepare('SELECT * FROM trades WHERE channelId = ?').get(targetChannelId);
+    
+    if (!trade) {
+      return message.reply('❌ No active trade found in this channel.');
+    }
+    
+    if (trade.status !== 'awaiting_release' && trade.status !== 'payment_confirmed') {
+      return message.reply('❌ Trade is not ready for release (payment not confirmed).');
+    }
+    
+    if (!trade.receiverId) {
+      return message.reply('❌ No receiver set for this trade.');
+    }
+    
+    const channel = client.channels.cache.get(targetChannelId);
+    if (!channel) {
+      return message.reply('❌ Channel not found.');
+    }
+    
+    activeTurns.delete(trade.id);
+    
+    const embed = new EmbedBuilder()
+      .setTitle('🔓 Owner Force Release')
+      .setDescription(`<@${trade.receiverId}> **Owner has force-released the funds.**\n\nPlease enter your LTC address to receive the funds.`)
+      .setColor('Green');
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`enter_address_${trade.id}`)
+        .setLabel('Enter Your LTC Address')
+        .setStyle(ButtonStyle.Primary)
+    );
+
+    await channel.send({ content: `<@${trade.receiverId}>`, embeds: [embed], components: [row] });
+    
+    db.prepare("UPDATE trades SET status = 'awaiting_release', senderId = ? WHERE id = ?").run(OWNER_ID, trade.id);
+    
+    await message.reply(`✅ Force release initiated in <#${targetChannelId}>`);
+    return;
+  }
+});
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  try {
+    if (interaction.isChatInputCommand()) {
+      await handleSlashCommand(interaction);
+      return;
+    }
+
+    if (interaction.isButton()) {
+      await handleButton(interaction);
+      return;
+    }
+
+    if (interaction.isModalSubmit()) {
+      await handleModal(interaction);
+      return;
+    }
+
+    if (interaction.isStringSelectMenu()) {
+      await handleSelectMenu(interaction);
+      return;
+    }
+
+  } catch (err) {
+    console.error('Interaction error:', err);
+    try {
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply({ content: '❌ An error occurred.', flags: MessageFlags.Ephemeral });
+      }
+    } catch {}
+  }
+});
+
+async function handleSlashCommand(interaction) {
+  const { commandName } = interaction;
+
+  if (commandName === 'panel') {
+    await showPanel(interaction);
+  } else if (commandName === 'supportpanel') {
+    await showSupportPanel(interaction);
+  } else if (commandName === 'balance') {
+    await showBalance(interaction);
+  } else if (commandName === 'send') {
+    await handleSendCommand(interaction);
+  } else if (commandName === 'setfee') {
+    await setFeeCommand(interaction);
+  } else if (commandName === 'close') {
+    await closeTicket(interaction);
+  } else if (commandName === 'logchannel') {
+    await setLogChannel(interaction);
+  } else if (commandName === 'ticketcategory') {
+    await setTicketCategory(interaction);
+  } else if (commandName === 'staffid') {
+    await setStaffRole(interaction);
+  } else if (commandName === 'transcriptid') {
+    await setTranscriptChannel(interaction);
+  }
+}
+
+async function setStaffRole(interaction) {
+  if (interaction.user.id !== OWNER_ID) {
+    return interaction.reply({ content: '❌ Only owner can use this command.', flags: MessageFlags.Ephemeral });
+  }
+
+  const roleId = interaction.options.getString('roleid').trim();
+  
+  const role = await interaction.guild.roles.fetch(roleId).catch(() => null);
+  if (!role) {
+    return interaction.reply({ content: '❌ Invalid role ID.', flags: MessageFlags.Ephemeral });
+  }
+
+  db.prepare("INSERT OR REPLACE INTO config(key, value) VALUES('staffRole', ?)").run(roleId);
+  
+  return interaction.reply({ 
+    content: `✅ Staff role set to **${role.name}**`, 
+    flags: MessageFlags.Ephemeral 
+  });
+}
+
+async function setTranscriptChannel(interaction) {
+  if (interaction.user.id !== OWNER_ID) {
+    return interaction.reply({ content: '❌ Only owner can use this command.', flags: MessageFlags.Ephemeral });
+  }
+
+  const channelId = interaction.options.getString('channelid').trim();
+  
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+  if (!channel) {
+    return interaction.reply({ content: '❌ Invalid channel ID or bot cannot access that channel.', flags: MessageFlags.Ephemeral });
+  }
+
+  db.prepare("INSERT OR REPLACE INTO config(key, value) VALUES('transcriptChannel', ?)").run(channelId);
+  
+  return interaction.reply({ 
+    content: `✅ Transcript channel set to <#${channelId}>`, 
+    flags: MessageFlags.Ephemeral 
+  });
+}
+
+async function setLogChannel(interaction) {
+  if (interaction.user.id !== OWNER_ID) {
+    return interaction.reply({ content: '❌ Only owner can use this command.', flags: MessageFlags.Ephemeral });
+  }
+
+  const channelId = interaction.options.getString('channelid').trim();
+  
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+  if (!channel) {
+    return interaction.reply({ content: '❌ Invalid channel ID or bot cannot access that channel.', flags: MessageFlags.Ephemeral });
+  }
+
+  db.prepare("INSERT OR REPLACE INTO config(key, value) VALUES('logChannel', ?)").run(channelId);
+  
+  return interaction.reply({ 
+    content: `✅ Trade log channel set to <#${channelId}>`, 
+    flags: MessageFlags.Ephemeral 
+  });
+}
+
+async function setTicketCategory(interaction) {
+  if (interaction.user.id !== OWNER_ID) {
+    return interaction.reply({ content: '❌ Only owner can use this command.', flags: MessageFlags.Ephemeral });
+  }
+
+  const categoryId = interaction.options.getString('categoryid').trim();
+  
+  const category = await interaction.guild.channels.fetch(categoryId).catch(() => null);
+  if (!category || category.type !== ChannelType.GuildCategory) {
+    return interaction.reply({ content: '❌ Invalid category ID.', flags: MessageFlags.Ephemeral });
+  }
+
+  db.prepare("INSERT OR REPLACE INTO config(key, value) VALUES('ticketCategory', ?)").run(categoryId);
+  
+  return interaction.reply({ 
+    content: `✅ Ticket category set to **${category.name}**`, 
+    flags: MessageFlags.Ephemeral 
+  });
+}
+
+async function logTradeCompletion(trade, txid) {
+  const logChannelId = await getLogChannel();
+  if (!logChannelId) return;
+
+  const logChannel = await client.channels.fetch(logChannelId).catch(() => null);
+  if (!logChannel) {
+    console.error(`[Log] Could not find log channel ${logChannelId}`);
+    return;
+  }
+
+  const totalLtc = parseFloat(trade.totalLtc) || 0;
+  const ltcPrice = parseFloat(trade.ltcPrice) || await getLtcPriceUSD() || 0;
+  const totalUsd = totalLtc * ltcPrice;
+
+  const embed = new EmbedBuilder()
+    .setTitle('• Trade Completed')
+    .setDescription(`**${totalLtc.toFixed(8)} LTC** ($${totalUsd.toFixed(2)} USD)`)
+    .addFields(
+      { name: 'Sender', value: 'Anonymous', inline: false },
+      { name: 'Receiver', value: 'Anonymous', inline: false },
+      { name: 'Transaction ID', value: `[${txid.substring(0, 10)}...${txid.substring(txid.length-8)}](https://live.blockcypher.com/ltc/tx/${txid})`, inline: false }
+    )
+    .setColor(0x5865F2)
+    .setTimestamp();
+
+  try {
+    await logChannel.send({ embeds: [embed] });
+    console.log(`[Log] Trade ${trade.id} logged to channel ${logChannelId}`);
+  } catch (err) {
+    console.error(`[Log] Failed to send log:`, err.message);
+  }
+}
+
+async function showPanel(interaction) {
+  const feePercent = await getFeePercent();
+  
+  const embed = new EmbedBuilder()
+    .setTitle('Schior\'s Auto Middleman Service')
+    .setDescription('Please select a category from the dropdown below to create a new ticket.\n\n**Fee Structure:**\n• Standard fee: **5%** of transaction amount\n• Fee goes to secure escrow wallet\n• No hidden charges\n• Fee is calculated in USD and converted to LTC at current market rate')
+    .setColor('Blurple');
+
+  const selectMenu = new StringSelectMenuBuilder()
+    .setCustomId('create_ticket')
+    .setPlaceholder('Select a category...')
+    .addOptions(
+      new StringSelectMenuOptionBuilder()
+        .setLabel('Litecoin')
+        .setDescription('Create a Litecoin middleman trade')
+        .setValue('litecoin')
+        .setEmoji('🪙')
+    );
+
+  const row = new ActionRowBuilder().addComponents(selectMenu);
+
+  return interaction.reply({ embeds: [embed], components: [row] });
+}
+
+async function showSupportPanel(interaction) {
+  if (!await hasStaffPermissions(interaction.user.id, interaction.member)) {
+    return interaction.reply({ content: '❌ Only staff can use this command.', flags: MessageFlags.Ephemeral });
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle('🎫 Support Center')
+    .setDescription('Need help? Select an option below to create a support ticket.\n\n**Available Options:**\n• **Report** - Report a user or issue\n• **Refund** - Request a refund for a trade')
+    .setColor('Green');
+
+  const selectMenu = new StringSelectMenuBuilder()
+    .setCustomId('create_support_ticket')
+    .setPlaceholder('Select support type...')
+    .addOptions(
+      new StringSelectMenuOptionBuilder()
+        .setLabel('Report')
+        .setDescription('Report a user or issue')
+        .setValue('report')
+        .setEmoji('🚨'),
+      new StringSelectMenuOptionBuilder()
+        .setLabel('Refund')
+        .setDescription('Request a refund')
+        .setValue('refund')
+        .setEmoji('💰')
+    );
+
+  const row = new ActionRowBuilder().addComponents(selectMenu);
+
+  return interaction.reply({ embeds: [embed], components: [row] });
+}
+
+async function handleSelectMenu(interaction) {
+  if (interaction.customId === 'create_ticket') {
+    const selected = interaction.values[0];
+
+    if (selected === 'litecoin') {
+      const modal = new ModalBuilder()
+        .setCustomId('enter_trade_details_modal')
+        .setTitle('Trade Details');
+
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('otherUserId')
+            .setLabel('Other User Discord ID')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('123456789012345678')
+            .setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('youGiving')
+            .setLabel('What are YOU giving?')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g., $50 PayPal, 1 LTC, Steam gift card')
+            .setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('theyGiving')
+            .setLabel('What is he/she giving?')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g., Fortnite account, Crypto, Item')
+            .setRequired(true)
+        )
+      );
+
+      return interaction.showModal(modal);
+    }
+  } else if (interaction.customId === 'create_support_ticket') {
+    const selected = interaction.values[0];
+    
+    const modal = new ModalBuilder()
+      .setCustomId(`support_modal_${selected}`)
+      .setTitle(selected === 'report' ? 'Report User' : 'Refund Request');
+
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('subject')
+          .setLabel('Subject')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('Brief description')
+          .setRequired(true)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('description')
+          .setLabel('Description')
+          .setStyle(TextInputStyle.Paragraph)
+          .setPlaceholder('Detailed explanation...')
+          .setRequired(true)
+      )
+    );
+
+    return interaction.showModal(modal);
+  }
+}
+
+async function handleModal(interaction) {
+  if (interaction.customId === 'enter_trade_details_modal') {
+    await handleTradeDetailsModal(interaction);
+    return;
+  }
+
+  if (interaction.customId.startsWith('amount_modal_')) {
+    await handleAmountModal(interaction);
+    return;
+  }
+
+  if (interaction.customId.startsWith('address_modal_')) {
+    await handleAddressModal(interaction);
+    return;
+  }
+
+  if (interaction.customId.startsWith('support_modal_')) {
+    await handleSupportModal(interaction);
+    return;
+  }
+
+  if (interaction.customId.startsWith('refund_address_modal_')) {
+    await handleRefundAddressModal(interaction);
+    return;
+  }
+}
+
+async function handleSupportModal(interaction) {
+  const type = interaction.customId.split('_')[2];
+  const subject = interaction.fields.getTextInputValue('subject');
+  const description = interaction.fields.getTextInputValue('description');
+
+  const ticketCategoryId = await getTicketCategory();
+  const staffRoleId = await getStaffRole();
+  
+  const channelOptions = {
+    name: `${type}-${interaction.user.username}`.substring(0, 100),
+    type: ChannelType.GuildText,
+    permissionOverwrites: [
+      {
+        id: interaction.guild.id,
+        deny: [PermissionsBitField.Flags.ViewChannel],
+      },
+      {
+        id: interaction.user.id,
+        allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages],
+      },
+      {
+        id: client.user.id,
+        allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages],
+      },
+    ],
+  };
+
+  if (staffRoleId) {
+    channelOptions.permissionOverwrites.push({
+      id: staffRoleId,
+      allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages],
+    });
+  }
+
+  if (ticketCategoryId) {
+    channelOptions.parent = ticketCategoryId;
+  }
+
+  const channel = await interaction.guild.channels.create(channelOptions);
+
+  const result = db.prepare(`
+    INSERT INTO trades (channelId, user1Id, user2Id, senderId, receiverId, amount, status, createdAt, youGiving, theyGiving, depositAddress, depositIndex, ticketType)
+    VALUES (?, ?, ?, NULL, NULL, 0, 'open', datetime('now'), ?, ?, NULL, ?, ?)
+  `).run(channel.id, interaction.user.id, interaction.user.id, subject, description, 0, type);
+
+  const tradeId = result.lastInsertRowid;
+
+  await interaction.reply({ content: `✅ Support ticket created: ${channel}`, flags: MessageFlags.Ephemeral });
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🎫 ${type === 'report' ? 'Report' : 'Refund Request'} #${tradeId}`)
+    .addFields(
+      { name: 'User', value: interaction.user.toString(), inline: true },
+      { name: 'Type', value: type === 'report' ? '🚨 Report' : '💰 Refund', inline: true },
+      { name: 'Subject', value: subject },
+      { name: 'Description', value: description }
+    )
+    .setColor(type === 'report' ? 'Red' : 'Orange')
+    .setTimestamp();
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`close_support_${tradeId}`)
+      .setLabel('Close Ticket')
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  await channel.send({ content: `${interaction.user} ${staffRoleId ? `<@&${staffRoleId}>` : ''}`, embeds: [embed], components: [row] });
+}
+
+async function handleTradeDetailsModal(interaction) {
+  const otherUserId = interaction.fields.getTextInputValue('otherUserId').trim();
+  const youGiving = interaction.fields.getTextInputValue('youGiving').trim();
+  const theyGiving = interaction.fields.getTextInputValue('theyGiving').trim();
+
+  let otherMember;
+  try {
+    otherMember = await interaction.guild.members.fetch(otherUserId);
+  } catch {
+    return interaction.reply({ content: '❌ Invalid user ID. User must be in this server.', flags: MessageFlags.Ephemeral });
+  }
+
+  if (otherUserId === interaction.user.id) {
+    return interaction.reply({ content: '❌ You cannot trade with yourself.', flags: MessageFlags.Ephemeral });
+  }
+
+  const ticketCategoryId = await getTicketCategory();
+  const staffRoleId = await getStaffRole();
+  
+  const channelOptions = {
+    name: `ltc-${interaction.user.username}-${otherMember.user.username}`.substring(0, 100),
+    type: ChannelType.GuildText,
+    permissionOverwrites: [
+      {
+        id: interaction.guild.id,
+        deny: [PermissionsBitField.Flags.ViewChannel],
+      },
+      {
+        id: interaction.user.id,
+        allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages],
+      },
+      {
+        id: otherUserId,
+        allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages],
+      },
+      {
+        id: client.user.id,
+        allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages],
+      },
+    ],
+  };
+
+  if (staffRoleId) {
+    channelOptions.permissionOverwrites.push({
+      id: staffRoleId,
+      allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages],
+    });
+  }
+
+  if (ticketCategoryId) {
+    channelOptions.parent = ticketCategoryId;
+  }
+
+  const channel = await interaction.guild.channels.create(channelOptions);
+
+  const depositAddress = generateAddress(TRADE_INDEX);
+  const result = db.prepare(`
+    INSERT INTO trades (channelId, user1Id, user2Id, senderId, receiverId, amount, status, createdAt, youGiving, theyGiving, depositAddress, depositIndex, ticketType)
+    VALUES (?, ?, ?, NULL, NULL, 0, 'role_selection', datetime('now'), ?, ?, ?, ?, 'trade')
+  `).run(channel.id, interaction.user.id, otherUserId, youGiving, theyGiving, depositAddress, TRADE_INDEX);
+
+  const tradeId = result.lastInsertRowid;
+
+  await interaction.reply({ content: `✅ Trade channel created: ${channel}`, flags: MessageFlags.Ephemeral });
+
+  const embed = new EmbedBuilder()
+    .setTitle('👋 Schior\'s Auto Middleman Service')
+    .setDescription('Make sure to follow the steps and read the instructions thoroughly.\nPlease explicitly state the trade details if the information below is inaccurate.')
+    .addFields(
+      { name: `${interaction.user.username}'s side:`, value: youGiving || 'Waiting...', inline: true },
+      { name: `${otherMember.user.username}'s side:`, value: theyGiving || 'Waiting...', inline: true }
+    )
+    .setColor(0x5865F2);
+
+  const deleteRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`delete_ticket_${tradeId}`)
+      .setLabel('Delete Ticket')
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  await channel.send({ content: `${interaction.user} ${otherMember}`, embeds: [embed], components: [deleteRow] });
+
+  const roleEmbed = new EmbedBuilder()
+    .setDescription('**Select your role**\n• **"Sender"** if you are **Sending** LTC to the bot.\n• **"Receiver"** if you are **Receiving** LTC *later* from the bot.')
+    .setColor(0x5865F2);
+
+  const roleRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`role_sender_${tradeId}`)
+      .setLabel('Sender')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`role_receiver_${tradeId}`)
+      .setLabel('Receiver')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`role_reset_${tradeId}`)
+      .setLabel('Reset')
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  await channel.send({ embeds: [roleEmbed], components: [roleRow] });
+}
+
+async function handleAmountModal(interaction) {
+  const tradeId = interaction.customId.split('_')[2];
+  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+
+  if (!trade) {
+    return interaction.reply({ content: '❌ Trade not found.', flags: MessageFlags.Ephemeral });
+  }
+
   const amountStr = interaction.fields.getTextInputValue('usd_amount');
   const amount = parseFloat(amountStr);
 
   if (isNaN(amount) || amount <= 0) {
     return interaction.reply({ content: '❌ Invalid amount.', flags: MessageFlags.Ephemeral });
+  }
+
+  // ANTI-MIXING PROTECTION
+  const similarTrade = await checkSimilarActiveTrade(amount, tradeId);
+  if (similarTrade) {
+    const otherChannel = similarTrade.channelId ? `<#${similarTrade.channelId}>` : `Trade #${similarTrade.id}`;
+    const tolerance = 0.10;
+    
+    return interaction.reply({ 
+      content: `⏳ **Amount Conflict Detected!**\n\nAnother active trade with **$${similarTrade.amount}** (within ±$${tolerance}) is in progress: ${otherChannel}\n\nTo prevent mixing up funds, please wait for that trade to complete, or use a different amount like:\n• $${(amount + 0.25).toFixed(2)}\n• $${(amount - 0.25).toFixed(2)}\n\nYour current input: **$${amount.toFixed(2)}**`, 
+      flags: MessageFlags.Ephemeral 
+    });
+  }
+  // END ANTI-MIXING
+
+  // Strict turn check
+  const currentTurn = activeTurns.get(tradeId);
+  if (!currentTurn || currentTurn.type !== 'sender') {
+    return interaction.reply({ 
+      content: '❌ It is not the sender\'s turn to set the amount!', 
+      flags: MessageFlags.Ephemeral 
+    });
+  }
+  
+  if (currentTurn.userId !== interaction.user.id) {
+    return interaction.reply({ 
+      content: '❌ Only the designated sender can set the amount at this step!', 
+      flags: MessageFlags.Ephemeral 
+    });
+  }
+
+  if (interaction.user.id !== trade.senderId) {
+    return interaction.reply({ content: '❌ Only the sender can set the amount!', flags: MessageFlags.Ephemeral });
   }
 
   const ltcPrice = await getLtcPriceUSD();
@@ -876,7 +1600,7 @@ async function handleAddressModal(interaction) {
     return interaction.reply({ content: '❌ Trade not found.', flags: MessageFlags.Ephemeral });
   }
 
-  // Strict turn check - must be receiver's turn
+  // Strict turn check
   const currentTurn = activeTurns.get(tradeId);
   if (!currentTurn || currentTurn.type !== 'receiver') {
     return interaction.reply({ 
@@ -1638,8 +2362,8 @@ function startPaymentMonitor(tradeId, channelId, expectedLtc) {
 
   checkBalance();
   
-  // Check every 4 seconds (15 checks per minute - safe for free tier)
-  const intervalId = setInterval(checkBalance, 4000);
+  // Check every 8 seconds (was 4, now 8 to save credits)
+  const intervalId = setInterval(checkBalance, 8000);
 
   setTimeout(() => {
     if (activeMonitors.has(tradeId)) {
